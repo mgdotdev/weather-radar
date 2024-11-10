@@ -13,3 +13,11 @@ class TestCoordinates:
         area = CoordinateArea(coord, 1, 1)
         assert len(area.gridpoints) == 4
         assert area.center_id
+
+
+    def test_cap(self):
+        coord = MapCoordinate(lat=47.6763, lon=-116.7798)
+        area = CoordinateArea(coord, 100, 100, point_cap=50)
+        assert len(area.gridpoints)
+
+

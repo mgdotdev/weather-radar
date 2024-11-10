@@ -1,3 +1,4 @@
+import os
 from functools import cached_property
 
 from .connection import NOAAConnection
@@ -34,10 +35,13 @@ class CoordinateArea:
     width (km) * (1 unit / 2.5km) = width (units)"""
     conversion_rate = 2.5
 
-    def __init__(self, center: MapCoordinate, width: float, height: float):
+    def __init__(self, center: MapCoordinate, width: float, height: float, point_cap: int|None=None):
         self.center = center
         self.width = width
         self.height = height
+        self._point_cap = (
+            point_cap or int(os.environ.get("WEATHER_RADAR_POINT_CAP", 100))
+        )
 
     @cached_property
     def center_gridpoint(self):
@@ -53,17 +57,24 @@ class CoordinateArea:
         dx = self.width / self.conversion_rate
         dy = self.height / self.conversion_rate
 
-        # make sure there's at least one
+        # make sure there's at least one polygon
         dx = max(dx, 2)
         dy = max(dy, 2)
 
         x -= dx // 2
         y -= dy // 2
-        return [
+
+        points = [
             Coordinate(x=j, y=i)
             for i in range(int(y), int(y + dy))
             for j in range(int(x), int(x + dx))
         ]
+
+        if len(points) > self._point_cap:
+            stride = len(points) // self._point_cap
+            points = points[::stride]
+
+        return points
 
 
 def center_id_from_map_coordinate(coordinate: MapCoordinate):
