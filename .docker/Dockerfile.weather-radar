@@ -1,0 +1,29 @@
+FROM python:3.12
+
+RUN adduser --disabled-password --gecos '' weather-radar
+
+WORKDIR /home/weather-radar
+
+ENV VENV=/home/weather-radar/venv
+
+RUN python3 -m venv $VENV
+
+ENV PATH="$VENV/bin:$PATH"
+
+WORKDIR /home/weather-radar/code
+
+COPY ./api/src/ ./api/src/
+COPY ./api/setup.py ./api/requirements.txt ./api/
+
+COPY ./lib/src/ ./lib/src/
+COPY ./lib/setup.py ./lib/requirements.txt ./lib/
+
+RUN python3 -m pip install --upgrade pip \
+ && python -m pip install -r ./lib/requirements.txt \
+ && python -m pip install -e ./lib --no-cache-dir \
+ && python -m pip install -r ./api/requirements.txt \
+ && python -m pip install -e ./api --no-cache-dir \
+ && chown -R weather-radar /home/weather-radar
+
+USER weather-radar
+
