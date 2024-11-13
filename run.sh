@@ -4,7 +4,7 @@ build() {
 }
 
 container() {
-    docker run --rm -it -p 8000:8000 -v $PWD:/home/weather-radar/code weather-radar bash
+    docker run --rm -it -p 8000:8000 -v /tmp:/tmp -v $PWD:/home/weather-radar/code weather-radar bash
 }
 
 $@

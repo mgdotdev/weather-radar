@@ -1,7 +1,7 @@
 from setuptools import find_packages, setup
 
 setup(
-    name="weather_radar.api",
+    name="weather_radar.server",
     version="0.0.1",
     author="Michael Green",
     author_email="self@michaelgreen.dev",

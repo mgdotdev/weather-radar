@@ -1,23 +1,20 @@
 from datetime import datetime
 from functools import cached_property
-from weather_radar.lib.area import Coordinate, MapCoordinate, CoordinateArea, center_gridpoint_from_map_coordinate, center_id_from_map_coordinate
+from weather_radar.lib.area import CoordinateArea, MapCoordinate, NOAAGridpoint, gridpoint_from_map_coordinate
 from ..connection import NOAAConnection
 
 from scipy.interpolate import CubicSpline
 
 
 class PrecipitationModel:
-    def __init__(self, coordinate: Coordinate, center_id: str):
+    def __init__(self, coordinate: NOAAGridpoint):
         self.coordinate = coordinate
-        self.center_id = center_id
 
     @classmethod
     def from_map_coordinate(cls, coordinate: MapCoordinate):
         return cls(
-            Coordinate(*center_gridpoint_from_map_coordinate(coordinate)),
-            center_id_from_map_coordinate(coordinate)
+            gridpoint_from_map_coordinate(coordinate)
         )
-
 
     @cached_property
     def model(self):
@@ -25,7 +22,7 @@ class PrecipitationModel:
         given time"""
 
         conn = NOAAConnection()
-        data = conn.get(f"/gridpoints/{self.center_id}/{self.coordinate}")
+        data = conn.get(f"/gridpoints/{self.coordinate}")
 
         polygon, = data["geometry"]["coordinates"]
         polygon = set(tuple(x) for x in polygon)
@@ -47,16 +44,21 @@ class PrecipitationModel:
         model = CubicSpline(model_data[0], model_data[1]).derivative()
         return start_time, center_coordinate, model
 
-    def predict(self, time, verbose=False):
+    def predict(self, time, dt=0, verbose=False):
         start_time, center_coordinate, f = self.model
         time = time.astimezone()
-        x = (time - start_time).total_seconds()
-        y = f(x).item()
+        t = (time - start_time).total_seconds()
+        y = f(t) if not dt else f.integrate(t, t+dt)
         if verbose:
             return {
-                "value": y,
-                "lat": center_coordinate.lat,
-                "lon": center_coordinate.lon
+                "type": "Feature",
+                "properties": {
+                    "precipitation": y.item(),
+                },
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [center_coordinate.lat, center_coordinate.lon]
+                }
             }
         return y
 
@@ -66,19 +68,18 @@ class PrecipitationEnsemble:
         self.area = area
         self._cache = {}
 
-    def __getitem__(self, coordinate: Coordinate):
+    def __getitem__(self, coordinate: NOAAGridpoint):
         model = self._cache.get(coordinate, None)
         if not model:
-            model = PrecipitationModel(coordinate, self.area.center_id)
+            model = PrecipitationModel(coordinate)
             self._cache[coordinate] = model
         return model
 
-    def predict(self, time: datetime, verbose=False):
+    def predict(self, time: datetime, dt=0, verbose=False):
         return {
-            "model": "precipitation",
-            "time": time.isoformat(),
-            "results": [
-                self[coordinate].predict(time, verbose=verbose)
+            "type": "FeatureCollection",
+            "features": [
+                self[coordinate].predict(time, dt=dt, verbose=verbose)
                 for coordinate in self.area.gridpoints
             ]
         }

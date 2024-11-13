@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 from . import models
 
-router = APIRouter(prefix="/v1")
+router = APIRouter(prefix="/api")
 router.include_router(models.router)
 
 

@@ -6,7 +6,7 @@ from weather_radar.lib.models.precipitation import PrecipitationEnsemble, Precip
 class TestPrecipitationModel:
     def test_precipitation_ensemble(self):
         coord = MapCoordinate(47.6763, -116.7798)
-        area = CoordinateArea(coord, 10, 10)
+        area = CoordinateArea(coord, 40, 10)
         grid = PrecipitationEnsemble(area).predict(datetime.now(), verbose=True)
         assert grid
 

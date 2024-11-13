@@ -1,4 +1,5 @@
 setuptools
 fastapi
 uvicorn
-
+jinja2
+hupper

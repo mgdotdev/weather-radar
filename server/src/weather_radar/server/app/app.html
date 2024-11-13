@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <script src="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  </head>
+  <body style="margin: 0px; padding: 0px;">
+    <div id="weatherRadar" style="height: 100vh; width: 100vw; margin: 0px; padding: 0px;"/>
+    <h2 id="displayTime" style="position: fixed; top: 2px; left: 20px; z-index: 100;"/></h2>
+  </body>
+  <script>
+    let map = new maplibregl.Map({
+      container: "weatherRadar",
+      style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+      center: [{{starting_longitude}}, {{starting_latitude}}],
+      zoom: 9,
+    })
+    map.on("load", async () => {
+      map.addSource({{weather_model}}, {
+        type: 'geojson',
+        data: {
+          type: "FeatureCollection",
+          features: []
+        }
+      })
+      map.addLayer({
+        'id': 'heatmap',
+        'type': 'heatmap',
+        'source': {{weather_model}},
+        'layout': {},
+        'paint': {
+          'heatmap-weight': [
+            'interpolate',
+            ['linear'],
+            ["get", "precipitation"],
+            0,0,0.1,0.3,0.2,0.6,0.3,0.9
+          ],
+          'heatmap-radius': 20,
+          // 'heatmap-radius': [
+          //   'interpolate', ['linear'],
+          //   ['get', 'precipitation'], 0.01, 1, 0.1, 20, 0.2, 30, 0.3, 40
+          // ],
+        }
+      })
+
+      let model = {{weather_model}}
+      let lat = {{starting_latitude}}
+      let lon = {{starting_longitude}}
+      let now = new Date()
+      let dt = {{dt}}
+      let width = {{width}}
+      let height = {{height}}
+
+      document.getElementById("displayTime").textContent = now.toString()
+      let time = Math.floor(now.getTime()/1000)
+
+      let url = `/api/models/${model}/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`
+      await fetch(url).then(resp => console.log("prefetch finished"))
+
+      window.setInterval(async () => {
+        time += dt
+        now = new Date(time*1000)
+        url = `/api/models/${model}/type/ensemble?lat=${lat}&lon=${lon}&width=${width}&height=${height}&time=${time}&dt=${dt}`
+        let data = await fetch(url).then(resp=>resp.json())
+        map.getSource({{weather_model}}).setData(data)
+        document.getElementById("displayTime").textContent = now.toString()
+      },
+      500)
+    })
+
+    let items = document.getElementsByClassName("maplibregl-ctrl-attrib-button")
+    for (let item of items) {item.click()}
+  </script>
+</html>

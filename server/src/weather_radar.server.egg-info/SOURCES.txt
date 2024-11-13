@@ -1,0 +1,5 @@
+setup.py
+src/weather_radar.server.egg-info/PKG-INFO
+src/weather_radar.server.egg-info/SOURCES.txt
+src/weather_radar.server.egg-info/dependency_links.txt
+src/weather_radar.server.egg-info/top_level.txt
