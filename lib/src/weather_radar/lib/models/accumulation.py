@@ -1,3 +1,5 @@
+import re
+
 from datetime import datetime
 from functools import cached_property
 from weather_radar.lib.area import CoordinateArea, MapCoordinate, NOAAGridpoint, gridpoint_from_map_coordinate
@@ -5,15 +7,31 @@ from ..connection import NOAAConnection
 
 from scipy.interpolate import CubicSpline
 
+CAMEL_TO_KEBAB = re.compile(r'(?<!^)(?=[A-Z])')
+KEBAB_TO_CAMEL = re.compile(r'(?<!\A)-(?=[a-zA-Z])',re.X)
 
-class PrecipitationModel:
-    def __init__(self, coordinate: NOAAGridpoint):
+
+def to_camel_case(value):
+    tokens = KEBAB_TO_CAMEL.split(value)
+    response = tokens.pop(0).lower()
+    for remain in tokens:
+        response += remain.capitalize()
+    return response
+
+
+def to_kebab_case(value):
+    return CAMEL_TO_KEBAB.sub('_', value).lower()
+
+
+class AccumulationModel:
+    def __init__(self, coordinate: NOAAGridpoint, attribute: str):
         self.coordinate = coordinate
+        self.attribute = attribute
 
     @classmethod
-    def from_map_coordinate(cls, coordinate: MapCoordinate):
+    def from_map_coordinate(cls, coordinate: MapCoordinate, attribute: str):
         return cls(
-            gridpoint_from_map_coordinate(coordinate)
+            gridpoint_from_map_coordinate(coordinate), attribute
         )
 
     @cached_property
@@ -29,8 +47,8 @@ class PrecipitationModel:
         polygon = list(zip(*polygon))
         center_coordinate = [sum(item) / len(item) for item in polygon]
         center_coordinate = MapCoordinate(*center_coordinate)
-
-        data = data["properties"]["quantitativePrecipitation"]["values"]
+        data = data["properties"]
+        data = data[to_camel_case(self.attribute)]["values"]
         data = [
             (datetime.fromisoformat(d["validTime"].split("/")[0]), d["value"])
             for d in data
@@ -53,7 +71,7 @@ class PrecipitationModel:
             return {
                 "type": "Feature",
                 "properties": {
-                    "precipitation": y.item(),
+                    self.attribute: y.item(),
                 },
                 "geometry": {
                     "type": "Point",
@@ -63,15 +81,16 @@ class PrecipitationModel:
         return y
 
 
-class PrecipitationEnsemble:
-    def __init__(self, area: CoordinateArea):
+class AccumulationEnsemble:
+    def __init__(self, area: CoordinateArea, attribute: str):
         self.area = area
+        self.attribute = attribute
         self._cache = {}
 
     def __getitem__(self, coordinate: NOAAGridpoint):
         model = self._cache.get(coordinate, None)
         if not model:
-            model = PrecipitationModel(coordinate)
+            model = AccumulationModel(coordinate, self.attribute)
             self._cache[coordinate] = model
         return model
 
