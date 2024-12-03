@@ -1,0 +1,40 @@
+<html>
+<head>
+	<script src='https://cdn.plot.ly/plotly-2.35.2.min.js'></script>
+</head>
+
+<body style="height: 100vh; width: 100vw; margin: 0px; padding: 0px;">
+	<div id='graph' style="height: 100vh; width: 100vw; margin: 0px; padding: 0px;"/>
+</body>
+<script>
+  document.addEventListener("DOMContentLoaded", async function() {
+    let data = []
+
+    let dt = {{dt}}
+    let counts = {{counts}}
+    let lat = {{starting_latitude}}
+    let lon = {{starting_longitude}}
+    let models = {{weather_models}}
+
+    for (let model of models) {
+      let url = `/api/models/${model}/type/point/`
+      let query = `?lat=${lat}&lon=${lon}&dt=${dt}&counts=${counts}`
+      let res = await fetch(url+query).then(res => res.json())
+      let x = []
+      let y = []
+      for (let feature of res.features) {
+        y.push(feature["properties"][model])
+        x.push(feature["properties"]["time"])
+      }
+      let trace = {
+        x: x,
+        y: y,
+        type: 'scatter',
+        name: model,
+      }
+      data.push(trace)
+    }
+    Plotly.newPlot('graph', data);
+  })
+</script>
+</html>

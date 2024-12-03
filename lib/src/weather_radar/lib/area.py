@@ -94,32 +94,31 @@ class CoordinateArea:
 
         return points
 
+    def cache(self):
+        paths = (f"/points/{c}" for c in self.map_coordinates)
+        path_objs = (PathObj(p) for p in paths)
+        with lock:
+            conn = NOAAConnection()
+            missings = [p for p in path_objs if not os.path.isfile(p.tempfile)]
+            with concurrent.futures.ThreadPoolExecutor() as exec:
+                jobs = [
+                    exec.submit(get_and_write, m, conn.session)
+                    for m in missings
+                ]
+                concurrent.futures.wait(jobs)
 
-def cache_coordinate_area(area: CoordinateArea):
-    paths = (f"/points/{c}" for c in area.map_coordinates)
-    path_objs = (PathObj(p) for p in paths)
-    with lock:
-        conn = NOAAConnection()
-        missings = [p for p in path_objs if not os.path.isfile(p.tempfile)]
-        with concurrent.futures.ThreadPoolExecutor() as exec:
-            jobs = [
-                exec.submit(get_and_write, m, conn.session)
-                for m in missings
-            ]
-            concurrent.futures.wait(jobs)
 
-
-    paths = (f"/gridpoints/{c}" for c in area.gridpoints)
-    path_objs = (PathObj(p) for p in paths)
-    with lock:
-        conn = NOAAConnection()
-        missings = [p for p in path_objs if not os.path.isfile(p.tempfile)]
-        with concurrent.futures.ThreadPoolExecutor() as exec:
-            jobs = [
-                exec.submit(get_and_write, m, conn.session)
-                for m in missings
-            ]
-            concurrent.futures.wait(jobs)
+        paths = (f"/gridpoints/{c}" for c in self.gridpoints)
+        path_objs = (PathObj(p) for p in paths)
+        with lock:
+            conn = NOAAConnection()
+            missings = [p for p in path_objs if not os.path.isfile(p.tempfile)]
+            with concurrent.futures.ThreadPoolExecutor() as exec:
+                jobs = [
+                    exec.submit(get_and_write, m, conn.session)
+                    for m in missings
+                ]
+                concurrent.futures.wait(jobs)
 
 
 def gridpoint_from_map_coordinate(coordinate: MapCoordinate):

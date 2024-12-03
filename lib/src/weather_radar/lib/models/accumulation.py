@@ -5,7 +5,7 @@ from functools import cached_property
 from weather_radar.lib.area import CoordinateArea, MapCoordinate, NOAAGridpoint, gridpoint_from_map_coordinate
 from ..connection import NOAAConnection
 
-from scipy.interpolate import CubicSpline
+from scipy import interpolate
 
 CAMEL_TO_KEBAB = re.compile(r'(?<!^)(?=[A-Z])')
 KEBAB_TO_CAMEL = re.compile(r'(?<!\A)-(?=[a-zA-Z])',re.X)
@@ -36,7 +36,7 @@ class AccumulationModel:
 
     @cached_property
     def model(self):
-        """CSpline of a cumulative model, derivative is precipitation at a
+        """Spline of a cumulative model, derivative is accumulator at a
         given time"""
 
         conn = NOAAConnection()
@@ -59,19 +59,27 @@ class AccumulationModel:
             for i, (a, _) in enumerate(data)
         ]
         model_data = list(zip(*model_data))
-        model = CubicSpline(model_data[0], model_data[1]).derivative()
+        x, y = model_data
+        model = interpolate.BSpline(x, y, k=3).derivative()
         return start_time, center_coordinate, model
 
     def predict(self, time, dt=0, verbose=False):
+        if type(time) is list:
+            return self.predict_many(time, dt=dt, verbose=verbose)
+
         start_time, center_coordinate, f = self.model
         time = time.astimezone()
         t = (time - start_time).total_seconds()
         y = f(t) if not dt else f.integrate(t, t+dt)
+        y = y.item()
+        if y < 0:
+            y = 0
         if verbose:
             return {
                 "type": "Feature",
                 "properties": {
-                    self.attribute: y.item(),
+                    self.attribute: y,
+                    "time": time.isoformat(),
                 },
                 "geometry": {
                     "type": "Point",
@@ -79,6 +87,15 @@ class AccumulationModel:
                 }
             }
         return y
+
+    def predict_many(self, times, dt=0, verbose=False):
+        return {
+            "type": "FeatureCollection",
+            "features": [
+                self.predict(time, dt=dt, verbose=verbose)
+                for time in times
+            ]
+        }
 
 
 class AccumulationEnsemble:
