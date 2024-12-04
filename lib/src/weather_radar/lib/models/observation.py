@@ -1,13 +1,19 @@
-from datetime import datetime
 from functools import cached_property
-from weather_radar.lib.area import CoordinateArea, MapCoordinate, NOAAGridpoint, gridpoint_from_map_coordinate
-from ..connection import NOAAConnection
 
+from datetime import datetime
 from scipy import interpolate
 
+from weather_radar.lib.area import MapCoordinate, NOAAGridpoint, gridpoint_from_map_coordinate
+from ..connection import NOAAConnection
 from .utils import to_camel_case
 
-class AccumulationModel:
+
+WRAPPER_FUNCTIONS = {
+        "temperature": lambda f: lambda *a, **kwd: (9/5*f(*a, **kwd)) + 32
+}
+
+
+class ObservationModel:
     def __init__(self, coordinate: NOAAGridpoint, attribute: str):
         self.coordinate = coordinate
         self.attribute = attribute
@@ -25,6 +31,7 @@ class AccumulationModel:
 
         conn = NOAAConnection()
         data = conn.get(f"/gridpoints/{self.coordinate}")
+        attr = to_camel_case(self.attribute)
 
         polygon, = data["geometry"]["coordinates"]
         polygon = set(tuple(x) for x in polygon)
@@ -32,32 +39,30 @@ class AccumulationModel:
         center_coordinate = [sum(item) / len(item) for item in polygon]
         center_coordinate = MapCoordinate(*center_coordinate)
         data = data["properties"]
-        data = data[to_camel_case(self.attribute)]["values"]
+        data = data[attr]["values"]
         data = [
             (datetime.fromisoformat(d["validTime"].split("/")[0]), d["value"])
             for d in data
-       ]
+        ]
         start_time = data[0][0]
         model_data = [
-            ((a-start_time).total_seconds(), sum(d[1] for d in data[:i+1]))
-            for i, (a, _) in enumerate(data)
+            ((a-start_time).total_seconds(), b)
+            for a, b in data
         ]
         model_data = list(zip(*model_data))
         x, y = model_data
-        model = interpolate.BSpline(x, y, k=3).derivative()
+        model = interpolate.CubicSpline(x, y)
+        model = WRAPPER_FUNCTIONS.get(attr, lambda f: f)(model)
         return start_time, center_coordinate, model
 
-    def predict(self, time, dt=0, verbose=False):
+    def predict(self, time, verbose=False, **_):
         if type(time) is list:
-            return self.predict_many(time, dt=dt, verbose=verbose)
+            return self.predict_many(time, verbose=verbose)
 
         start_time, center_coordinate, f = self.model
         time = time.astimezone()
         t = (time - start_time).total_seconds()
-        y = f(t) if not dt else f.integrate(t, t+dt)
-        y = y.item()
-        if y < 0:
-            y = 0
+        y = f(t).item()
         if verbose:
             return {
                 "type": "Feature",
@@ -78,28 +83,5 @@ class AccumulationModel:
             "features": [
                 self.predict(time, dt=dt, verbose=verbose)
                 for time in times
-            ]
-        }
-
-
-class AccumulationEnsemble:
-    def __init__(self, area: CoordinateArea, attribute: str):
-        self.area = area
-        self.attribute = attribute
-        self._cache = {}
-
-    def __getitem__(self, coordinate: NOAAGridpoint):
-        model = self._cache.get(coordinate, None)
-        if not model:
-            model = AccumulationModel(coordinate, self.attribute)
-            self._cache[coordinate] = model
-        return model
-
-    def predict(self, time: datetime, dt=0, verbose=False):
-        return {
-            "type": "FeatureCollection",
-            "features": [
-                self[coordinate].predict(time, dt=dt, verbose=verbose)
-                for coordinate in self.area.gridpoints
             ]
         }

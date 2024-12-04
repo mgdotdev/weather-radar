@@ -2,17 +2,19 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from weather_radar.server.api.models.utils import datetime_from_time, time_t
 
+from weather_radar.lib.models import model_from_type
 from weather_radar.lib.models.accumulation import AccumulationModel, AccumulationEnsemble
 from weather_radar.lib.area import MapCoordinate, CoordinateArea
 
 router = APIRouter(prefix="/models")
 
 
-@router.get("/{model}/type/point", response_class=JSONResponse)
-def models(model: str, lat: float, lon: float, time: time_t=None, dt:int=0, counts: int=0):
+@router.get("/{model}/params/{param}", response_class=JSONResponse)
+def models(model: str, param: str, lat: float, lon: float, time: time_t=None, dt:int=0, counts: int=0):
     dtime = datetime_from_time(time, dt=dt, counts=counts)
     coord = MapCoordinate(lat, lon)
-    model = AccumulationModel.from_map_coordinate(coord, model)
+    model_class = model_from_type(model)
+    model = model_class.from_map_coordinate(coord, param)
     return model.predict(dtime, dt=dt, verbose=True)
 
 
