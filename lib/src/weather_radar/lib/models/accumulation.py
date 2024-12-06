@@ -31,8 +31,9 @@ class AccumulationModel:
         polygon = list(zip(*polygon))
         center_coordinate = [sum(item) / len(item) for item in polygon]
         center_coordinate = MapCoordinate(*center_coordinate)
-        data = data["properties"]
-        data = data[to_camel_case(self.attribute)]["values"]
+        data = data["properties"][to_camel_case(self.attribute)]
+        _, units = data["uom"].split(":")
+        data = data["values"]
         data = [
             (datetime.fromisoformat(d["validTime"].split("/")[0]), d["value"])
             for d in data
@@ -45,20 +46,19 @@ class AccumulationModel:
         ]
         model_data = list(zip(*model_data))
         x, y = model_data
-        model = interpolate.BSpline(x, y, k=3).derivative()
-        return start_time, end_time, center_coordinate, model
+        model = interpolate.BSpline(x, y, k=3)
+        return start_time, end_time, center_coordinate, model, units
 
-    def predict(self, time, dt=0, verbose=False):
+    def predict(self, time, verbose=False):
         if type(time) is not datetime:
-            return self.predict_many(time, dt=dt, verbose=verbose)
+            return self.predict_many(time, verbose=verbose)
 
-        start_time, end_time, center_coordinate, f = self.model
+        start_time, end_time, center_coordinate, f, units = self.model
         time = time.astimezone()
         if time > end_time:
             raise BoundsError
         t = (time - start_time).total_seconds()
-        y = f(t) if not dt else f.integrate(t, t+dt)
-        y = y.item()
+        y = f(t).item()
         if y < 0:
             y = 0
         if verbose:
@@ -67,6 +67,7 @@ class AccumulationModel:
                 "properties": {
                     self.attribute: y,
                     "time": time.isoformat(),
+                    "uom": units
                 },
                 "geometry": {
                     "type": "Point",
@@ -75,11 +76,11 @@ class AccumulationModel:
             }
         return y
 
-    def predict_many(self, times, dt=0, verbose=False):
+    def predict_many(self, times, verbose=False):
         features = []
         for time in times:
             try:
-                feature = self.predict(time, dt=dt, verbose=verbose)
+                feature = self.predict(time, verbose=verbose)
             except BoundsError:
                 break
             else:

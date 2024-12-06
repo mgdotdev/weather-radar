@@ -54,7 +54,6 @@
   Plotly.newPlot('graph', data, layout);
 
   document.addEventListener("DOMContentLoaded", async function() {
-
     let dt = {{dt}}
     let counts = {{counts}}
     let lat = {{starting_latitude}}
@@ -73,11 +72,12 @@
           y.push(feature["properties"][param])
           x.push(feature["properties"]["time"])
         }
+        let unit = res.features[0]["properties"]["uom"]
         let trace = {
           x: x,
           y: y,
           type: 'scatter',
-          name: param,
+          name: `${param} (${unit})`,
         }
         data.push(trace)
       }

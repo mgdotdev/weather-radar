@@ -15,7 +15,7 @@ def models(model: str, param: str, lat: float, lon: float, time: time_t=None, dt
     coord = MapCoordinate(lat, lon)
     model_class = model_from_type(model)
     model = model_class.from_map_coordinate(coord, param)
-    return model.predict(dtime, dt=dt, verbose=True)
+    return model.predict(dtime, verbose=True)
 
 
 @router.get("/prefetch", status_code=204)

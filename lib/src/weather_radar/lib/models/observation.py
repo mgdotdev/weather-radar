@@ -9,7 +9,7 @@ from .utils import BoundsError, to_camel_case
 
 
 WRAPPER_FUNCTIONS = {
-        "temperature": lambda f: lambda *a, **kwd: (9/5*f(*a, **kwd)) + 32
+        "temperature": lambda f, _: ((lambda *a, **kwd: (9/5*f(*a, **kwd)) + 32), "degF")
 }
 
 
@@ -38,8 +38,9 @@ class ObservationModel:
         polygon = list(zip(*polygon))
         center_coordinate = [sum(item) / len(item) for item in polygon]
         center_coordinate = MapCoordinate(*center_coordinate)
-        data = data["properties"]
-        data = data[attr]["values"]
+        data = data["properties"][attr]
+        _, units = data["uom"].split(":")
+        data = data["values"]
         data = [
             (datetime.fromisoformat(d["validTime"].split("/")[0]), d["value"])
             for d in data
@@ -53,14 +54,14 @@ class ObservationModel:
         model_data = list(zip(*model_data))
         x, y = model_data
         model = interpolate.CubicSpline(x, y)
-        model = WRAPPER_FUNCTIONS.get(attr, lambda f: f)(model)
-        return start_time, end_time, center_coordinate, model
+        model, units = WRAPPER_FUNCTIONS.get(attr, lambda f, u: (f, u))(model, units)
+        return start_time, end_time, center_coordinate, model, units
 
-    def predict(self, time, verbose=False, **_):
+    def predict(self, time, verbose=False):
         if type(time) is not datetime:
             return self.predict_many(time, verbose=verbose)
 
-        start_time, end_time, center_coordinate, f = self.model
+        start_time, end_time, center_coordinate, f, units = self.model
         time = time.astimezone()
         if time > end_time:
             raise BoundsError
@@ -72,6 +73,7 @@ class ObservationModel:
                 "properties": {
                     self.attribute: y,
                     "time": time.isoformat(),
+                    "uom": units
                 },
                 "geometry": {
                     "type": "Point",
@@ -80,11 +82,11 @@ class ObservationModel:
             }
         return y
 
-    def predict_many(self, times, dt=0, verbose=False):
+    def predict_many(self, times, verbose=False):
         features = []
         for time in times:
             try:
-                feature = self.predict(time, dt=dt, verbose=verbose)
+                feature = self.predict(time, verbose=verbose)
             except BoundsError:
                 break
             else:
