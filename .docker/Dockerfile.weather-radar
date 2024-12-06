@@ -22,10 +22,8 @@ COPY ./lib/setup.py ./lib/requirements.txt ./lib/
 
 RUN python3 -m pip install --upgrade pip \
  && python -m pip install -r ./lib/requirements.txt \
- && python -m pip install -r ./lib/requirements_testing.txt \
  && python -m pip install -e ./lib --no-cache-dir \
  && python -m pip install -r ./server/requirements.txt \
- && python -m pip install -r ./server/requirements_testing.txt \
  && python -m pip install -e ./server --no-cache-dir \
  && chown -R weather-radar /home/weather-radar
 
