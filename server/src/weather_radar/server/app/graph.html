@@ -8,8 +8,52 @@
 	<div id='graph' style="height: 100vh; width: 100vw; margin: 0px; padding: 0px;"/>
 </body>
 <script>
+
+  let layout = {}
+  let is_ha = {{is_ha}}
+  if (is_ha) {
+    Object.assign(
+      layout,
+      {
+        showlegend: true,
+        legend: {
+          orientation: "h",
+          yref: "container",
+          xref: "container",
+          x: 0.125,
+          y: 0.955,
+          xanchor: "left",
+          yanchor: "top",
+        },
+        font: {
+          size: 12
+        },
+        margin: {
+          t: 70
+        }
+      }
+    )
+  }
+  else {
+    Object.assign(
+      layout,
+      {
+        showlegend: true,
+        legend: {
+          xanchor: "right",
+        },
+        font: {
+          size: 24
+        }
+      }
+    )
+  }
+
+  let data = []
+
+  Plotly.newPlot('graph', data, layout);
+
   document.addEventListener("DOMContentLoaded", async function() {
-    let data = []
 
     let dt = {{dt}}
     let counts = {{counts}}
@@ -38,21 +82,7 @@
         data.push(trace)
       }
     }
-    let layout = {
-      showlegend: true,
-      legend: {
-        orientation: "h",
-        yref: "container",
-        xref: "container",
-        x: 0.95,
-        y: -1.25,
-        xanchor: "right",
-      },
-      font: {
-        size: 14
-      }
-    }
-    Plotly.newPlot('graph', data, layout);
+    Plotly.redraw('graph', data, layout);
   })
 </script>
 </html>

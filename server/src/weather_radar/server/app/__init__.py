@@ -35,7 +35,7 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
 
 
 @router.get("/graph/", response_class=HTMLResponse)
-def graph(models: str, lat: float, lon: float, dark_mode: bool = True, dt: int = 450, counts: int = -1):
+def graph(models: str, lat: float, lon: float, dark_mode: bool = True, dt: int = 450, counts: int = -1, ha: bool = False):
     with open(GRAPH_HTML) as f:
         template = Template(f.read())
     html = template.render({
@@ -44,7 +44,8 @@ def graph(models: str, lat: float, lon: float, dark_mode: bool = True, dt: int =
         "weather_models": models,
         "dt": dt,
         "counts": counts,
-        "dark_mode": DARK_MODE if dark_mode else ""
+        "dark_mode": DARK_MODE if dark_mode else "",
+        "is_ha": "true" if ha else "false"
     })
     return html
 
