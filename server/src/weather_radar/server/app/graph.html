@@ -41,12 +41,15 @@
     let layout = {
       showlegend: true,
       legend: {
-        x: 1,
-        xanchor: 'right',
-        y: 1,
+        orientation: "h",
+        yref: "container",
+        xref: "container",
+        x: 0.95,
+        y: -1.25,
+        xanchor: "right",
       },
       font: {
-        size: 24
+        size: 14
       }
     }
     Plotly.newPlot('graph', data, layout);
