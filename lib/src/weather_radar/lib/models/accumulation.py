@@ -5,7 +5,7 @@ from ..connection import NOAAConnection
 
 from scipy import interpolate
 
-from .utils import to_camel_case
+from .utils import BoundsError, to_camel_case
 
 class AccumulationModel:
     def __init__(self, coordinate: NOAAGridpoint, attribute: str):
@@ -38,6 +38,7 @@ class AccumulationModel:
             for d in data
        ]
         start_time = data[0][0]
+        end_time = data[-1][0]
         model_data = [
             ((a-start_time).total_seconds(), sum(d[1] for d in data[:i+1]))
             for i, (a, _) in enumerate(data)
@@ -45,14 +46,16 @@ class AccumulationModel:
         model_data = list(zip(*model_data))
         x, y = model_data
         model = interpolate.BSpline(x, y, k=3).derivative()
-        return start_time, center_coordinate, model
+        return start_time, end_time, center_coordinate, model
 
     def predict(self, time, dt=0, verbose=False):
-        if type(time) is list:
+        if type(time) is not datetime:
             return self.predict_many(time, dt=dt, verbose=verbose)
 
-        start_time, center_coordinate, f = self.model
+        start_time, end_time, center_coordinate, f = self.model
         time = time.astimezone()
+        if time > end_time:
+            raise BoundsError
         t = (time - start_time).total_seconds()
         y = f(t) if not dt else f.integrate(t, t+dt)
         y = y.item()
@@ -73,13 +76,19 @@ class AccumulationModel:
         return y
 
     def predict_many(self, times, dt=0, verbose=False):
+        features = []
+        for time in times:
+            try:
+                feature = self.predict(time, dt=dt, verbose=verbose)
+            except BoundsError:
+                break
+            else:
+                features.append(feature)
         return {
             "type": "FeatureCollection",
-            "features": [
-                self.predict(time, dt=dt, verbose=verbose)
-                for time in times
-            ]
+            "features": features
         }
+
 
 
 class AccumulationEnsemble:

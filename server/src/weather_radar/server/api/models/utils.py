@@ -1,8 +1,18 @@
 from datetime import datetime, timedelta
+from typing import Iterable
 
 time_t = float|str|None
 
-def datetime_from_time(time: time_t, dt=0, counts=0) -> datetime|list[datetime]:
+GUARD = 10_000
+
+def _time_generator(dtime, dt_td, counts: int = -1):
+    count = 0
+    while count != counts and count < GUARD:
+        yield dtime + (dt_td * count)
+        count += 1
+
+
+def datetime_from_time(time: time_t, dt=0, counts: int = -1) -> datetime|Iterable[datetime]:
     if time is None:
         dtime = datetime.now()
     else:
@@ -12,11 +22,8 @@ def datetime_from_time(time: time_t, dt=0, counts=0) -> datetime|list[datetime]:
             dtime = datetime.fromisoformat(str(time))
         else:
             dtime = datetime.fromtimestamp(dtime)
-    if not counts:
+    if not dt:
         return dtime
     dt_td = timedelta(seconds=float(dt))
-    return [
-        dtime + (dt_td * i)
-        for i in range(counts)
-    ]
+    return _time_generator(dtime, dt_td, counts)
 

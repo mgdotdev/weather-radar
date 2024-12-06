@@ -5,7 +5,7 @@ from scipy import interpolate
 
 from weather_radar.lib.area import MapCoordinate, NOAAGridpoint, gridpoint_from_map_coordinate
 from ..connection import NOAAConnection
-from .utils import to_camel_case
+from .utils import BoundsError, to_camel_case
 
 
 WRAPPER_FUNCTIONS = {
@@ -45,6 +45,7 @@ class ObservationModel:
             for d in data
         ]
         start_time = data[0][0]
+        end_time = data[-1][0]
         model_data = [
             ((a-start_time).total_seconds(), b)
             for a, b in data
@@ -53,14 +54,16 @@ class ObservationModel:
         x, y = model_data
         model = interpolate.CubicSpline(x, y)
         model = WRAPPER_FUNCTIONS.get(attr, lambda f: f)(model)
-        return start_time, center_coordinate, model
+        return start_time, end_time, center_coordinate, model
 
     def predict(self, time, verbose=False, **_):
-        if type(time) is list:
+        if type(time) is not datetime:
             return self.predict_many(time, verbose=verbose)
 
-        start_time, center_coordinate, f = self.model
+        start_time, end_time, center_coordinate, f = self.model
         time = time.astimezone()
+        if time > end_time:
+            raise BoundsError
         t = (time - start_time).total_seconds()
         y = f(t).item()
         if verbose:
@@ -78,10 +81,15 @@ class ObservationModel:
         return y
 
     def predict_many(self, times, dt=0, verbose=False):
+        features = []
+        for time in times:
+            try:
+                feature = self.predict(time, dt=dt, verbose=verbose)
+            except BoundsError:
+                break
+            else:
+                features.append(feature)
         return {
             "type": "FeatureCollection",
-            "features": [
-                self.predict(time, dt=dt, verbose=verbose)
-                for time in times
-            ]
+            "features": features
         }

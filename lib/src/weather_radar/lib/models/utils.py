@@ -16,3 +16,4 @@ def to_kebab_case(value):
     return CAMEL_TO_KEBAB.sub('_', value).lower()
 
 
+class BoundsError(Exception): ...

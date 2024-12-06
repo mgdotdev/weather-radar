@@ -11,6 +11,13 @@ GRAPH_HTML = os.path.join(HERE, "graph.html")
 
 router = APIRouter()
 
+DARK_MODE = """
+  <style type="text/css">
+  .plot-container {
+    filter: invert(75%) hue-rotate(180deg);
+  }
+  </style>
+"""
 
 @router.get("/map/models/{model}/", response_class=HTMLResponse)
 def map(model: str, width: float, height: float, lat: float, lon: float, dt: int):
@@ -28,7 +35,7 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
 
 
 @router.get("/graph/", response_class=HTMLResponse)
-def graph(models: str, lat: float, lon: float, dt: int = 0, counts: int = 0):
+def graph(models: str, lat: float, lon: float, dark_mode: bool = True, dt: int = 450, counts: int = -1):
     with open(GRAPH_HTML) as f:
         template = Template(f.read())
     html = template.render({
@@ -37,6 +44,7 @@ def graph(models: str, lat: float, lon: float, dt: int = 0, counts: int = 0):
         "weather_models": models,
         "dt": dt,
         "counts": counts,
+        "dark_mode": DARK_MODE if dark_mode else ""
     })
     return html
 
