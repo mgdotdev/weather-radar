@@ -58,6 +58,7 @@ class AccumulationModel:
         if time > end_time:
             raise BoundsError
         t = (time - start_time).total_seconds()
+        time = time.replace(tzinfo=None)
         y = f(t).item()
         if y < 0:
             y = 0
