@@ -6,6 +6,7 @@ from fastapi.responses import HTMLResponse
 from jinja2 import Template
 
 
+
 HERE = os.path.abspath(os.path.dirname(__file__))
 MAP_HTML = os.path.join(HERE, "map.html")
 GRAPH_HTML = os.path.join(HERE, "graph.html")
@@ -21,60 +22,92 @@ DARK_MODE = """
 """
 
 
-# Per-kind heatmap rendering profiles. Each profile supplies the MapLibre
-# `heatmap-weight` input->weight stops and the `heatmap-color` density ramp.
-# `prop` is the GeoJSON property key the features carry (equal to the model
-# name). Precipitation is an accumulation that should fade to transparent at
-# zero; temperature is an observation whose cold end is meaningful, so it uses
-# a diverging cold->hot ramp with no transparent floor.
-HEATMAP_PROFILES = {
-    "accumulation": {
-        # Precipitation uses a fixed, absolute weight scale: 0 genuinely means
-        # "no precipitation", so the range should not adapt to the data.
-        "adaptive": False,
-        "weight_stops": [0, 0, 0.5, 0.2, 2, 0.5, 5, 0.8, 10, 1],
+# Per-model rendering profiles for the contour map. Each entry fully describes
+# how a NOAA gridpoint attribute is fetched and drawn:
+#   kind          -> which ensemble resolves it ("observation" or "accumulation")
+#   label         -> human-friendly name (unused server-side; handy for docs)
+#   contour_step  -> default value delta between contour lines (live-adjustable)
+#   color_ramp    -> sequential [pos, "rgb(...)", ...] ramp for fill + borders
+# Units are NOT specified here: they flow through from the model's data
+# (NOAA's `uom`, e.g. degF after the temperature wrapper, or native mm for
+# accumulation), so the legend/readout always reflect the real units.
+#
+# Accumulation attributes (snowfall, precipitation) are cumulative "storm
+# totals": each frame shows the running sum up to that time, so contours only
+# grow over the animation. The fixed global color scale (value_range samples
+# the whole lifecycle) keeps the end-of-storm maximum from blowing out early
+# frames.
+MODEL_PROFILES = {
+    "temperature": {
+        "kind": "observation",
+        "label": "Temperature",
+        "contour_step": 1.0,
+        # Subtle sequential cool->warm gradient. Opaque colors; transparency is
+        # applied uniformly via the fill layer so it never varies per band.
         "color_ramp": [
-            0, "rgba(0, 0, 255, 0)",
-            0.2, "rgba(0, 170, 255, 0.6)",
-            0.4, "rgba(0, 255, 170, 0.7)",
-            0.6, "rgba(170, 255, 0, 0.8)",
-            0.8, "rgba(255, 170, 0, 0.9)",
-            1, "rgba(255, 0, 0, 1)",
+            0.0,   "rgb(69, 117, 180)",
+            0.125, "rgb(96, 141, 186)",
+            0.25,  "rgb(123, 165, 180)",
+            0.375, "rgb(150, 183, 166)",
+            0.5,   "rgb(180, 196, 150)",
+            0.625, "rgb(205, 192, 130)",
+            0.75,  "rgb(222, 173, 110)",
+            0.875, "rgb(227, 146, 95)",
+            1.0,   "rgb(222, 119, 86)",
         ],
     },
-    "observation": {
-        # Temperature (and other observations) have no meaningful absolute
-        # zero for colouring, and a local area often spans only a few degrees.
-        # `adaptive` tells the client to rescale the weight ramp to each
-        # payload's actual min/max so local variation is visible. The
-        # `weight_stops` below are only a fallback used before the first
-        # payload arrives.
-        "adaptive": True,
-        "weight_stops": [0, 0, 20, 0.2, 50, 0.4, 70, 0.6, 90, 0.8, 110, 1],
-        # A subtle sequential gradient with many closely-spaced stops, so
-        # adjacent contour bands differ only slightly. Colors are opaque here;
-        # transparency is applied uniformly via the layer's fill-opacity so it
-        # never varies between frames/bands.
+    "snowfall-amount": {
+        "kind": "accumulation",
+        "label": "Snowfall",
+        # Snow totals (inches) can reach a few feet over a storm; a coarser
+        # default step keeps the contour set readable. Adjustable in the legend.
+        "contour_step": 2.0,
+        # White -> blue sequential ramp.
         "color_ramp": [
-            0.0,  "rgb(69, 117, 180)",
-            0.125, "rgb(96, 141, 186)",
-            0.25, "rgb(123, 165, 180)",
-            0.375, "rgb(150, 183, 166)",
-            0.5,  "rgb(180, 196, 150)",
-            0.625, "rgb(205, 192, 130)",
-            0.75, "rgb(222, 173, 110)",
-            0.875, "rgb(227, 146, 95)",
-            1.0,  "rgb(222, 119, 86)",
+            0.0, "rgb(247, 251, 255)",
+            0.25, "rgb(198, 219, 239)",
+            0.5, "rgb(107, 174, 214)",
+            0.75, "rgb(33, 113, 181)",
+            1.0, "rgb(8, 48, 107)",
+        ],
+    },
+    "quantitative-precipitation": {
+        "kind": "accumulation",
+        "label": "Precipitation",
+        # Precipitation (inches) totals are typically smaller than snow; a
+        # finer default step surfaces light-precip structure.
+        "contour_step": 0.5,
+        # White -> teal -> blue sequential ramp.
+        "color_ramp": [
+            0.0, "rgb(247, 252, 253)",
+            0.25, "rgb(204, 236, 230)",
+            0.5, "rgb(102, 194, 164)",
+            0.75, "rgb(44, 127, 184)",
+            1.0, "rgb(8, 64, 129)",
         ],
     },
 }
 
+# Fallback profile for any unregistered attribute: treat it as an observation
+# with a neutral sequential ramp so the map still renders something sensible.
+DEFAULT_PROFILE = MODEL_PROFILES["temperature"]
+
 
 @router.get("/map/models/{model}/", response_class=HTMLResponse)
-def map(model: str, width: float, height: float, lat: float, lon: float, dt: int, kind: str = "accumulation", step: float = 1.0, speed: float = 1.0):
-    profile = HEATMAP_PROFILES.get(kind, HEATMAP_PROFILES["accumulation"])
-    # Contour interval: the value delta between adjacent contour lines (e.g.
-    # 1.0 degree, 0.5 degree). Clamped to a sane positive range.
+def map(model: str, width: float, height: float, lat: float, lon: float, dt: int, kind: str = None, step: float = None, speed: float = 1.0):
+    # Model names are kebab-case end-to-end (URL, GeoJSON property key, API
+    # params). The data layer converts to the camelCase NOAA attribute only
+    # when reading the gridpoint (see models.utils.to_camel_case), so nothing
+    # here needs to convert.
+    profile = MODEL_PROFILES.get(model, DEFAULT_PROFILE)
+    # The data kind (which ensemble fetches the attribute) is derived from the
+    # model's profile. An explicit `kind` query param may still override it.
+    kind = kind or profile["kind"]
+    # Contour interval: the value delta between adjacent contour lines. When
+    # the user hasn't specified `step`, the client auto-scales it to the data's
+    # global range (auto_step=True); the profile value is only a seed/fallback.
+    auto_step = step is None
+    step = profile["contour_step"] if step is None else step
     step = max(0.1, min(float(step), 100.0))
     # Playback speed multiplier: higher = faster animation (shorter interval
     # between frames). Clamped to a sensible range.
@@ -90,10 +123,9 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
         "dt": dt,
         "kind": kind,
         "contour_step": step,
+        "auto_step": "true" if auto_step else "false",
         "playback_speed": speed,
-        "heatmap_adaptive": "true" if profile.get("adaptive") else "false",
-        "heatmap_weight_stops": json.dumps(profile["weight_stops"]),
-        "heatmap_color_ramp": json.dumps(profile["color_ramp"]),
+        "contour_color_ramp": json.dumps(profile["color_ramp"]),
     })
     return html
 

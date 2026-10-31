@@ -10,6 +10,15 @@ from scipy import interpolate
 from .utils import BoundsError, to_camel_case
 
 
+# NOAA reports accumulation attributes (snowfall, precipitation) in
+# millimetres (wmoUnit:mm). We display inches instead. Map the native unit to
+# a (factor, display-unit) pair; unknown units pass through unchanged.
+MM_TO_IN = 1.0 / 25.4
+UNIT_CONVERSIONS = {
+    "mm": (MM_TO_IN, "in"),
+}
+
+
 # Process-wide cache of fitted models, keyed by (gridpoint, attribute).
 # Fitting a spline requires reading/parsing the gridpoint JSON and running
 # scipy interpolation, which is expensive to redo on every request. The
@@ -67,15 +76,22 @@ class AccumulationModel:
         center_coordinate = MapCoordinate(*center_coordinate)
         data = data["properties"][to_camel_case(self.attribute)]
         _, units = data["uom"].split(":")
+        # Convert from NOAA's native unit (mm) to our display unit (inches).
+        factor, units = UNIT_CONVERSIONS.get(units, (1.0, units))
         data = data["values"]
         data = [
             (datetime.fromisoformat(d["validTime"].split("/")[0]), d["value"])
             for d in data
-       ]
+        ]
         start_time = data[0][0]
         end_time = data[-1][0]
+        # A null value means "no accumulation reported for this interval", so
+        # treat it as 0 when summing. (Summing a None would raise TypeError and
+        # silently drop the whole gridpoint.) Values are scaled to the display
+        # unit as they're summed.
         model_data = [
-            ((a-start_time).total_seconds(), sum(d[1] for d in data[:i+1]))
+            ((a-start_time).total_seconds(),
+             sum((d[1] or 0) for d in data[:i+1]) * factor)
             for i, (a, _) in enumerate(data)
         ]
         model_data = list(zip(*model_data))
@@ -94,7 +110,7 @@ class AccumulationModel:
 
         start_time, end_time, center_coordinate, f, units, _expiry = self.model
         time = time.astimezone()
-        if time > end_time:
+        if time > end_time or time < start_time:
             raise BoundsError
         t = (time - start_time).total_seconds()
         time = time.replace(tzinfo=None)
@@ -170,11 +186,20 @@ class AccumulationEnsemble:
     def value_range(self, samples: int = 24):
         """Global min/max of the predicted value over the entire forecast
         lifecycle across all gridpoints (see ObservationEnsemble.value_range).
-        Returns {"min", "max", "uom"} or None. Negative accumulation values
-        are clamped to 0 to match predict()."""
+        Negative accumulation values are clamped to 0 to match predict().
+
+        Also returns the forecast window shared by all gridpoints (the latest
+        start / earliest end — i.e. the INTERSECTION of per-gridpoint
+        horizons), as ISO-8601 strings, so looping keeps the whole area
+        populated instead of shrinking as shorter-horizon gridpoints drop out.
+
+        Returns {"min", "max", "uom", "start", "end"} or None.
+        """
         vmin = None
         vmax = None
         units = None
+        start = None
+        end = None
         for coordinate in self.area.iter_gridpoints():
             m = self[coordinate]
             try:
@@ -182,6 +207,11 @@ class AccumulationEnsemble:
             except Exception:
                 continue
             units = units or uom
+            # Intersection of horizons: latest start, earliest end.
+            if start is None or start_time > start:
+                start = start_time
+            if end is None or end_time < end:
+                end = end_time
             total = (end_time - start_time).total_seconds()
             if total <= 0:
                 continue
@@ -196,4 +226,13 @@ class AccumulationEnsemble:
                     vmax = y
         if vmin is None:
             return None
-        return {"min": vmin, "max": vmax, "uom": units}
+        # A valid shared window requires start < end; if per-gridpoint horizons
+        # don't overlap, report no window (client then skips looping).
+        window_ok = start is not None and end is not None and start < end
+        return {
+            "min": vmin,
+            "max": vmax,
+            "uom": units,
+            "start": start.isoformat() if window_ok else None,
+            "end": end.isoformat() if window_ok else None,
+        }

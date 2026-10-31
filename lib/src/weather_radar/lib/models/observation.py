@@ -75,6 +75,10 @@ class ObservationModel:
             (datetime.fromisoformat(d["validTime"].split("/")[0]), d["value"])
             for d in data
         ]
+        # Drop entries with no observed value: a null doesn't mean zero for an
+        # observation (e.g. temperature), it means "no data at this time", so
+        # we omit the point and let the spline interpolate across the gap.
+        data = [(a, b) for a, b in data if b is not None]
         start_time = data[0][0]
         end_time = data[-1][0]
         model_data = [
@@ -93,7 +97,7 @@ class ObservationModel:
 
         start_time, end_time, center_coordinate, f, units, _expiry = self.model
         time = time.astimezone()
-        if time > end_time:
+        if time > end_time or time < start_time:
             raise BoundsError
         t = (time - start_time).total_seconds()
         y = f(t).item()
@@ -166,12 +170,21 @@ class ObservationEnsemble:
         gridpoint's fitted model at `samples` times spanning its forecast
         horizon (so unit wrappers like degC->degF are applied consistently).
 
-        Returns {"min", "max", "uom"} or None if there's no data. Requires the
-        area's data to be cached (call /prefetch first) to be fast.
+        Also returns the forecast window shared by all gridpoints (the latest
+        start / earliest end — i.e. the INTERSECTION of per-gridpoint
+        horizons), as ISO-8601 strings. Looping over this window keeps the
+        whole area populated: gridpoints with shorter horizons won't drop out
+        and shrink the contour field near the ends.
+
+        Returns {"min", "max", "uom", "start", "end"} or None if there's no
+        data. Requires the area's data to be cached (call /prefetch first) to
+        be fast.
         """
         vmin = None
         vmax = None
         units = None
+        start = None
+        end = None
         for coordinate in self.area.iter_gridpoints():
             m = self[coordinate]
             try:
@@ -179,6 +192,11 @@ class ObservationEnsemble:
             except Exception:
                 continue
             units = units or uom
+            # Intersection of horizons: latest start, earliest end.
+            if start is None or start_time > start:
+                start = start_time
+            if end is None or end_time < end:
+                end = end_time
             total = (end_time - start_time).total_seconds()
             if total <= 0:
                 continue
@@ -191,4 +209,13 @@ class ObservationEnsemble:
                     vmax = y
         if vmin is None:
             return None
-        return {"min": vmin, "max": vmax, "uom": units}
+        # A valid shared window requires start < end; if per-gridpoint horizons
+        # don't overlap, report no window (client then skips looping).
+        window_ok = start is not None and end is not None and start < end
+        return {
+            "min": vmin,
+            "max": vmax,
+            "uom": units,
+            "start": start.isoformat() if window_ok else None,
+            "end": end.isoformat() if window_ok else None,
+        }

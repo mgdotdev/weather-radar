@@ -21,18 +21,19 @@
   </head>
   <body style="margin: 0px; padding: 0px;">
     <div id="weatherRadar" style="height: 100vh; width: 100vw; margin: 0px; padding: 0px;"/>
-    <h2 id="displayTime" style="position: fixed; top: 2px; left: 20px; z-index: 100;"/></h2>
 
-    <!-- Color legend (draggable), shown once the field renders. -->
+    <!-- Color legend (draggable), shown once the field renders. Fixed width
+         so it never grows/shrinks as the (variable-length) timestamp updates. -->
     <div id="legend" style="
         position: fixed; top: 50px; left: 20px; z-index: 100;
-        display: none; background: rgba(255,255,255,0.85);
+        display: none; background: rgba(255,255,255,0.85); box-sizing: border-box;
+        width: 360px;
         padding: 8px 10px; border-radius: 6px; font-family: sans-serif;
         font-size: 12px; color: #222; box-shadow: 0 1px 4px rgba(0,0,0,0.3);
         cursor: move; user-select: none;">
       <div id="legendTitle" style="font-weight: 600; margin-bottom: 4px;"></div>
-      <div id="legendBar" style="height: 12px; width: 180px; border-radius: 2px;
-        border: 1px solid rgba(0,0,0,0.2);"></div>
+      <div id="legendBar" style="height: 12px; width: 100%; border-radius: 2px;
+        border: 1px solid rgba(0,0,0,0.2); box-sizing: border-box;"></div>
       <div style="display: flex; justify-content: space-between; margin-top: 2px;">
         <span id="legendMin"></span>
         <span id="legendMid"></span>
@@ -41,12 +42,20 @@
       <!-- Playback controls. Rows share a grid so the −/+ buttons line up in
            consistent columns regardless of label/value width. -->
       <div style="margin-top:8px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12);">
-        <div style="margin-bottom:6px;">
-          <button id="playPause" title="Pause / Play" style="cursor:pointer; width:100%; height:24px;
-            border:1px solid #bbb; border-radius:4px; background:#f5f5f5; font-size:12px; line-height:1; padding:0;">⏸ Pause</button>
+        <!-- Play/Pause sits beside the time scrubber, which reflects the
+             current animation time and lets you jump to any point in the
+             forecast window. -->
+        <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
+          <button id="playPause" title="Pause / Play" style="cursor:pointer; flex:0 0 auto; height:24px;
+            border:1px solid #bbb; border-radius:4px; background:#f5f5f5; font-size:12px; line-height:1; padding:0 8px;">⏸</button>
+          <input id="timeSlider" type="range" min="0" max="1" step="1" value="0" disabled
+            style="flex:1 1 auto; cursor:pointer; margin:0; min-width:0;" title="Scrub through time" />
         </div>
-        <div style="display:grid; grid-template-columns:auto 22px 52px 22px; align-items:center;
-            column-gap:6px; row-gap:6px; justify-content:start;">
+        <div id="timeSliderLabel" style="font-size:10px; color:#666; text-align:center;
+          margin-bottom:6px; font-variant-numeric:tabular-nums;
+          white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">—</div>
+        <div style="display:grid; grid-template-columns:1fr 22px 52px 22px; align-items:center;
+            column-gap:6px; row-gap:6px;">
           <span style="font-size:11px; color:#555;">Speed</span>
           <button id="speedDown" title="Slower" class="ctlbtn">−</button>
           <span id="speedLabel" class="ctlval">1.0×</span>
@@ -110,17 +119,23 @@
     let width = {{width}}
     let height = {{height}}
     let dt = {{dt}}
-    const adaptive = {{heatmap_adaptive}}
-    const weightStops = {{heatmap_weight_stops}}
-    const colorRamp = {{heatmap_color_ramp}}
+    const colorRamp = {{contour_color_ramp}}
     // Contour interval: the value delta between adjacent contour lines
     // (e.g. 1.0, 0.5, 2.0 degrees). Configurable live in the legend.
     let contourStep = {{contour_step}}
+    // When true, the step auto-scales to the data's global range (targeting a
+    // readable number of bands). Any manual change in the legend turns this
+    // off so the user's choice sticks. Set false when `step` is in the URL.
+    let autoStep = {{auto_step}}
 
     // Fixed color-scale range across the whole forecast lifecycle, fetched
     // once before the first render so colors/legend stay stable over time.
     // Null until fetched (then buildContours falls back to the frame range).
     let globalMin = null, globalMax = null
+    // Forecast time window (epoch seconds) for the current area, from the
+    // range API. Used to loop the animation back to the start when `time`
+    // passes the end. Null until fetched.
+    let forecastStart = null, forecastEnd = null
     let lastFeatures = []  // most recent frame's features (for instant re-render on contour-step change)
 
     // Grid resolution and interpolation smoothing for the contour field.
@@ -229,7 +244,14 @@
           if (val > vMax) vMax = val
         }
       }
-      if (!(vMax > vMin)) vMax = vMin + 1
+      // If the field is completely flat (e.g. an all-zero accumulation like
+      // snowfall with no snow forecast), there are no contours to draw. Emit
+      // an empty collection rather than letting d3-contour produce spurious
+      // full-extent polygons for thresholds at/below the constant value.
+      const FLAT_EPS = 1e-9
+      if (!(vMax - vMin > FLAT_EPS)) {
+        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax, units: features[0].properties.uom || "" }
+      }
 
       // Color scale: use the FIXED global range (whole forecast lifecycle)
       // when available, so a given temperature is the same color in every
@@ -239,14 +261,21 @@
       const cSpan = (cMax - cMin) || 1
 
       // Thresholds are anchored to FIXED absolute values spaced `contourStep`
-      // apart (e.g. every 1.0 degree). Boundaries represent the same absolute
-      // temperatures every frame, so a given isoline is always in the same
-      // place as the field moves — no spurious per-frame value shifts.
+      // apart (e.g. every 1.0 degree), so a given isoline is always at the
+      // same absolute value every frame. Only thresholds that lie strictly
+      // INSIDE the field's (vMin, vMax) range are kept: a threshold at or
+      // beyond the extremes isn't actually crossed by the field, and d3
+      // would otherwise emit a spurious full-extent (or empty) polygon.
       const step = contourStep
-      const tLo = (Math.floor(vMin / step) - 1) * step
-      const tHi = (Math.ceil(vMax / step) + 1) * step
+      const tLo = Math.ceil(vMin / step) * step
+      const tHi = Math.floor(vMax / step) * step
       const thresholds = []
-      for (let tv = tLo; tv <= tHi + 1e-9; tv += step) thresholds.push(tv)
+      for (let tv = tLo; tv <= tHi + 1e-9; tv += step) {
+        if (tv > vMin + 1e-9 && tv < vMax - 1e-9) thresholds.push(tv)
+      }
+      if (!thresholds.length) {
+        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax, units: features[0].properties.uom || "" }
+      }
 
       const polys = d3.contours().size([GRID, GRID]).thresholds(thresholds)(values)
 
@@ -289,33 +318,18 @@
     }
 
     map.on("load", async () => {
-      // Sources + layers.
-      if (adaptive) {
-        map.addSource("contours", { type: 'geojson', data: { type: "FeatureCollection", features: [] } })
-        map.addLayer({
-          id: 'contours', type: 'fill', source: 'contours',
-          paint: { 'fill-color': ['get', 'fillColor'], 'fill-opacity': 0.05, 'fill-antialias': true }
-        })
-        // Strong contour borders (opaque band color) so structure stays
-        // legible even with a very faint fill.
-        map.addLayer({
-          id: 'contour-lines', type: 'line', source: 'contours',
-          layout: { 'line-join': 'round' },
-          paint: { 'line-color': ['get', 'fillColor'], 'line-width': 1.6, 'line-opacity': 0.9 }
-        })
-      } else {
-        map.addSource(model, { type: 'geojson', data: { type: "FeatureCollection", features: [] } })
-        map.addLayer({
-          id: 'heatmap', type: 'heatmap', source: model,
-          paint: {
-            'heatmap-weight': ['interpolate', ['linear'], ['get', model], ...weightStops],
-            'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 0, 0.5, 9, 1, 15, 3],
-            'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 0, 4, 9, 20, 15, 50],
-            'heatmap-color': ['interpolate', ['linear'], ['heatmap-density'], ...colorRamp],
-            'heatmap-opacity': ['interpolate', ['linear'], ['zoom'], 7, 1, 15, 0.7]
-          }
-        })
-      }
+      // Contour sources + layers. A faint fill keeps the basemap visible while
+      // strong, opaque borders make the contour structure legible.
+      map.addSource("contours", { type: 'geojson', data: { type: "FeatureCollection", features: [] } })
+      map.addLayer({
+        id: 'contours', type: 'fill', source: 'contours',
+        paint: { 'fill-color': ['get', 'fillColor'], 'fill-opacity': 0.05, 'fill-antialias': true }
+      })
+      map.addLayer({
+        id: 'contour-lines', type: 'line', source: 'contours',
+        layout: { 'line-join': 'round' },
+        paint: { 'line-color': ['get', 'fillColor'], 'line-width': 1.6, 'line-opacity': 0.9 }
+      })
 
       const mapContainer = document.getElementById("weatherRadar")
       const readoutEl = document.getElementById("cursorReadout")
@@ -486,10 +500,13 @@
         // cache its data, recompute the fixed color range, then render.
         time = Math.floor(Date.now() / 1000)
         globalMin = null; globalMax = null
+        forecastStart = null; forecastEnd = null
+        document.getElementById("timeSlider").disabled = true
         showSpinner()
         try {
           await fetch(`/api/models/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`)
           await fetchGlobalRange()
+          time = clampToForecast(time)
           await loadFrame(time)
         } catch (err) {
           console.error("re-center load failed:", err)
@@ -502,7 +519,7 @@
       window.addEventListener("keydown", (e) => { if (e.key === "Escape") hideMenu() })
 
       // ---- Rendering --------------------------------------------------------
-      // Render one frame's features onto the map (contour field or heatmap).
+      // Render one frame's features as a contour field.
       function renderFeatures(features) {
         lastFeatures = features
         latestPoints = features.map(f => ({
@@ -510,14 +527,15 @@
         })).filter(p => Number.isFinite(p.v))
         latestUnits = features.length ? (features[0].properties.uom || "") : ""
 
-        if (adaptive) {
-          const info = buildContours(features)
-          if (info) {
-            map.getSource("contours").setData(info.fc)
-            updateLegend(info.vMin, info.vMax, info.units)
-          }
-        } else {
-          map.getSource(model).setData({ type: "FeatureCollection", features })
+        // Now that units are known, make sure the contour-interval label shows
+        // them (e.g. "2 mm" instead of a placeholder degree symbol).
+        const stepLbl = document.getElementById("stepLabel")
+        if (stepLbl) stepLbl.textContent = formatStep(contourStep)
+
+        const info = buildContours(features)
+        if (info) {
+          map.getSource("contours").setData(info.fc)
+          updateLegend(info.vMin, info.vMax, info.units)
         }
         // Keep the cursor readout and dropped pins in sync with the new
         // frame's data.
@@ -535,15 +553,14 @@
         const data = await resp.json()
         const features = (data && data.features) || []
         renderFeatures(features)
-        document.getElementById("displayTime").textContent = new Date(time * 1000).toString()
+        syncTimeSlider(time)
         return true
       }
 
       // Fetch the fixed global value range for the current area (whole
-      // forecast lifecycle) so colors/legend stay stable. Only meaningful for
-      // the adaptive contour view. Safe to call after /prefetch.
+      // forecast lifecycle) so colors/legend stay stable across frames.
+      // Safe to call after /prefetch.
       async function fetchGlobalRange() {
-        if (!adaptive) return
         try {
           const resp = await fetch(
             `/api/models/${model}/type/range?lat=${lat}&lon=${lon}&width=${width}&height=${height}&kind=${kind}`
@@ -552,10 +569,29 @@
           if (r && Number.isFinite(r.min) && Number.isFinite(r.max) && r.max > r.min) {
             globalMin = r.min; globalMax = r.max
             console.log("[field] global range:", globalMin.toFixed(1), "-", globalMax.toFixed(1), r.uom)
+            // Auto-scale the contour interval to the range (unless the user
+            // has pinned a step manually / via URL).
+            if (autoStep) applyAutoStep()
+          }
+          // Capture the forecast window so the animation can loop over it.
+          const s = r && r.start ? Math.floor(Date.parse(r.start) / 1000) : NaN
+          const e = r && r.end ? Math.floor(Date.parse(r.end) / 1000) : NaN
+          if (Number.isFinite(s) && Number.isFinite(e) && e > s) {
+            forecastStart = s; forecastEnd = e
+            console.log("[field] forecast window:", new Date(s * 1000).toISOString(), "->", new Date(e * 1000).toISOString())
+            configureTimeSlider()
           }
         } catch (err) {
           console.warn("global range fetch failed; using per-frame range:", err)
         }
+      }
+
+      // Clamp a time (epoch seconds) into the forecast window if known, so the
+      // first frame after a (re)load always falls on valid data.
+      function clampToForecast(t) {
+        if (forecastStart !== null && t < forecastStart) return forecastStart
+        if (forecastEnd !== null && t > forecastEnd) return forecastStart !== null ? forecastStart : t
+        return t
       }
 
       // ---- Animation over time ---------------------------------------------
@@ -581,7 +617,7 @@
       }
       function updatePlayPauseButton() {
         const btn = document.getElementById("playPause")
-        if (btn) { btn.textContent = paused ? "▶ Play" : "⏸ Pause"; btn.title = paused ? "Play" : "Pause" }
+        if (btn) { btn.textContent = paused ? "▶" : "⏸"; btn.title = paused ? "Play" : "Pause" }
       }
       function setPaused(p) {
         if (p === paused) return
@@ -607,6 +643,9 @@
         dt = Math.max(DT_PRESETS[0], Math.min(secs, DT_PRESETS[DT_PRESETS.length - 1]))
         const lbl = document.getElementById("dtLabel")
         if (lbl) lbl.textContent = formatDt(dt)
+        // Keep the time slider's snap resolution in step with dt.
+        const ts = document.getElementById("timeSlider")
+        if (ts && !ts.disabled) ts.step = String(Math.max(1, dt))
         const u = new URL(window.location.href)
         u.searchParams.set("dt", String(dt))
         history.replaceState(null, "", u.toString())
@@ -621,11 +660,59 @@
         setDt(DT_PRESETS[next])
       }
 
-      // Contour interval control. Steps through preset deltas (degrees).
-      const STEP_PRESETS = [0.25, 0.5, 1, 2, 5, 10]
-      function formatStep(s) { return (Number.isInteger(s) ? s : s) + "°" }
+      // Contour interval control. Steps through preset deltas, labeled in the
+      // model's own units (° for temperature, mm for precip/snow, etc.).
+      const STEP_PRESETS = [0.25, 0.5, 1, 2, 5, 10, 20]
+      // Derive the step-label unit suffix from the current data's units.
+      // Temperature-like units render as a degree symbol; everything else gets
+      // a space-separated unit (e.g. "mm"). Falls back to "°" before the first
+      // frame's units are known.
+      function stepUnitSuffix() {
+        const u = (latestUnits || "").toLowerCase()
+        if (!u) return "\u00b0"
+        if (u === "degf" || u === "degc" || u === "f" || u === "c") return "\u00b0"
+        return " " + latestUnits
+      }
+      function formatStep(s) {
+        // Trim to at most 2 decimals, dropping trailing zeros.
+        const n = Math.round(s * 100) / 100
+        return (Number.isInteger(n) ? n : n) + stepUnitSuffix()
+      }
+
+      // Snap a raw interval to a "nice" number: {1, 2, 2.5, 5, 10} x 10^n.
+      // Keeps contour intervals human-friendly regardless of the data range.
+      function niceStep(raw) {
+        if (!(raw > 0)) return 1
+        const mag = Math.pow(10, Math.floor(Math.log10(raw)))
+        const norm = raw / mag // in [1, 10)
+        let nice
+        if (norm < 1.5) nice = 1
+        else if (norm < 3) nice = 2
+        else if (norm < 4) nice = 2.5
+        else if (norm < 7.5) nice = 5
+        else nice = 10
+        return nice * mag
+      }
+
+      // Auto-scale the contour interval to the global value range, targeting a
+      // readable number of bands. Does not touch the URL or the autoStep flag
+      // (it IS the auto behavior). Re-renders the current frame.
+      const TARGET_BANDS = 10
+      function applyAutoStep() {
+        if (globalMin === null || globalMax === null) return
+        const range = globalMax - globalMin
+        if (!(range > 0)) return
+        contourStep = niceStep(range / TARGET_BANDS)
+        const lbl = document.getElementById("stepLabel")
+        if (lbl) lbl.textContent = formatStep(contourStep)
+        if (lastFeatures.length) renderFeatures(lastFeatures)
+      }
+
+      // Set the interval from an explicit user action: pins the value, records
+      // it in the URL, and disables auto-scaling so the choice sticks.
       function setContourStep(s) {
-        contourStep = Math.max(STEP_PRESETS[0], Math.min(s, STEP_PRESETS[STEP_PRESETS.length - 1]))
+        contourStep = Math.max(0.05, Math.min(s, 100))
+        autoStep = false
         const lbl = document.getElementById("stepLabel")
         if (lbl) lbl.textContent = formatStep(contourStep)
         const u = new URL(window.location.href)
@@ -633,22 +720,81 @@
         history.replaceState(null, "", u.toString())
       }
       function stepContour(dir) {
-        let i = STEP_PRESETS.findIndex(v => v >= contourStep)
+        // Cycle through the presets relative to the current step.
+        let i = STEP_PRESETS.findIndex(v => v >= contourStep - 1e-9)
         if (i < 0) i = STEP_PRESETS.length - 1
-        if (STEP_PRESETS[i] !== contourStep && dir < 0) i -= 1
+        if (STEP_PRESETS[i] > contourStep + 1e-9 && dir < 0) i -= 1
         const next = Math.max(0, Math.min(i + dir, STEP_PRESETS.length - 1))
-        setContourStep(STEP_PRESETS[next])
+        setContourStep(STEP_PRESETS[next]) // manual -> disables autoStep
         // Re-render the current frame immediately with the new interval.
-        if (adaptive && lastFeatures.length) renderFeatures(lastFeatures)
+        if (lastFeatures.length) renderFeatures(lastFeatures)
       }
 
-      // Hide the contour control for the non-adaptive (heatmap) view.
-      if (!adaptive) {
-        for (const id of ["contourRowLabel", "stepDown", "stepLabel", "stepUp"]) {
-          const el = document.getElementById(id)
-          if (el) el.style.display = "none"
-        }
+      // ---- Time scrubber ----------------------------------------------------
+      // The slider mirrors the animation clock and lets the user jump to any
+      // moment in the forecast window. While dragging, the animation is
+      // paused and frame loads are debounced so scrubbing stays responsive.
+      const timeSlider = document.getElementById("timeSlider")
+      const timeSliderLabel = document.getElementById("timeSliderLabel")
+      let scrubbing = false
+      let resumeAfterScrub = false
+      let scrubLoadTimer = null
+
+      function fmtTime(epochSec) {
+        return new Date(epochSec * 1000).toString()
       }
+
+      // Configure the slider's range from the forecast window. Called once the
+      // window is known (and again after re-centering to a new area).
+      function configureTimeSlider() {
+        if (forecastStart === null || forecastEnd === null) return
+        timeSlider.min = String(forecastStart)
+        timeSlider.max = String(forecastEnd)
+        // Step by dt so the slider snaps to the same instants the animation
+        // visits; at least 1s to stay valid.
+        timeSlider.step = String(Math.max(1, dt))
+        timeSlider.disabled = false
+        syncTimeSlider(time)
+      }
+
+      // Reflect the current animation time on the slider + label. Skipped while
+      // the user is actively scrubbing so we don't fight their drag.
+      function syncTimeSlider(t) {
+        if (scrubbing) return
+        if (!timeSlider.disabled) timeSlider.value = String(t)
+        timeSliderLabel.textContent = fmtTime(t)
+      }
+
+      // Load the frame at the slider's current value (debounced during drag).
+      function scrubToSliderValue() {
+        const t = parseInt(timeSlider.value, 10)
+        if (!Number.isFinite(t)) return
+        time = t
+        timeSliderLabel.textContent = fmtTime(t)
+        if (scrubLoadTimer) clearTimeout(scrubLoadTimer)
+        scrubLoadTimer = window.setTimeout(() => { loadFrame(time) }, 60)
+      }
+
+      timeSlider.addEventListener("pointerdown", (e) => e.stopPropagation())
+      timeSlider.addEventListener("input", (e) => {
+        e.stopPropagation()
+        if (!scrubbing) { // begin scrub: pause the animation, remember state
+          scrubbing = true
+          resumeAfterScrub = !paused
+          setPaused(true)
+        }
+        scrubToSliderValue()
+      })
+      // End of scrub (mouse release / keyboard commit): resume if we paused.
+      const endScrub = () => {
+        if (!scrubbing) return
+        scrubbing = false
+        if (resumeAfterScrub) setPaused(false)
+        resumeAfterScrub = false
+      }
+      timeSlider.addEventListener("change", endScrub)
+      timeSlider.addEventListener("pointerup", endScrub)
+      timeSlider.addEventListener("pointercancel", endScrub)
 
       // Wire up the control buttons (stopPropagation so clicks don't drag the
       // legend).
@@ -665,7 +811,9 @@
       })
       setPlaybackSpeed(playbackSpeed) // initialize the label
       setDt(dt) // initialize the dt label
-      setContourStep(contourStep) // initialize the contour-interval label
+      // Initialize the contour-interval label without disabling autoStep; the
+      // real step is set by applyAutoStep() once the global range arrives.
+      document.getElementById("stepLabel").textContent = formatStep(contourStep)
 
       showSpinner()
       try {
@@ -673,6 +821,7 @@
         await fetch(`/api/models/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`)
         // Fix the color scale to the whole-lifecycle range before rendering.
         await fetchGlobalRange()
+        time = clampToForecast(time)
         await loadFrame(time) // first frame
       } catch (err) {
         console.error("failed to load initial frame:", err)
@@ -684,6 +833,11 @@
         if (tickRunning) return // guard against double-entry (e.g. resume mid-fetch)
         tickRunning = true
         time += dt
+        // Loop the animation: once we step past the forecast's end, jump back
+        // to the start of the valid time window.
+        if (forecastEnd !== null && time > forecastEnd) {
+          time = forecastStart !== null ? forecastStart : time
+        }
         try {
           await loadFrame(time)
         } catch (err) {

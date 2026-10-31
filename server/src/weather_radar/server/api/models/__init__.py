@@ -68,13 +68,14 @@ def ensemble_range(
     kind: str="accumulation",
 ):
     """Global min/max of the predicted value over the whole forecast
-    lifecycle for the area, so the client can fix its color scale before the
-    first frame. Fast once the area is cached (call /prefetch first)."""
+    lifecycle for the area, plus the forecast time window (start/end), so the
+    client can fix its color scale and loop the animation over the valid
+    range. Fast once the area is cached (call /prefetch first)."""
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
     ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
     ensemble = ensemble_class(area, model)
-    return ensemble.value_range() or {"min": None, "max": None, "uom": None}
+    return ensemble.value_range() or {"min": None, "max": None, "uom": None, "start": None, "end": None}
 
 
 @router.get("/{model}/type/ensemble/stream")
