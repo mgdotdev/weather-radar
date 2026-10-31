@@ -1,8 +1,9 @@
-from .observation import ObservationModel
+from .observation import ObservationModel, ObservationEnsemble
 from .accumulation import AccumulationModel, AccumulationEnsemble
 
 MODEL_MAP = {
     "observation": ObservationModel,
+    "observation-ensemble": ObservationEnsemble,
     "accumulation": AccumulationModel,
     "accumulation-ensemble": AccumulationEnsemble
 }

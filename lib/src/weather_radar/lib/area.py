@@ -1,12 +1,44 @@
 import os
 import concurrent.futures
 import multiprocessing
+import threading
 import math
 from functools import cached_property
 
 from .connection import NOAAConnection, PathObj, get_and_write
 
 lock = multiprocessing.Lock()
+
+# Maximum simultaneous requests to the NOAA API. NOAA enforces undisclosed
+# rate limits and returns HTTP 429 when overwhelmed; a modest ceiling keeps
+# us under that while still parallelizing I/O-bound lookups.
+NOAA_MAX_CONCURRENCY = 4
+
+# Spacing (km) between sample coordinates when resolving an area's gridpoints.
+# NOAA forecast gridpoints are ~2.5km cells, so sampling finer than this just
+# produces redundant /points lookups that all resolve to the same gridpoint.
+# Matching the cell size covers every overlapped gridpoint with the fewest
+# calls.
+SAMPLE_STEP_KM = 2.5
+
+# Fixed global sampling lattice step, in degrees, derived from SAMPLE_STEP_KM
+# using the latitude-independent km->deg factor. Using a constant degree step
+# everywhere keeps the sample grid globally aligned so overlapping areas (at
+# any center/size/zoom) reuse each other's cached /points lookups.
+LATTICE_STEP_DEG = SAMPLE_STEP_KM / 110.574
+
+# Distance (km) the area center is snapped to when forming the gridpoint-set
+# cache key. Re-centering within this distance of a previously-resolved area
+# reuses its cached gridpoints instead of re-resolving a near-identical grid.
+# Kept well under the data resolution so it has no visible effect on output.
+CACHE_SNAP_KM = 1.0
+
+# Cache of resolved gridpoint lists keyed by a rounded area signature.
+# Resolving an area's gridpoints means mapping every sample coordinate to a
+# NOAA gridpoint; for a fixed map view this result is stable, so caching it
+# avoids repeating that work on every poll.
+_GRIDPOINTS_CACHE: dict[tuple, list] = {}
+_GRIDPOINTS_LOCK = threading.Lock()
 
 
 class Coordinate:
@@ -46,13 +78,21 @@ class NOAAGridpoint:
     def __repr__(self) -> str:
         return f'"{str(self)}"'
 
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, NOAAGridpoint):
+            return NotImplemented
+        return (self.id, self.x, self.y) == (other.id, other.x, other.y)
+
+    def __hash__(self) -> int:
+        return hash((self.id, self.x, self.y))
+
 
 class CoordinateArea:
 
     def __init__(self, center: MapCoordinate, width: float, height: float):
         self.center = center
-        self.width = max(width, 1.25)
-        self.height = max(height, 1.25)
+        self.width = max(width, SAMPLE_STEP_KM)
+        self.height = max(height, SAMPLE_STEP_KM)
 
     @cached_property
     def center_gridpoint(self):
@@ -68,31 +108,127 @@ class CoordinateArea:
         dx = dkm_to_dlat(self.width)
         dy = dkm_to_dlon(self.height, self.center.lat)
 
-        x = self.center.lon
-        y = self.center.lat
+        x = self.center.lon - dx / 2
+        y = self.center.lat - dy / 2
 
-        x -= dx / 2
-        y -= dy / 2
+        step = LATTICE_STEP_DEG
+
+        # Generate coordinates as (integer lattice index * step) rather than by
+        # repeatedly adding `step`. Integer indexing avoids floating-point
+        # accumulation drift, so a given lattice cell has the EXACT same
+        # coordinate value for every area that includes it — regardless of
+        # center, size, or zoom. That exact-equality is what lets overlapping
+        # areas reuse each other's cached /points lookups.
+        i0 = math.floor(y / step)
+        i1 = math.ceil((y + dy) / step)
+        j0 = math.floor(x / step)
+        j1 = math.ceil((x + dx) / step)
 
         return (
-            MapCoordinate(lat=i, lon=j)
-            for i in arange(y, y+dy, dkm_to_dlon(1.25, self.center.lat))
-            for j in arange(x, x+dx, dkm_to_dlat(1.25))
+            MapCoordinate(lat=i * step, lon=j * step)
+            for i in range(i0, i1 + 1)
+            for j in range(j0, j1 + 1)
         )
 
+    @cached_property
+    def signature(self):
+        # Exact cache key for this area's resolved gridpoint set. (Used only
+        # as a cache key, never for display or computation.) Near-identical
+        # areas are matched separately via _find_cached_gridpoints, which
+        # reuses an existing entry whose center is within CACHE_SNAP_KM.
+        return (
+            round(self.center.lat, 6),
+            round(self.center.lon, 6),
+            round(self.width, 1),
+            round(self.height, 1),
+        )
+
+    def _find_cached_gridpoints(self):
+        """Return a cached gridpoint set to reuse, or None.
+
+        Reuses an entry when the area dimensions match and its center is
+        within CACHE_SNAP_KM of this center — so re-centering slightly off a
+        previously-resolved area doesn't re-resolve a near-identical grid.
+        The snap distance is well below the data resolution, so reuse has no
+        visible effect on the field.
+        """
+        w = round(self.width, 1)
+        h = round(self.height, 1)
+        snap_deg_lat = CACHE_SNAP_KM / 110.574
+        snap_deg_lon = CACHE_SNAP_KM / (111.320 * math.cos(math.radians(self.center.lat)))
+        with _GRIDPOINTS_LOCK:
+            # Exact hit first.
+            exact = _GRIDPOINTS_CACHE.get(self.signature)
+            if exact is not None:
+                return exact
+            # Otherwise, nearest matching area within the snap distance.
+            best = None
+            best_d2 = None
+            for (clat, clon, cw, ch), points in _GRIDPOINTS_CACHE.items():
+                if cw != w or ch != h:
+                    continue
+                dlat = (self.center.lat - clat) / snap_deg_lat
+                dlon = (self.center.lon - clon) / snap_deg_lon
+                d2 = dlat * dlat + dlon * dlon
+                if d2 <= 1.0 and (best_d2 is None or d2 < best_d2):
+                    best, best_d2 = points, d2
+            return best
+
+    @property
+    def coordinates_by_proximity(self):
+        """Sample coordinates ordered nearest-to-center first, so resolution
+        (and thus rendering) fills outward from the middle of the view."""
+        center = self.center
+
+        def dist2(c):
+            # Squared planar distance in degrees; fine for ordering a small
+            # local area.
+            return (c.lat - center.lat) ** 2 + (c.lon - center.lon) ** 2
+
+        return sorted(self.map_coordinates, key=dist2)
+
+    def iter_gridpoints(self):
+        """Yield unique NOAA gridpoints for this area, nearest-to-center
+        first, as each is resolved. Lets callers stream results instead of
+        waiting for the whole area to resolve.
+
+        If a matching (exact or nearby) gridpoint set is already cached, yields
+        it from the cache. Otherwise resolves lazily and populates the cache
+        once the full set has been produced.
+        """
+        cached = self._find_cached_gridpoints()
+        if cached is not None:
+            yield from cached
+            return
+
+        coordinates = self.coordinates_by_proximity
+
+        seen = set()
+        ordered = []
+        # `executor.map` preserves input (proximity) order while running up to
+        # NOAA_MAX_CONCURRENCY lookups ahead, so we emit gridpoints outward
+        # from the center as soon as each nearest one resolves. Dedupe on the
+        # fly since adjacent samples often map to the same gridpoint.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=NOAA_MAX_CONCURRENCY) as executor:
+            for gp in executor.map(gridpoint_from_map_coordinate, coordinates):
+                if gp in seen:
+                    continue
+                seen.add(gp)
+                ordered.append(gp)
+                yield gp
+
+        with _GRIDPOINTS_LOCK:
+            _GRIDPOINTS_CACHE[self.signature] = ordered
 
     @cached_property
     def gridpoints(self):
-        points = self.map_coordinates
+        cached = self._find_cached_gridpoints()
+        if cached is not None:
+            return cached
 
-        points = set(
-            gridpoint_from_map_coordinate(p)
-            for p in points
-        )
-
-        points = sorted(points, key = str)
-
-        return points
+        # Fully consume the streaming resolver (which also populates the
+        # cache) and return the complete, proximity-ordered list.
+        return list(self.iter_gridpoints())
 
     def cache(self):
         paths = (f"/points/{c}" for c in self.map_coordinates)
@@ -100,7 +236,7 @@ class CoordinateArea:
         with lock:
             conn = NOAAConnection()
             missings = [p for p in path_objs if not os.path.isfile(p.tempfile)]
-            with concurrent.futures.ThreadPoolExecutor() as exec:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=NOAA_MAX_CONCURRENCY) as exec:
                 jobs = [
                     exec.submit(get_and_write, m, conn.session)
                     for m in missings
@@ -113,7 +249,7 @@ class CoordinateArea:
         with lock:
             conn = NOAAConnection()
             missings = [p for p in path_objs if not os.path.isfile(p.tempfile)]
-            with concurrent.futures.ThreadPoolExecutor() as exec:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=NOAA_MAX_CONCURRENCY) as exec:
                 jobs = [
                     exec.submit(get_and_write, m, conn.session)
                     for m in missings

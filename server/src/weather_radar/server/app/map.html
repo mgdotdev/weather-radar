@@ -3,72 +3,722 @@
   <head>
     <script src="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+    <!-- d3-contour builds filled isobands from a regular grid of values. -->
+    <script src="https://unpkg.com/d3-contour@4"></script>
+    <style>
+      /* Shared styles for the legend's control buttons/values so the −/+
+         columns line up across rows. */
+      .ctlbtn {
+        cursor: pointer; width: 22px; height: 22px; padding: 0;
+        border: 1px solid #bbb; border-radius: 4px; background: #f5f5f5;
+        font-size: 14px; line-height: 1;
+      }
+      .ctlval {
+        text-align: center; font-size: 11px;
+        font-variant-numeric: tabular-nums;
+      }
+    </style>
   </head>
   <body style="margin: 0px; padding: 0px;">
     <div id="weatherRadar" style="height: 100vh; width: 100vw; margin: 0px; padding: 0px;"/>
     <h2 id="displayTime" style="position: fixed; top: 2px; left: 20px; z-index: 100;"/></h2>
+
+    <!-- Color legend (draggable), shown once the field renders. -->
+    <div id="legend" style="
+        position: fixed; top: 50px; left: 20px; z-index: 100;
+        display: none; background: rgba(255,255,255,0.85);
+        padding: 8px 10px; border-radius: 6px; font-family: sans-serif;
+        font-size: 12px; color: #222; box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+        cursor: move; user-select: none;">
+      <div id="legendTitle" style="font-weight: 600; margin-bottom: 4px;"></div>
+      <div id="legendBar" style="height: 12px; width: 180px; border-radius: 2px;
+        border: 1px solid rgba(0,0,0,0.2);"></div>
+      <div style="display: flex; justify-content: space-between; margin-top: 2px;">
+        <span id="legendMin"></span>
+        <span id="legendMid"></span>
+        <span id="legendMax"></span>
+      </div>
+      <!-- Playback controls. Rows share a grid so the −/+ buttons line up in
+           consistent columns regardless of label/value width. -->
+      <div style="margin-top:8px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12);">
+        <div style="margin-bottom:6px;">
+          <button id="playPause" title="Pause / Play" style="cursor:pointer; width:100%; height:24px;
+            border:1px solid #bbb; border-radius:4px; background:#f5f5f5; font-size:12px; line-height:1; padding:0;">⏸ Pause</button>
+        </div>
+        <div style="display:grid; grid-template-columns:auto 22px 52px 22px; align-items:center;
+            column-gap:6px; row-gap:6px; justify-content:start;">
+          <span style="font-size:11px; color:#555;">Speed</span>
+          <button id="speedDown" title="Slower" class="ctlbtn">−</button>
+          <span id="speedLabel" class="ctlval">1.0×</span>
+          <button id="speedUp" title="Faster" class="ctlbtn">+</button>
+
+          <span style="font-size:11px; color:#555;">Time</span>
+          <button id="dtDown" title="Smaller time step" class="ctlbtn">−</button>
+          <span id="dtLabel" class="ctlval">1h</span>
+          <button id="dtUp" title="Larger time step" class="ctlbtn">+</button>
+
+          <span id="contourRowLabel" style="font-size:11px; color:#555;">Contour</span>
+          <button id="stepDown" title="Finer contours" class="ctlbtn">−</button>
+          <span id="stepLabel" class="ctlval">1°</span>
+          <button id="stepUp" title="Coarser contours" class="ctlbtn">+</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cursor readout: follows the pointer with the interpolated value. -->
+    <div id="cursorReadout" style="
+        position: fixed; z-index: 101; display: none; pointer-events: none;
+        background: rgba(0,0,0,0.75); color: #fff; font-family: sans-serif;
+        font-size: 12px; padding: 4px 7px; border-radius: 4px;
+        white-space: nowrap;"></div>
+
+    <!-- Right-click context menu. -->
+    <div id="contextMenu" style="
+        position: fixed; z-index: 102; display: none;
+        background: #fff; border: 1px solid rgba(0,0,0,0.2); border-radius: 6px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.25); font-family: sans-serif;
+        font-size: 13px; color: #222; overflow: hidden; min-width: 160px;">
+      <div id="ctxCenterHere" style="padding: 8px 12px; cursor: pointer;">Center map here</div>
+      <div id="ctxDropPin" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Drop pin here</div>
+      <div id="ctxSeeGraph" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">See graph</div>
+      <div id="ctxCoords" style="padding: 6px 12px; font-size: 11px;
+        color: #666; border-top: 1px solid #eee;"></div>
+    </div>
+
+    <!-- Container for dropped pin labels (positioned over the map in JS). -->
+    <div id="pins"></div>
+
+    <!-- Loading spinner, shown while data is being cached/fetched. -->
+    <style>@keyframes wrspin { to { transform: rotate(360deg); } }</style>
+    <div id="spinner" style="
+        position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+        z-index: 103; display: none; pointer-events: none;
+        text-align: center; font-family: sans-serif; color: #1565c0;">
+      <div style="width: 44px; height: 44px; margin: 0 auto 6px;
+          border: 5px solid rgba(21,101,192,0.25); border-top-color: #1565c0;
+          border-radius: 50%; animation: wrspin 0.8s linear infinite;"></div>
+      <div style="font-size: 12px; background: rgba(255,255,255,0.85);
+          padding: 2px 8px; border-radius: 4px;">Loading data…</div>
+    </div>
   </body>
   <script>
-    let map = new maplibregl.Map({
+    // ---- Config (from the server) ------------------------------------------
+    const model = {{weather_model}}
+    const kind = "{{kind}}"
+    let lat = {{starting_latitude}}
+    let lon = {{starting_longitude}}
+    let width = {{width}}
+    let height = {{height}}
+    let dt = {{dt}}
+    const adaptive = {{heatmap_adaptive}}
+    const weightStops = {{heatmap_weight_stops}}
+    const colorRamp = {{heatmap_color_ramp}}
+    // Contour interval: the value delta between adjacent contour lines
+    // (e.g. 1.0, 0.5, 2.0 degrees). Configurable live in the legend.
+    let contourStep = {{contour_step}}
+
+    // Fixed color-scale range across the whole forecast lifecycle, fetched
+    // once before the first render so colors/legend stay stable over time.
+    // Null until fetched (then buildContours falls back to the frame range).
+    let globalMin = null, globalMax = null
+    let lastFeatures = []  // most recent frame's features (for instant re-render on contour-step change)
+
+    // Grid resolution and interpolation smoothing for the contour field.
+    const GRID = 64
+    // IDW smoothing radius (squared, in deg^2) added to each weight's
+    // denominator. NOAA gridpoints are ~2.5km (~0.023 deg) apart; a radius
+    // around half the spacing blends neighbors smoothly and avoids the
+    // "bull's-eye" rings that appear when points dominate tight circles.
+    const IDW_EPS = 0.015 * 0.015
+    const COLOR_BUFFER = 0.1
+
+    const initialZoom = parseFloat(new URL(window.location.href).searchParams.get("zoom")) || 9
+
+    const map = new maplibregl.Map({
       container: "weatherRadar",
       style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
-      center: [{{starting_longitude}}, {{starting_latitude}}],
-      zoom: 9,
+      center: [lon, lat],
+      zoom: initialZoom,
     })
+
+    // ---- Spinner ------------------------------------------------------------
+    const spinnerEl = document.getElementById("spinner")
+    function showSpinner() { spinnerEl.style.display = "block" }
+    function hideSpinner() { spinnerEl.style.display = "none" }
+
+    // ---- Color ramp ---------------------------------------------------------
+    const rampStops = (() => {
+      const stops = []
+      for (let i = 0; i < colorRamp.length; i += 2) {
+        const m = String(colorRamp[i + 1]).match(/rgba?\(([^)]+)\)/)
+        const p = m[1].split(',').map(s => parseFloat(s.trim()))
+        stops.push({ pos: colorRamp[i], r: p[0], g: p[1], b: p[2] })
+      }
+      return stops
+    })()
+    function rampColorAt(t) {
+      t = Math.max(0, Math.min(1, t))
+      let a = rampStops[0], b = rampStops[rampStops.length - 1]
+      for (let i = 0; i < rampStops.length - 1; i++) {
+        if (t >= rampStops[i].pos && t <= rampStops[i + 1].pos) { a = rampStops[i]; b = rampStops[i + 1]; break }
+      }
+      const span = (b.pos - a.pos) || 1
+      const f = (t - a.pos) / span
+      return `rgb(${Math.round(a.r + (b.r - a.r) * f)}, ${Math.round(a.g + (b.g - a.g) * f)}, ${Math.round(a.b + (b.b - a.b) * f)})`
+    }
+
+    // ---- Legend -------------------------------------------------------------
+    let legendInitialized = false
+    function legendGradientCss() {
+      const stops = []
+      for (let i = 0; i < colorRamp.length; i += 2) {
+        stops.push(`${colorRamp[i + 1]} ${Math.round(colorRamp[i] * 100)}%`)
+      }
+      return `linear-gradient(to right, ${stops.join(", ")})`
+    }
+    function updateLegend(vMin, vMax, units) {
+      if (!legendInitialized) {
+        document.getElementById("legendBar").style.background = legendGradientCss()
+        legendInitialized = true
+      }
+      document.getElementById("legendTitle").textContent = model + (units ? ` (${units})` : "")
+      document.getElementById("legendMin").textContent = vMin.toFixed(1)
+      document.getElementById("legendMid").textContent = ((vMin + vMax) / 2).toFixed(1)
+      document.getElementById("legendMax").textContent = vMax.toFixed(1)
+      document.getElementById("legend").style.display = "block"
+    }
+
+    // ---- Contour construction ----------------------------------------------
+
+    // Build filled contour polygons (GeoJSON) from a scatter of features.
+    // Returns { fc, vMin, vMax, units } or null if there isn't enough data.
+    function buildContours(features) {
+      const pts = features.map(f => ({
+        lon: f.geometry.coordinates[0],
+        lat: f.geometry.coordinates[1],
+        v: f.properties[model]
+      })).filter(p => Number.isFinite(p.v))
+      if (pts.length < 3) return null
+
+      let minLon = Math.min(...pts.map(p => p.lon))
+      let maxLon = Math.max(...pts.map(p => p.lon))
+      let minLat = Math.min(...pts.map(p => p.lat))
+      let maxLat = Math.max(...pts.map(p => p.lat))
+      const padLon = (maxLon - minLon) * 0.05 || 0.01
+      const padLat = (maxLat - minLat) * 0.05 || 0.01
+      minLon -= padLon; maxLon += padLon; minLat -= padLat; maxLat += padLat
+
+      // IDW resample onto a GRID x GRID lattice (row 0 = minLat).
+      const values = new Array(GRID * GRID)
+      let vMin = Infinity, vMax = -Infinity
+      for (let gy = 0; gy < GRID; gy++) {
+        const plat = minLat + (gy / (GRID - 1)) * (maxLat - minLat)
+        for (let gx = 0; gx < GRID; gx++) {
+          const plon = minLon + (gx / (GRID - 1)) * (maxLon - minLon)
+          let num = 0, den = 0, exact = null
+          for (const p of pts) {
+            const dLon = plon - p.lon, dLat = plat - p.lat
+            const d2 = dLon * dLon + dLat * dLat
+            if (d2 < 1e-12) { exact = p.v; break }
+            const w = 1 / (d2 + IDW_EPS) // IDW power 2
+            num += w * p.v; den += w
+          }
+          const val = exact !== null ? exact : num / den
+          values[gy * GRID + gx] = val
+          if (val < vMin) vMin = val
+          if (val > vMax) vMax = val
+        }
+      }
+      if (!(vMax > vMin)) vMax = vMin + 1
+
+      // Color scale: use the FIXED global range (whole forecast lifecycle)
+      // when available, so a given temperature is the same color in every
+      // frame and the legend never shifts. Fall back to the frame's own range.
+      const cMin = (globalMin !== null) ? globalMin : vMin
+      const cMax = (globalMax !== null && globalMax > globalMin) ? globalMax : vMax
+      const cSpan = (cMax - cMin) || 1
+
+      // Thresholds are anchored to FIXED absolute values spaced `contourStep`
+      // apart (e.g. every 1.0 degree). Boundaries represent the same absolute
+      // temperatures every frame, so a given isoline is always in the same
+      // place as the field moves — no spurious per-frame value shifts.
+      const step = contourStep
+      const tLo = (Math.floor(vMin / step) - 1) * step
+      const tHi = (Math.ceil(vMax / step) + 1) * step
+      const thresholds = []
+      for (let tv = tLo; tv <= tHi + 1e-9; tv += step) thresholds.push(tv)
+
+      const polys = d3.contours().size([GRID, GRID]).thresholds(thresholds)(values)
+
+      const sx = (maxLon - minLon) / (GRID - 1)
+      const sy = (maxLat - minLat) / (GRID - 1)
+      const toLngLat = ([gx, gy]) => [minLon + gx * sx, minLat + gy * sy]
+
+      const outFeatures = polys.map(poly => {
+        const raw = (poly.value - cMin) / cSpan
+        const t = COLOR_BUFFER + Math.max(0, Math.min(1, raw)) * (1 - 2 * COLOR_BUFFER)
+        return {
+          type: "Feature",
+          properties: { fillColor: rampColorAt(t) },
+          geometry: {
+            type: "MultiPolygon",
+            coordinates: poly.coordinates.map(pg => pg.map(ring => ring.map(toLngLat)))
+          }
+        }
+      })
+
+      const units = features[0].properties.uom || ""
+      // Report the color-scale range (global when fixed) so the legend matches
+      // the colors and stays stable across frames.
+      return { fc: { type: "FeatureCollection", features: outFeatures }, vMin: cMin, vMax: cMax, units }
+    }
+
+    // ---- Cursor readout -----------------------------------------------------
+    let latestPoints = [], latestUnits = ""
+    function sampleAt(plon, plat) {
+      if (!latestPoints.length) return null
+      let num = 0, den = 0
+      for (const p of latestPoints) {
+        const dLon = plon - p.lon, dLat = plat - p.lat
+        const d2 = dLon * dLon + dLat * dLat
+        if (d2 < 1e-12) return p.v
+        const w = 1 / (d2 + IDW_EPS)
+        num += w * p.v; den += w
+      }
+      return num / den
+    }
+
     map.on("load", async () => {
-      map.addSource({{weather_model}}, {
-        type: 'geojson',
-        data: {
-          type: "FeatureCollection",
-          features: []
+      // Sources + layers.
+      if (adaptive) {
+        map.addSource("contours", { type: 'geojson', data: { type: "FeatureCollection", features: [] } })
+        map.addLayer({
+          id: 'contours', type: 'fill', source: 'contours',
+          paint: { 'fill-color': ['get', 'fillColor'], 'fill-opacity': 0.05, 'fill-antialias': true }
+        })
+        // Strong contour borders (opaque band color) so structure stays
+        // legible even with a very faint fill.
+        map.addLayer({
+          id: 'contour-lines', type: 'line', source: 'contours',
+          layout: { 'line-join': 'round' },
+          paint: { 'line-color': ['get', 'fillColor'], 'line-width': 1.6, 'line-opacity': 0.9 }
+        })
+      } else {
+        map.addSource(model, { type: 'geojson', data: { type: "FeatureCollection", features: [] } })
+        map.addLayer({
+          id: 'heatmap', type: 'heatmap', source: model,
+          paint: {
+            'heatmap-weight': ['interpolate', ['linear'], ['get', model], ...weightStops],
+            'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 0, 0.5, 9, 1, 15, 3],
+            'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 0, 4, 9, 20, 15, 50],
+            'heatmap-color': ['interpolate', ['linear'], ['heatmap-density'], ...colorRamp],
+            'heatmap-opacity': ['interpolate', ['linear'], ['zoom'], 7, 1, 15, 0.7]
+          }
+        })
+      }
+
+      const mapContainer = document.getElementById("weatherRadar")
+      const readoutEl = document.getElementById("cursorReadout")
+      let cursorPx = null
+
+      function refreshReadout() {
+        if (!cursorPx) { readoutEl.style.display = "none"; return }
+        const rect = mapContainer.getBoundingClientRect()
+        const ll = map.unproject([cursorPx.x - rect.left, cursorPx.y - rect.top])
+        const v = sampleAt(ll.lng, ll.lat)
+        const valueText = v === null ? "—" : `${v.toFixed(1)}${latestUnits ? " " + latestUnits : ""}`
+        readoutEl.innerHTML = `${model}: ${valueText}<br>${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`
+        readoutEl.style.left = (cursorPx.x + 12) + "px"
+        readoutEl.style.top = (cursorPx.y + 12) + "px"
+        readoutEl.style.display = "block"
+      }
+      mapContainer.addEventListener("mousemove", (e) => { cursorPx = { x: e.clientX, y: e.clientY }; refreshReadout() })
+      mapContainer.addEventListener("mouseleave", () => { cursorPx = null; readoutEl.style.display = "none" })
+      map.on("move", () => { refreshReadout(); refreshPins() })
+
+      // ---- Dropped pins -----------------------------------------------------
+      // Persistent labels at fixed lat/lon showing the interpolated value,
+      // updated each frame and repositioned on map move. Persisted in the URL
+      // (`pins=lat,lon;lat,lon;...`) so a refresh restores them.
+      const pinsContainer = document.getElementById("pins")
+      let pins = [] // [{ lat, lon, el }]
+
+      function serializePins() {
+        const u = new URL(window.location.href)
+        if (pins.length) {
+          u.searchParams.set("pins", pins.map(p => `${p.lat.toFixed(5)},${p.lon.toFixed(5)}`).join(";"))
+        } else {
+          u.searchParams.delete("pins")
+        }
+        history.replaceState(null, "", u.toString())
+      }
+
+      function addPin(plat, plon, persist = true) {
+        // Marker: a pin icon anchored exactly at the point (tip at the spot).
+        const marker = document.createElement("div")
+        marker.textContent = "📍"
+        marker.style.cssText = "position:fixed; z-index:101; transform:translate(-50%,-100%);" +
+          "font-size:20px; line-height:1; cursor:pointer; user-select:none;" +
+          "filter:drop-shadow(0 1px 1px rgba(0,0,0,0.5));"
+        // Info box: offset to the upper-right of the marker.
+        const info = document.createElement("div")
+        info.style.cssText = "position:fixed; z-index:101; transform:translate(0,-100%);" +
+          "background:rgba(30,30,30,0.85); color:#fff; font-family:sans-serif; font-size:12px;" +
+          "padding:3px 7px; border-radius:4px; white-space:nowrap; cursor:pointer;" +
+          "box-shadow:0 1px 4px rgba(0,0,0,0.4);"
+
+        const pin = { lat: plat, lon: plon, marker, info }
+        const remove = (ev) => {
+          ev.stopPropagation()
+          const i = pins.indexOf(pin)
+          if (i >= 0) { marker.remove(); info.remove(); pins.splice(i, 1); serializePins() }
+        }
+        marker.title = "Click to remove pin"
+        info.title = "Click to remove pin"
+        marker.addEventListener("click", remove)
+        info.addEventListener("click", remove)
+
+        pinsContainer.appendChild(marker)
+        pinsContainer.appendChild(info)
+        pins.push(pin)
+        if (persist) serializePins()
+        refreshPins()
+      }
+
+      // Reposition + re-read all pins (called on map move and each frame).
+      // The marker sits on the point; the info box is offset to the
+      // upper-right so it doesn't cover the location.
+      const INFO_DX = 14, INFO_DY = -14
+      function refreshPins() {
+        const rect = mapContainer.getBoundingClientRect()
+        for (const p of pins) {
+          const pt = map.project([p.lon, p.lat])
+          const x = rect.left + pt.x, y = rect.top + pt.y
+          p.marker.style.left = x + "px"
+          p.marker.style.top = y + "px"
+
+          const v = sampleAt(p.lon, p.lat)
+          const valueText = v === null ? "—" : `${v.toFixed(1)}${latestUnits ? " " + latestUnits : ""}`
+          p.info.innerHTML = `${model}: ${valueText}<br>${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}`
+          p.info.style.left = (x + INFO_DX) + "px"
+          p.info.style.top = (y + INFO_DY) + "px"
+        }
+      }
+
+      // Restore pins from the URL on load.
+      ;(() => {
+        const raw = new URL(window.location.href).searchParams.get("pins")
+        if (!raw) return
+        for (const part of raw.split(";")) {
+          const [la, lo] = part.split(",").map(Number)
+          if (Number.isFinite(la) && Number.isFinite(lo)) addPin(la, lo, false)
+        }
+      })()
+
+      // Remove every pin (DOM + state) and clear them from the URL.
+      function clearPins() {
+        for (const p of pins) { p.marker.remove(); p.info.remove() }
+        pins = []
+        serializePins()
+      }
+
+      // Right-click context menu: "Center map here".
+      const menuEl = document.getElementById("contextMenu")
+      const ctxCoordsEl = document.getElementById("ctxCoords")
+      let menuLngLat = null
+      function hideMenu() { menuEl.style.display = "none" }
+      map.on("contextmenu", (e) => {
+        menuLngLat = e.lngLat
+        ctxCoordsEl.textContent = `${e.lngLat.lat.toFixed(4)}, ${e.lngLat.lng.toFixed(4)}`
+        menuEl.style.left = e.originalEvent.clientX + "px"
+        menuEl.style.top = e.originalEvent.clientY + "px"
+        menuEl.style.display = "block"
+      })
+      // "Drop pin here": leave a persistent value label at the clicked point.
+      document.getElementById("ctxDropPin").addEventListener("click", () => {
+        if (!menuLngLat) return
+        addPin(menuLngLat.lat, menuLngLat.lng)
+        hideMenu()
+      })
+      // "See graph": open the forecast graph for this location in a new tab.
+      // The graph's `models` param maps model-type -> [attribute], e.g.
+      // {"observation": ["temperature"]}.
+      document.getElementById("ctxSeeGraph").addEventListener("click", () => {
+        if (!menuLngLat) return
+        const models = JSON.stringify({ [kind]: [model] })
+        const u = new URL("/graph/", window.location.origin)
+        u.searchParams.set("models", models)
+        u.searchParams.set("lat", menuLngLat.lat.toFixed(6))
+        u.searchParams.set("lon", menuLngLat.lng.toFixed(6))
+        hideMenu()
+        window.open(u.toString(), "_blank")
+      })
+      document.getElementById("ctxCenterHere").addEventListener("click", async () => {
+        if (!menuLngLat) return
+        lat = menuLngLat.lat
+        lon = menuLngLat.lng
+        hideMenu()
+
+        // Centering moves to a new area, so existing pins no longer apply.
+        clearPins()
+
+        // Size the fetched area to the current viewport so the contour field
+        // covers the whole window. The map's lat/lon span (in degrees) is
+        // converted to km mirroring the server geometry: width drives the
+        // lon-span, height the lat-span. (Pan doesn't change the span, only
+        // the center, so reading bounds now is correct for the new view.)
+        const b = map.getBounds()
+        width = Math.abs(b.getEast() - b.getWest()) * 110.574
+        height = Math.abs(b.getNorth() - b.getSouth()) * (111.320 * Math.cos(lat * Math.PI / 180))
+
+        // Pan to the new center (keep current zoom) and sync the URL in place
+        // — no page reload.
+        map.easeTo({ center: [lon, lat], duration: 500 })
+        const u = new URL(window.location.href)
+        u.searchParams.set("lat", lat.toFixed(6))
+        u.searchParams.set("lon", lon.toFixed(6))
+        u.searchParams.set("width", width.toFixed(2))
+        u.searchParams.set("height", height.toFixed(2))
+        u.searchParams.set("zoom", map.getZoom().toFixed(2))
+        history.replaceState(null, "", u.toString())
+
+        // Reset the animation clock to "now" and reload for the new area:
+        // cache its data, recompute the fixed color range, then render.
+        time = Math.floor(Date.now() / 1000)
+        globalMin = null; globalMax = null
+        showSpinner()
+        try {
+          await fetch(`/api/models/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`)
+          await fetchGlobalRange()
+          await loadFrame(time)
+        } catch (err) {
+          console.error("re-center load failed:", err)
+        } finally {
+          hideSpinner()
         }
       })
-      map.addLayer({
-        'id': 'heatmap',
-        'type': 'heatmap',
-        'source': {{weather_model}},
-        'layout': {},
-        'paint': {
-          'heatmap-weight': [
-            'interpolate',
-            ['linear'],
-            ["get", "precipitation"],
-            0,0,0.1,0.3,0.2,0.6,0.3,0.9
-          ],
-          'heatmap-radius': 20,
-          // 'heatmap-radius': [
-          //   'interpolate', ['linear'],
-          //   ['get', 'precipitation'], 0.01, 1, 0.1, 20, 0.2, 30, 0.3, 40
-          // ],
+      map.on("click", hideMenu)
+      map.on("movestart", hideMenu)
+      window.addEventListener("keydown", (e) => { if (e.key === "Escape") hideMenu() })
+
+      // ---- Rendering --------------------------------------------------------
+      // Render one frame's features onto the map (contour field or heatmap).
+      function renderFeatures(features) {
+        lastFeatures = features
+        latestPoints = features.map(f => ({
+          lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1], v: f.properties[model]
+        })).filter(p => Number.isFinite(p.v))
+        latestUnits = features.length ? (features[0].properties.uom || "") : ""
+
+        if (adaptive) {
+          const info = buildContours(features)
+          if (info) {
+            map.getSource("contours").setData(info.fc)
+            updateLegend(info.vMin, info.vMax, info.units)
+          }
+        } else {
+          map.getSource(model).setData({ type: "FeatureCollection", features })
         }
+        // Keep the cursor readout and dropped pins in sync with the new
+        // frame's data.
+        refreshReadout()
+        refreshPins()
+      }
+
+      // Fetch the full ensemble for a given time and render it. Returns true
+      // on success. Waits for the entire response (no streaming) — simple.
+      async function loadFrame(time) {
+        const resp = await fetch(
+          `/api/models/${model}/type/ensemble?lat=${lat}&lon=${lon}&width=${width}&height=${height}&time=${time}&dt=${dt}&kind=${kind}`
+        )
+        if (!resp.ok) { console.error("ensemble request failed:", resp.status); return false }
+        const data = await resp.json()
+        const features = (data && data.features) || []
+        renderFeatures(features)
+        document.getElementById("displayTime").textContent = new Date(time * 1000).toString()
+        return true
+      }
+
+      // Fetch the fixed global value range for the current area (whole
+      // forecast lifecycle) so colors/legend stay stable. Only meaningful for
+      // the adaptive contour view. Safe to call after /prefetch.
+      async function fetchGlobalRange() {
+        if (!adaptive) return
+        try {
+          const resp = await fetch(
+            `/api/models/${model}/type/range?lat=${lat}&lon=${lon}&width=${width}&height=${height}&kind=${kind}`
+          )
+          const r = await resp.json()
+          if (r && Number.isFinite(r.min) && Number.isFinite(r.max) && r.max > r.min) {
+            globalMin = r.min; globalMax = r.max
+            console.log("[field] global range:", globalMin.toFixed(1), "-", globalMax.toFixed(1), r.uom)
+          }
+        } catch (err) {
+          console.warn("global range fetch failed; using per-frame range:", err)
+        }
+      }
+
+      // ---- Animation over time ---------------------------------------------
+      // Each frame advances model time by `dt`. The next frame is scheduled
+      // only after the current one finishes, so slow frames don't stack up.
+      const BASE_FRAME_INTERVAL_MS = 1000
+      let playbackSpeed = {{playback_speed}}
+      let paused = false
+      let tickTimer = null
+      let tickRunning = false
+      let time = Math.floor(Date.now() / 1000)
+
+      function frameIntervalMs() {
+        return Math.max(100, BASE_FRAME_INTERVAL_MS / playbackSpeed)
+      }
+      function setPlaybackSpeed(mult) {
+        playbackSpeed = Math.max(0.1, Math.min(mult, 10))
+        const lbl = document.getElementById("speedLabel")
+        if (lbl) lbl.textContent = playbackSpeed.toFixed(1) + "×"
+        const u = new URL(window.location.href)
+        u.searchParams.set("speed", playbackSpeed.toFixed(2))
+        history.replaceState(null, "", u.toString())
+      }
+      function updatePlayPauseButton() {
+        const btn = document.getElementById("playPause")
+        if (btn) { btn.textContent = paused ? "▶ Play" : "⏸ Pause"; btn.title = paused ? "Play" : "Pause" }
+      }
+      function setPaused(p) {
+        if (p === paused) return
+        paused = p
+        updatePlayPauseButton()
+        if (!paused) { // resume: cancel stray timer, kick the loop
+          if (tickTimer) { clearTimeout(tickTimer); tickTimer = null }
+          scheduleNext()
+        }
+      }
+      function scheduleNext() {
+        if (!paused) tickTimer = window.setTimeout(tick, frameIntervalMs())
+      }
+
+      // Time-step (dt) control. Steps through a preset list of nice durations.
+      const DT_PRESETS = [300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400] // seconds
+      function formatDt(secs) {
+        if (secs < 3600) return (secs / 60) + "m"
+        const h = secs / 3600
+        return (Number.isInteger(h) ? h : h.toFixed(1)) + "h"
+      }
+      function setDt(secs) {
+        dt = Math.max(DT_PRESETS[0], Math.min(secs, DT_PRESETS[DT_PRESETS.length - 1]))
+        const lbl = document.getElementById("dtLabel")
+        if (lbl) lbl.textContent = formatDt(dt)
+        const u = new URL(window.location.href)
+        u.searchParams.set("dt", String(dt))
+        history.replaceState(null, "", u.toString())
+      }
+      function stepDt(dir) {
+        // Move to the neighboring preset (dir = +1 bigger, -1 smaller).
+        let i = DT_PRESETS.findIndex(v => v >= dt)
+        if (i < 0) i = DT_PRESETS.length - 1
+        // If current dt isn't exactly a preset, snap toward the requested dir.
+        if (DT_PRESETS[i] !== dt && dir < 0) i -= 1
+        const next = Math.max(0, Math.min(i + dir, DT_PRESETS.length - 1))
+        setDt(DT_PRESETS[next])
+      }
+
+      // Contour interval control. Steps through preset deltas (degrees).
+      const STEP_PRESETS = [0.25, 0.5, 1, 2, 5, 10]
+      function formatStep(s) { return (Number.isInteger(s) ? s : s) + "°" }
+      function setContourStep(s) {
+        contourStep = Math.max(STEP_PRESETS[0], Math.min(s, STEP_PRESETS[STEP_PRESETS.length - 1]))
+        const lbl = document.getElementById("stepLabel")
+        if (lbl) lbl.textContent = formatStep(contourStep)
+        const u = new URL(window.location.href)
+        u.searchParams.set("step", String(contourStep))
+        history.replaceState(null, "", u.toString())
+      }
+      function stepContour(dir) {
+        let i = STEP_PRESETS.findIndex(v => v >= contourStep)
+        if (i < 0) i = STEP_PRESETS.length - 1
+        if (STEP_PRESETS[i] !== contourStep && dir < 0) i -= 1
+        const next = Math.max(0, Math.min(i + dir, STEP_PRESETS.length - 1))
+        setContourStep(STEP_PRESETS[next])
+        // Re-render the current frame immediately with the new interval.
+        if (adaptive && lastFeatures.length) renderFeatures(lastFeatures)
+      }
+
+      // Hide the contour control for the non-adaptive (heatmap) view.
+      if (!adaptive) {
+        for (const id of ["contourRowLabel", "stepDown", "stepLabel", "stepUp"]) {
+          const el = document.getElementById(id)
+          if (el) el.style.display = "none"
+        }
+      }
+
+      // Wire up the control buttons (stopPropagation so clicks don't drag the
+      // legend).
+      ;[["speedUp", () => setPlaybackSpeed(playbackSpeed * 1.5)],
+        ["speedDown", () => setPlaybackSpeed(playbackSpeed / 1.5)],
+        ["playPause", () => setPaused(!paused)],
+        ["dtUp", () => stepDt(+1)],
+        ["dtDown", () => stepDt(-1)],
+        ["stepUp", () => stepContour(+1)],
+        ["stepDown", () => stepContour(-1)]].forEach(([id, fn]) => {
+        const btn = document.getElementById(id)
+        btn.addEventListener("pointerdown", (e) => e.stopPropagation())
+        btn.addEventListener("click", (e) => { e.stopPropagation(); fn() })
       })
+      setPlaybackSpeed(playbackSpeed) // initialize the label
+      setDt(dt) // initialize the dt label
+      setContourStep(contourStep) // initialize the contour-interval label
 
-      let model = {{weather_model}}
-      let lat = {{starting_latitude}}
-      let lon = {{starting_longitude}}
-      let now = new Date()
-      let dt = {{dt}}
-      let width = {{width}}
-      let height = {{height}}
+      showSpinner()
+      try {
+        // Cache all the data for the area first (parallel prefetch).
+        await fetch(`/api/models/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`)
+        // Fix the color scale to the whole-lifecycle range before rendering.
+        await fetchGlobalRange()
+        await loadFrame(time) // first frame
+      } catch (err) {
+        console.error("failed to load initial frame:", err)
+      } finally {
+        hideSpinner()
+      }
 
-      document.getElementById("displayTime").textContent = now.toString()
-      let time = Math.floor(now.getTime()/1000)
-
-      let url = `/api/models/${model}/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`
-      await fetch(url).then(resp => console.log("prefetch finished"))
-
-      window.setInterval(async () => {
+      async function tick() {
+        if (tickRunning) return // guard against double-entry (e.g. resume mid-fetch)
+        tickRunning = true
         time += dt
-        now = new Date(time*1000)
-        url = `/api/models/${model}/type/ensemble?lat=${lat}&lon=${lon}&width=${width}&height=${height}&time=${time}&dt=${dt}`
-        let data = await fetch(url).then(resp=>resp.json())
-        map.getSource({{weather_model}}).setData(data)
-        document.getElementById("displayTime").textContent = now.toString()
-      },
-      500)
+        try {
+          await loadFrame(time)
+        } catch (err) {
+          console.error("frame error:", err)
+        } finally {
+          tickRunning = false
+          scheduleNext()
+        }
+      }
+      scheduleNext()
     })
 
-    let items = document.getElementsByClassName("maplibregl-ctrl-attrib-button")
-    for (let item of items) {item.click()}
+    // Dismiss the basemap attribution popup.
+    const items = document.getElementsByClassName("maplibregl-ctrl-attrib-button")
+    for (const item of items) { item.click() }
+
+    // Make the legend draggable.
+    ;(function makeLegendDraggable() {
+      const el = document.getElementById("legend")
+      if (!el) return
+      let dragging = false, offsetX = 0, offsetY = 0
+      el.addEventListener("pointerdown", (e) => {
+        dragging = true
+        const rect = el.getBoundingClientRect()
+        offsetX = e.clientX - rect.left; offsetY = e.clientY - rect.top
+        el.style.top = rect.top + "px"; el.style.left = rect.left + "px"
+        el.setPointerCapture(e.pointerId); e.preventDefault()
+      })
+      el.addEventListener("pointermove", (e) => {
+        if (!dragging) return
+        const maxX = window.innerWidth - el.offsetWidth, maxY = window.innerHeight - el.offsetHeight
+        el.style.left = Math.max(0, Math.min(e.clientX - offsetX, maxX)) + "px"
+        el.style.top = Math.max(0, Math.min(e.clientY - offsetY, maxY)) + "px"
+      })
+      el.addEventListener("pointerup", (e) => { dragging = false; el.releasePointerCapture(e.pointerId) })
+    })()
   </script>
 </html>

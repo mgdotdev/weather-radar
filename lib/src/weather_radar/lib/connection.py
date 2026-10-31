@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+import threading
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -13,24 +14,61 @@ logger = logging.getLogger(__name__)
 lock = multiprocessing.Lock()
 
 
-def _retry_time(retries):
-    if retries >= 4:
-        return 0
-    return 4 - retries
+class _KeyedLocks:
+    """Hands out a distinct lock per key (here, per URL) so that concurrent
+    requests for the *same* resource are coalesced (only one fetch happens,
+    the rest wait and then read the freshly written cache), while requests
+    for *different* resources still proceed in parallel."""
+
+    def __init__(self):
+        self._registry_lock = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+
+    def get(self, key: str) -> threading.Lock:
+        with self._registry_lock:
+            existing = self._locks.get(key)
+            if existing is None:
+                existing = threading.Lock()
+                self._locks[key] = existing
+            return existing
 
 
-def retry_get(session, path, retries=10, resp=None):
-    logger.info(f"HTTP ATTEMPT {5-retries+1}: {path}")
+_url_locks = _KeyedLocks()
+
+
+def _retry_time(attempt):
+    """Exponential backoff with a cap, in seconds, for the given 0-based
+    attempt number: 1, 2, 4, 8, ... capped at 16s."""
+    return min(2 ** attempt, 16)
+
+
+def retry_get(session, path, retries=6, resp=None, attempt=0):
+    logger.info(f"HTTP ATTEMPT {attempt + 1}: {path}")
     if not retries:
-        if resp:
+        if resp is not None:
             resp.raise_for_status()
-        else:
-            raise RuntimeError(f"NWS unresponsive after 5 tries")
-    time.sleep(_retry_time(retries))
+        raise RuntimeError("NWS unresponsive after multiple tries")
+
     resp = session.get(path)
-    if resp.status_code != 200:
-        return retry_get(session, path, retries-1, resp)
-    return resp
+    if resp.status_code == 200:
+        return resp
+
+    # Rate limited: NOAA documents that throttling typically clears within a
+    # few seconds. Honor an explicit Retry-After header when present, else
+    # fall back to exponential backoff.
+    if resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After")
+        try:
+            wait = float(retry_after)
+        except (TypeError, ValueError):
+            wait = _retry_time(attempt)
+        logger.warning(f"HTTP 429 rate limited; backing off {wait}s: {path}")
+        time.sleep(wait)
+        return retry_get(session, path, retries - 1, resp, attempt + 1)
+
+    # Other transient errors: exponential backoff.
+    time.sleep(_retry_time(attempt))
+    return retry_get(session, path, retries - 1, resp, attempt + 1)
 
 
 def get_and_write(path, session):
@@ -48,16 +86,27 @@ def get_and_write(path, session):
 bad_cache = object()
 
 def get_from_external_source(path, session):
-    with lock:
-        if not os.path.isfile(path.tempfile):
-            return get_and_write(path, session)
+    # Fast path: file already cached on disk.
+    if os.path.isfile(path.tempfile):
+        try:
+            with open(path.tempfile, "r") as f:
+                return json.loads(f.read())
+        except Exception:
+            return bad_cache
 
-    try:
-        with open(path.tempfile, "r") as f:
-            resp = json.loads(f.read())
-    except Exception:
-        return bad_cache
-    return resp
+    # Not cached. Coalesce concurrent requests for the *same* URL behind a
+    # per-URL lock so only one thread hits NOAA; the others wait and then read
+    # the file the first thread wrote. Different URLs are not blocked.
+    url_lock = _url_locks.get(path.url)
+    with url_lock:
+        # Re-check: another thread may have fetched it while we waited.
+        if os.path.isfile(path.tempfile):
+            try:
+                with open(path.tempfile, "r") as f:
+                    return json.loads(f.read())
+            except Exception:
+                return bad_cache
+        return get_and_write(path, session)
 
 
 class PathObj:
@@ -93,6 +142,13 @@ class NOAAConnection:
         self._cache = {}
 
     def get(self, path):
+        _, body = self.get_with_expiry(path)
+        return body
+
+    def get_with_expiry(self, path):
+        """Like `get`, but also returns the `Expires` datetime for the
+        resource so callers can cache derived artifacts (e.g. fitted
+        splines) with the same lifetime as the underlying data."""
         path = PathObj(path)
         resp = self._cache.get(path.url, None)
 
@@ -107,7 +163,7 @@ class NOAAConnection:
                     os.unlink(path.tempfile)
                 except FileNotFoundError:
                     pass
-                return self.get(path.path)
+                return self.get_with_expiry(path.path)
 
             resp = (
                 datetime.strptime(
@@ -132,5 +188,5 @@ class NOAAConnection:
                 os.unlink(path.tempfile)
             except FileNotFoundError:
                 pass
-            return self.get(path.path)
-        return body
+            return self.get_with_expiry(path.path)
+        return expiry, body
