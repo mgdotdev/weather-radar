@@ -10,6 +10,7 @@ from jinja2 import Template
 HERE = os.path.abspath(os.path.dirname(__file__))
 MAP_HTML = os.path.join(HERE, "map.html")
 GRAPH_HTML = os.path.join(HERE, "graph.html")
+ADMIN_HTML = os.path.join(HERE, "admin.html")
 
 router = APIRouter()
 
@@ -196,6 +197,15 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
         "current_model": model,
     })
     return html
+
+
+@router.get("/admin", response_class=HTMLResponse)
+def admin():
+    """Serve the hot-cache admin page. The page's API calls are themselves
+    access-controlled (localhost-only, or ADMIN_TOKEN); this just serves the
+    static UI."""
+    with open(ADMIN_HTML) as f:
+        return f.read()
 
 
 @router.get("/graph/", response_class=HTMLResponse)

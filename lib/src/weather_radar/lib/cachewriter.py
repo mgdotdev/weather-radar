@@ -143,6 +143,10 @@ class _Writer:
         self._registry_lock = threading.Lock()
         # Streaming jobs: id -> progress queue (server-side only).
         self._jobs = {}
+        # Per-frame-key locks so two concurrent requests for the same frame
+        # compute it once (the second waits, then reads the cached result).
+        self._frame_locks = {}
+        self._frame_registry_lock = threading.Lock()
         import itertools
         self._job_counter = itertools.count(1)
 
@@ -252,6 +256,78 @@ class _Writer:
             items.append(nxt)
         return json.dumps({"items": items, "done": ended})
 
+    # --- frame computation (single-writer invariant) ---
+    # The writer is the ONLY process that computes + writes ensemble frame
+    # cache files, mirroring how it's the only one that writes NOAA cache
+    # files. Web workers ask for a frame via compute_frame(); the writer serves
+    # it from the per-frame cache or computes+caches it, returning the
+    # FeatureCollection by value (JSON string) across the manager boundary.
+
+    def _frame_lock(self, key):
+        with self._frame_registry_lock:
+            lk = self._frame_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                self._frame_locks[key] = lk
+            return lk
+
+    def compute_frame(self, params_json):
+        """Return the ensemble FeatureCollection for one frame as a JSON
+        string. Serves from the per-frame cache when the area's NOAA data is
+        fresh; otherwise computes it once (concurrent identical requests share
+        the compute via a per-key lock), caches it, and returns it."""
+        params = json.loads(params_json)
+        from . import framecache
+        from .area import MapCoordinate, CoordinateArea
+        from .models.accumulation import AccumulationEnsemble
+        from .models.observation import ObservationEnsemble
+        from datetime import datetime
+
+        akey = framecache.area_key(
+            params["model"], params["kind"], params["lat"], params["lon"],
+            params["width"], params["height"],
+        )
+        epoch = int(params["time"])
+
+        coord = MapCoordinate(params["lat"], params["lon"])
+        area = CoordinateArea(coord, params["width"], params["height"])
+        grid_paths = [f"/gridpoints/{gp}" for gp in area.gridpoints]
+        fresh = framecache.area_is_fresh(grid_paths)
+        # Version-stamp frames by the current gridpoint data so a frame built
+        # from superseded data is detected as stale even once the (new)
+        # gridpoints are themselves fresh — NOAA data changing invalidates any
+        # interpolation derived from it.
+        version = framecache.data_version(grid_paths)
+
+        # Fast path: fresh cache hit (matching data version), no lock needed.
+        if fresh:
+            cached = framecache.read_frame(akey, epoch, version=version)
+            if cached is not None:
+                return json.dumps(cached)
+
+        # Dedupe concurrent computes of the same frame.
+        lk = self._frame_lock(f"{akey}:{epoch}")
+        with lk:
+            # Re-check inside the lock (another thread may have just written).
+            if fresh:
+                cached = framecache.read_frame(akey, epoch, version=version)
+                if cached is not None:
+                    return json.dumps(cached)
+
+            ENSEMBLE_KINDS = {
+                "accumulation": AccumulationEnsemble,
+                "observation": ObservationEnsemble,
+            }
+            ensemble_class = ENSEMBLE_KINDS.get(params["kind"], AccumulationEnsemble)
+            ensemble = ensemble_class(area, params["model"])
+            fc = ensemble.predict(datetime.fromtimestamp(epoch), verbose=True)
+            if fresh:
+                try:
+                    framecache.write_frame(akey, epoch, fc, version=version)
+                except Exception:
+                    logger.warning("failed to cache frame %s", epoch, exc_info=True)
+            return json.dumps(fc)
+
 
 # --- Manager wiring ----------------------------------------------------------
 
@@ -267,6 +343,7 @@ def run_writer(ready_event=None):
     _CacheManager.register("ensure", callable=writer.ensure)
     _CacheManager.register("start_job", callable=writer.start_job)
     _CacheManager.register("poll_job", callable=writer.poll_job)
+    _CacheManager.register("compute_frame", callable=writer.compute_frame)
 
     mgr = _CacheManager(
         address=(CACHE_WRITER_HOST, CACHE_WRITER_PORT),
@@ -295,6 +372,7 @@ class _CacheClient(BaseManager):
 _CacheClient.register("ensure")
 _CacheClient.register("start_job")
 _CacheClient.register("poll_job")
+_CacheClient.register("compute_frame")
 
 
 class WriterUnavailable(Exception):
@@ -369,3 +447,23 @@ def ensure_stream(paths):
             yield {"done": item["done"], "total": item["total"]}
         if resp.get("done"):
             break
+
+
+def frame(params):
+    """Return the computed ensemble FeatureCollection (dict) for one frame,
+    produced BY THE WRITER PROCESS (single-writer invariant: the writer is the
+    only process that computes + writes frame cache files). `params` is a dict
+    with keys model, kind, lat, lon, width, height, time (epoch seconds).
+
+    The writer serves from its per-frame cache when the underlying NOAA data is
+    fresh, else computes + caches it. Raises WriterUnavailable if the writer
+    isn't reachable (caller may fall back to computing inline)."""
+    client = _get_client()
+
+    def _value(proxy):
+        try:
+            return proxy._getvalue()
+        except AttributeError:
+            return proxy
+
+    return json.loads(_value(client.compute_frame(json.dumps(params))))

@@ -8,6 +8,7 @@ from weather_radar.lib.models import model_from_type
 from weather_radar.lib.models.accumulation import AccumulationEnsemble
 from weather_radar.lib.models.observation import ObservationEnsemble
 from weather_radar.lib.area import MapCoordinate, CoordinateArea
+from weather_radar.lib import cachewriter
 
 router = APIRouter(prefix="/models")
 
@@ -68,11 +69,21 @@ def ensemble(
     kind: str="accumulation",
 ):
     dtime = datetime_from_time(time)
-    coord = MapCoordinate(lat, lon)
-    area = CoordinateArea(coord, width, height)
-    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
-    ensemble = ensemble_class(area, model)
-    return ensemble.predict(dtime, dt=dt, verbose=True)
+    epoch = int(dtime.timestamp())
+    params = {
+        "model": model, "kind": kind, "lat": lat, "lon": lon,
+        "width": width, "height": height, "time": epoch,
+    }
+    # Preferred path: the writer process computes + caches the frame (single-
+    # writer invariant) and returns it. Fall back to inline compute if the
+    # writer is unreachable (tests / standalone runs).
+    try:
+        return cachewriter.frame(params)
+    except cachewriter.WriterUnavailable:
+        coord = MapCoordinate(lat, lon)
+        area = CoordinateArea(coord, width, height)
+        ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
+        return ensemble_class(area, model).predict(dtime, dt=dt, verbose=True)
 
 
 @router.get("/{model}/type/range", response_class=JSONResponse)
@@ -113,16 +124,32 @@ def ensemble_stream(
     kind: str="accumulation",
 ):
     """Stream the ensemble as newline-delimited JSON (NDJSON): one GeoJSON
-    feature per line, emitted as each gridpoint is computed. Lets the client
-    render points progressively instead of waiting for the whole area."""
+    feature per line. Lets the client render points progressively.
+
+    The frame itself is computed + cached by the writer process (single-writer
+    invariant); this endpoint fetches it (a cache hit after the first time) and
+    streams its features out. Falls back to inline progressive compute if the
+    writer is unreachable."""
     dtime = datetime_from_time(time)
-    coord = MapCoordinate(lat, lon)
-    area = CoordinateArea(coord, width, height)
-    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
-    ensemble = ensemble_class(area, model)
+    epoch = int(dtime.timestamp())
+    params = {
+        "model": model, "kind": kind, "lat": lat, "lon": lon,
+        "width": width, "height": height, "time": epoch,
+    }
 
     def generate():
-        for feature in ensemble.iter_predict(dtime, verbose=True):
+        try:
+            fc = cachewriter.frame(params)
+        except cachewriter.WriterUnavailable:
+            # Writer down: compute inline, streaming each gridpoint as it's
+            # produced (no caching in this fallback path).
+            coord = MapCoordinate(lat, lon)
+            area = CoordinateArea(coord, width, height)
+            ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
+            for feature in ensemble_class(area, model).iter_predict(dtime, verbose=True):
+                yield json.dumps(feature) + "\n"
+            return
+        for feature in (fc or {}).get("features", []):
             yield json.dumps(feature) + "\n"
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")

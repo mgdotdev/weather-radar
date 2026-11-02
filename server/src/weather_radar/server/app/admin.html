@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>weather-radar · hot-cache admin</title>
+  <script src="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    :root { --fg:#222; --muted:#666; --border:#ddd; --accent:#1565c0; --bg:#fafafa; --danger:#c0392b; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; color: var(--fg); background: var(--bg);
+           margin: 0; padding: 24px; line-height: 1.4; }
+    .wrap { max-width: 820px; margin: 0 auto; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+    .card { background: #fff; border: 1px solid var(--border); border-radius: 8px;
+            padding: 16px; margin-bottom: 16px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    input[type=text] { width: 100%; padding: 8px 10px; border: 1px solid var(--border);
+                       border-radius: 6px; font-size: 14px; font-family: inherit; }
+    .row { display: flex; gap: 8px; align-items: flex-end; }
+    .row .grow { flex: 1 1 auto; min-width: 0; }
+    button { cursor: pointer; border: 1px solid var(--border); border-radius: 6px;
+             background: #f5f5f5; font-size: 14px; padding: 8px 14px; font-family: inherit; }
+    button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    button.danger { color: var(--danger); border-color: var(--danger); background: #fff; }
+    button:disabled { opacity: .5; cursor: default; }
+    table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
+             font-size: 13px; vertical-align: middle; }
+    th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+    td.url { word-break: break-all; font-family: ui-monospace, monospace; font-size: 12px; }
+    .stats { display: flex; gap: 20px; color: var(--muted); font-size: 13px; margin-top: 8px; }
+    .stats b { color: var(--fg); }
+    .empty { color: var(--muted); font-style: italic; padding: 12px 8px; }
+    #msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+    #msg.ok { color: #2e7d32; }
+    #msg.err { color: var(--danger); }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    td.url a { color: var(--accent); text-decoration: none; }
+    td.url a:hover { text-decoration: underline; }
+    .preview { width: 160px; height: 100px; border-radius: 6px; overflow: hidden;
+               border: 1px solid var(--border); background: #eee; }
+    .preview .maplibregl-ctrl-attrib, .preview .maplibregl-ctrl { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Hot-cache admin</h1>
+    <div class="sub">
+      Designate app URLs to keep "hot". The scheduler refreshes their NOAA data
+      just before it expires, so navigating to a watched URL finds everything
+      already cached and current.
+    </div>
+
+    <div class="card">
+      <label for="token">Admin token <span class="hint">(only needed if the server sets <code>ADMIN_TOKEN</code>)</span></label>
+      <input type="text" id="token" placeholder="leave blank on localhost" autocomplete="off" />
+    </div>
+
+    <div class="card">
+      <label for="url">Add a URL to keep hot</label>
+      <div class="row">
+        <div class="grow">
+          <input type="text" id="url" placeholder="http://host:8000/map/models/temperature/?lat=47.78&lon=-116.70&width=11&height=5&dt=600" autocomplete="off" />
+        </div>
+        <button class="primary" id="addBtn">Add</button>
+      </div>
+      <div class="hint">
+        Map URLs (<code>/map/models/&hellip;</code>) and graph URLs
+        (<code>/graph/?lat&amp;lon</code>) are supported; the server resolves
+        each to the NOAA paths it depends on.
+      </div>
+      <div id="msg"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content: space-between; align-items:center;">
+        <strong style="font-size:14px;">Watched URLs</strong>
+        <button id="refreshBtn">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th style="width:170px;">Preview</th><th>URL</th><th style="width:90px;">Actions</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="stats" id="stats"></div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id)
+    const tokenEl = $("token"), urlEl = $("url"), msgEl = $("msg"),
+          rowsEl = $("rows"), statsEl = $("stats")
+
+    // Live preview map instances, torn down before each re-render to avoid
+    // leaking WebGL contexts as the list is refreshed.
+    let previewMaps = []
+    function destroyPreviews() {
+      for (const m of previewMaps) { try { m.remove() } catch (_) {} }
+      previewMaps = []
+    }
+
+    // Persist the token locally so it survives reloads (convenience only).
+    tokenEl.value = localStorage.getItem("wr_admin_token") || ""
+    tokenEl.addEventListener("change", () =>
+      localStorage.setItem("wr_admin_token", tokenEl.value.trim()))
+
+    function headers() {
+      const h = { "Content-Type": "application/json" }
+      const t = tokenEl.value.trim()
+      if (t) h["X-Admin-Token"] = t
+      return h
+    }
+
+    function setMsg(text, kind) {
+      msgEl.textContent = text || ""
+      msgEl.className = kind || ""
+    }
+
+    async function api(method, body) {
+      let url = "/api/admin/hotcache"
+      const opts = { method, headers: headers() }
+      if (method === "DELETE") {
+        url += "?url=" + encodeURIComponent(body.url)
+      } else if (body) {
+        opts.body = JSON.stringify(body)
+      }
+      const resp = await fetch(url, opts)
+      let data = null
+      try { data = await resp.json() } catch (_) {}
+      if (!resp.ok) {
+        const detail = (data && data.detail) || resp.statusText
+        throw new Error(detail)
+      }
+      return data
+    }
+
+    // --- Area preview ------------------------------------------------------
+
+    // Parse an app URL's area params into a [ [west,south],[east,north] ]
+    // bounding box, mirroring the server geometry (km span -> degrees). Returns
+    // null if the URL has no usable lat/lon (e.g. a graph URL).
+    function areaBounds(urlStr) {
+      let q
+      try { q = new URL(urlStr).searchParams } catch (_) { return null }
+      const num = (k, d) => {
+        const v = parseFloat(q.get(k))
+        return Number.isFinite(v) ? v : d
+      }
+      const lat = num("lat", NaN), lon = num("lon", NaN)
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null
+      const width = num("width", 1), height = num("height", 1)  // km
+      // Server: dkm_to_dlat = km/110.574 ; dkm_to_dlon = km/(111.320*cos(lat)).
+      // width drives the lon span, height the lat span (see map.html geometry).
+      const dLon = width / (111.320 * Math.cos(lat * Math.PI / 180))
+      const dLat = height / 110.574
+      return [[lon - dLon / 2, lat - dLat / 2], [lon + dLon / 2, lat + dLat / 2]]
+    }
+
+    // Render a small static basemap (no contours) fit to the given bounds.
+    function makePreview(container, bounds) {
+      try {
+        const m = new maplibregl.Map({
+          container,
+          style: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+          bounds, fitBoundsOptions: { padding: 6, animate: false },
+          interactive: false, attributionControl: false,
+        })
+        previewMaps.push(m)
+        // Draw the area rectangle once the style is ready.
+        m.on("load", () => {
+          const [[w, s], [e, n]] = bounds
+          m.addSource("area", {
+            type: "geojson",
+            data: { type: "Feature", geometry: { type: "Polygon",
+              coordinates: [[[w, s], [e, s], [e, n], [w, n], [w, s]]] } },
+          })
+          m.addLayer({ id: "area-line", type: "line", source: "area",
+            paint: { "line-color": "#1565c0", "line-width": 1.5 } })
+          m.addLayer({ id: "area-fill", type: "fill", source: "area",
+            paint: { "fill-color": "#1565c0", "fill-opacity": 0.08 } })
+        })
+      } catch (e) {
+        container.textContent = "(preview unavailable)"
+      }
+    }
+
+    function render(list) {
+      destroyPreviews()
+      rowsEl.innerHTML = ""
+      const urls = (list && list.urls) || []
+      if (!urls.length) {
+        const tr = document.createElement("tr")
+        tr.innerHTML = '<td colspan="3" class="empty">No URLs are being kept hot yet.</td>'
+        rowsEl.appendChild(tr)
+      } else {
+        for (const u of urls) {
+          const tr = document.createElement("tr")
+
+          // Preview: a small static basemap of the area (no contours).
+          const tdPrev = document.createElement("td")
+          const prev = document.createElement("div")
+          prev.className = "preview"
+          tdPrev.appendChild(prev)
+
+          // URL: clickable link that opens the map in a new tab.
+          const tdUrl = document.createElement("td")
+          tdUrl.className = "url"
+          const a = document.createElement("a")
+          a.href = u; a.target = "_blank"; a.rel = "noopener"
+          a.textContent = u
+          tdUrl.appendChild(a)
+
+          // Actions.
+          const tdAct = document.createElement("td")
+          const btn = document.createElement("button")
+          btn.className = "danger"; btn.textContent = "Remove"
+          btn.addEventListener("click", () => remove(u))
+          tdAct.appendChild(btn)
+
+          tr.appendChild(tdPrev); tr.appendChild(tdUrl); tr.appendChild(tdAct)
+          rowsEl.appendChild(tr)
+
+          // Build the mini-map after the row is in the DOM (needs layout).
+          const bounds = areaBounds(u)
+          if (bounds) makePreview(prev, bounds)
+          else prev.textContent = ""
+        }
+      }
+      statsEl.innerHTML = list
+        ? `<span>URLs: <b>${list.urls ? list.urls.length : 0}</b></span>`
+          + `<span>Paths tracked: <b>${list.paths ?? 0}</b></span>`
+          + `<span>Scheduled refreshes: <b>${list.scheduled ?? 0}</b></span>`
+        : ""
+    }
+
+    async function refresh() {
+      try {
+        const list = await api("GET")
+        render(list)
+        setMsg("")
+      } catch (e) {
+        setMsg("Could not load watch-list: " + e.message, "err")
+      }
+    }
+
+    async function add() {
+      const url = urlEl.value.trim()
+      if (!url) { setMsg("Enter a URL first.", "err"); return }
+      $("addBtn").disabled = true
+      try {
+        const res = await api("POST", { url })
+        setMsg(`Added — tracking ${res.paths} NOAA path(s).`, "ok")
+        urlEl.value = ""
+        await refresh()
+      } catch (e) {
+        setMsg("Add failed: " + e.message, "err")
+      } finally {
+        $("addBtn").disabled = false
+      }
+    }
+
+    async function remove(url) {
+      try {
+        await api("DELETE", { url })
+        setMsg("Removed.", "ok")
+        await refresh()
+      } catch (e) {
+        setMsg("Remove failed: " + e.message, "err")
+      }
+    }
+
+    $("addBtn").addEventListener("click", add)
+    $("refreshBtn").addEventListener("click", refresh)
+    urlEl.addEventListener("keydown", (e) => { if (e.key === "Enter") add() })
+
+    refresh()
+  </script>
+</body>
+</html>
