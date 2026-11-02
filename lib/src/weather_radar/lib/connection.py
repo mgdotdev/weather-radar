@@ -94,19 +94,49 @@ def get_from_external_source(path, session):
         except Exception:
             return bad_cache
 
-    # Not cached. Coalesce concurrent requests for the *same* URL behind a
-    # per-URL lock so only one thread hits NOAA; the others wait and then read
-    # the file the first thread wrote. Different URLs are not blocked.
+    # Not cached. Preferred path: delegate the fetch+write to the single
+    # cache-writer process and wait (model A) for it to atomically publish the
+    # file, then read it. The writer coalesces duplicate URLs so concurrent
+    # misses for the same path cause a single NOAA request.
+    #
+    # If the writer process isn't reachable (e.g. tests, scripts, REPL, or the
+    # server hasn't spawned it yet), fall back to fetching inline so callers
+    # still work. The inline path uses the same per-URL coalescing lock.
+    try:
+        from .cachewriter import ensure as _ensure_cached
+        _ensure_cached([path.path])
+    except Exception:
+        logger.info(
+            "cache writer unavailable for %s; fetching inline", path.path
+        )
+        return _inline_fetch(path, session)
+
+    if os.path.isfile(path.tempfile):
+        try:
+            with open(path.tempfile, "r") as f:
+                return json.loads(f.read())
+        except Exception:
+            return bad_cache
+    # Writer ran but produced nothing (e.g. NOAA error) -> treat as a miss.
+    return bad_cache
+
+
+def _inline_fetch(path, session):
+    """Fetch + write a single path in-process (fallback when the cache-writer
+    process isn't available). Coalesces concurrent fetches of the same URL."""
     url_lock = _url_locks.get(path.url)
     with url_lock:
-        # Re-check: another thread may have fetched it while we waited.
         if os.path.isfile(path.tempfile):
             try:
                 with open(path.tempfile, "r") as f:
                     return json.loads(f.read())
             except Exception:
                 return bad_cache
-        return get_and_write(path, session)
+        try:
+            return get_and_write(path, session)
+        except Exception:
+            logger.warning("inline fetch failed for %s", path.path, exc_info=True)
+            return bad_cache
 
 
 class PathObj:

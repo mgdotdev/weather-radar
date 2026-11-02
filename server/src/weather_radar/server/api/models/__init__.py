@@ -39,6 +39,23 @@ def prefetch(lat: float, lon: float, width: float|None=None, height: float|None=
         area.cache()
 
 
+@router.get("/prefetch/stream")
+def prefetch_stream(lat: float, lon: float, width: float=1, height: float=1):
+    """Stream prefetch progress as NDJSON (one JSON object per line) while the
+    area's data is fetched from NOAA. Each line is
+    {"phase": "points"|"gridpoints", "done": N, "total": M} so the client can
+    show a live completed/total fraction. Phases run in order; the final line
+    of each phase has done == total."""
+    coord = MapCoordinate(lat, lon)
+    area = CoordinateArea(coord, width, height)
+
+    def generate():
+        for progress in area.iter_cache():
+            yield json.dumps(progress) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
 @router.get("/{model}/type/ensemble", response_class=JSONResponse)
 def ensemble(
     model: str,
@@ -75,7 +92,13 @@ def ensemble_range(
     area = CoordinateArea(coord, width, height)
     ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
     ensemble = ensemble_class(area, model)
-    return ensemble.value_range() or {"min": None, "max": None, "uom": None, "start": None, "end": None}
+    result = ensemble.value_range() or {
+        "min": None, "max": None, "uom": None, "start": None, "end": None
+    }
+    # Include the center's IANA timezone so the client can display times in
+    # the map location's local zone rather than the browser's.
+    result["timeZone"] = area.time_zone
+    return result
 
 
 @router.get("/{model}/type/ensemble/stream")

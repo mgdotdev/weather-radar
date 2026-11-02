@@ -10,9 +10,10 @@ from .connection import NOAAConnection, PathObj, get_and_write
 lock = multiprocessing.Lock()
 
 # Maximum simultaneous requests to the NOAA API. NOAA enforces undisclosed
-# rate limits and returns HTTP 429 when overwhelmed; a modest ceiling keeps
-# us under that while still parallelizing I/O-bound lookups.
-NOAA_MAX_CONCURRENCY = 4
+# rate limits and returns HTTP 429 when overwhelmed; we respect 429/Retry-After
+# (see connection.retry_get) so this ceiling can be fairly generous — if we
+# push too hard NOAA throttles and we automatically back off. Env-overridable.
+NOAA_MAX_CONCURRENCY = int(os.environ.get("NOAA_MAX_CONCURRENCY", "8"))
 
 # Spacing (km) between sample coordinates when resolving an area's gridpoints.
 # NOAA forecast gridpoints are ~2.5km cells, so sampling finer than this just
@@ -101,6 +102,16 @@ class CoordinateArea:
     @cached_property
     def center_id(self):
         return self.center_gridpoint.id
+
+    @cached_property
+    def time_zone(self):
+        """IANA timezone name (e.g. "America/Los_Angeles") for the area's
+        center, from NOAA's /points metadata. None if unavailable."""
+        try:
+            resp = NOAAConnection().get(f"/points/{self.center}")
+            return resp["properties"].get("timeZone")
+        except Exception:
+            return None
 
     @property
     def map_coordinates(self):
@@ -203,12 +214,24 @@ class CoordinateArea:
 
         coordinates = self.coordinates_by_proximity
 
+        # Pre-warm ALL /points lookups in a single batched writer job, rather
+        # than letting each gridpoint_from_map_coordinate() trigger its own
+        # per-path writer round-trip. The writer fetches them concurrently;
+        # afterwards every /points read below is a fast local cache hit. This
+        # turns N blocking IPC round-trips into one.
+        try:
+            from .cachewriter import ensure as _ensure_cached
+            _ensure_cached([f"/points/{c}" for c in coordinates])
+        except Exception:
+            # Writer unavailable: fall back to resolving inline (each call
+            # fetches on miss via connection's inline fallback).
+            pass
+
         seen = set()
         ordered = []
-        # `executor.map` preserves input (proximity) order while running up to
-        # NOAA_MAX_CONCURRENCY lookups ahead, so we emit gridpoints outward
-        # from the center as soon as each nearest one resolves. Dedupe on the
-        # fly since adjacent samples often map to the same gridpoint.
+        # With /points warmed, resolve gridpoints. The thread pool keeps this
+        # fast even though each call is now just a cache read; dedupe since
+        # adjacent samples often map to the same gridpoint.
         with concurrent.futures.ThreadPoolExecutor(max_workers=NOAA_MAX_CONCURRENCY) as executor:
             for gp in executor.map(gridpoint_from_map_coordinate, coordinates):
                 if gp in seen:
@@ -231,30 +254,32 @@ class CoordinateArea:
         return list(self.iter_gridpoints())
 
     def cache(self):
-        paths = (f"/points/{c}" for c in self.map_coordinates)
-        path_objs = (PathObj(p) for p in paths)
-        with lock:
-            conn = NOAAConnection()
-            missings = [p for p in path_objs if not os.path.isfile(p.tempfile)]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=NOAA_MAX_CONCURRENCY) as exec:
-                jobs = [
-                    exec.submit(get_and_write, m, conn.session)
-                    for m in missings
-                ]
-                concurrent.futures.wait(jobs)
+        # Eagerly consume the streaming cacher (ignoring progress). Kept for
+        # callers that just want the side effect of populating the cache.
+        for _ in self.iter_cache():
+            pass
 
+    def iter_cache(self):
+        """Populate the on-disk cache for this area, yielding progress for two
+        ordered phases, each with its OWN fraction:
+          1. "points"     — resolve gridpoints via /points lookups;
+          2. "gridpoints" — fetch /gridpoints forecast data.
+        Each yielded dict is {"phase", "done", "total"}. Only not-fresh files
+        are counted/fetched; all fetching is delegated to the cache-writer.
+        """
+        from .cachewriter import ensure_stream, not_fresh
 
-        paths = (f"/gridpoints/{c}" for c in self.gridpoints)
-        path_objs = (PathObj(p) for p in paths)
-        with lock:
-            conn = NOAAConnection()
-            missings = [p for p in path_objs if not os.path.isfile(p.tempfile)]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=NOAA_MAX_CONCURRENCY) as exec:
-                jobs = [
-                    exec.submit(get_and_write, m, conn.session)
-                    for m in missings
-                ]
-                concurrent.futures.wait(jobs)
+        # Phase 1: /points. Its total is the not-fresh point count.
+        point_paths = not_fresh([f"/points/{c}" for c in self.map_coordinates])
+        yield {"phase": "points", "done": 0, "total": len(point_paths)}
+        for prog in ensure_stream(point_paths):
+            yield {"phase": "points", "done": prog["done"], "total": len(point_paths)}
+
+        # Phase 2: /gridpoints (gridpoint set now known from phase 1).
+        grid_paths = not_fresh([f"/gridpoints/{gp}" for gp in self.gridpoints])
+        yield {"phase": "gridpoints", "done": 0, "total": len(grid_paths)}
+        for prog in ensure_stream(grid_paths):
+            yield {"phase": "gridpoints", "done": prog["done"], "total": len(grid_paths)}
 
 
 def gridpoint_from_map_coordinate(coordinate: MapCoordinate):

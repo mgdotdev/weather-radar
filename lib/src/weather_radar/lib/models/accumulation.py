@@ -2,12 +2,17 @@ from datetime import datetime
 from functools import cached_property
 from threading import Lock
 
+import logging
+
 from weather_radar.lib.area import CoordinateArea, MapCoordinate, NOAAGridpoint, gridpoint_from_map_coordinate
 from ..connection import NOAAConnection
 
 from scipy import interpolate
 
 from .utils import BoundsError, to_camel_case
+
+
+logger = logging.getLogger(__name__)
 
 
 # NOAA reports accumulation attributes (snowfall, precipitation) in
@@ -75,7 +80,9 @@ class AccumulationModel:
         center_coordinate = [sum(item) / len(item) for item in polygon]
         center_coordinate = MapCoordinate(*center_coordinate)
         data = data["properties"][to_camel_case(self.attribute)]
-        _, units = data["uom"].split(":")
+        # Some layers omit `uom` (dimensionless); default to no unit.
+        uom = data.get("uom", "")
+        units = uom.split(":")[-1] if uom else ""
         # Convert from NOAA's native unit (mm) to our display unit (inches).
         factor, units = UNIT_CONVERSIONS.get(units, (1.0, units))
         data = data["values"]
@@ -165,12 +172,30 @@ class AccumulationEnsemble:
         for the whole area. Gridpoints are resolved nearest-to-center first
         and emitted as they become available. Out-of-horizon points are
         skipped."""
-        for coordinate in self.area.iter_gridpoints():
+        gridpoints = list(self.area.iter_gridpoints())
+        # Batch-warm all gridpoint data concurrently via the writer before the
+        # serial predict loop, so per-gridpoint cache misses don't each make
+        # their own blocking writer round-trip (the main cause of slowness).
+        try:
+            from ..cachewriter import ensure as _ensure_cached
+            _ensure_cached([f"/gridpoints/{gp}" for gp in gridpoints])
+        except Exception:
+            pass
+        for coordinate in gridpoints:
             try:
                 yield self[coordinate].predict(time, verbose=verbose)
             except BoundsError:
                 # Requested time is outside this gridpoint's forecast horizon;
                 # skip the point rather than failing the whole ensemble.
+                continue
+            except Exception:
+                # A single gridpoint may fail to build (layer absent here, too
+                # few points for a spline, malformed data). Skip it so one bad
+                # cell doesn't 500 the whole area.
+                logger.warning(
+                    "skipping gridpoint %s for %s", coordinate, self.attribute,
+                    exc_info=True,
+                )
                 continue
 
     def predict(self, time: datetime, dt=0, verbose=False):

@@ -38,7 +38,9 @@ def _gridpoint_json(attribute_camel, values, uom="wmoUnit:mm"):
         },
         "properties": {
             attribute_camel: {
-                "uom": uom,
+                # A None uom means "dimensionless" -> omit the key entirely,
+                # matching layers like probabilityOfThunder.
+                **({"uom": uom} if uom is not None else {}),
                 "values": [
                     {
                         "validTime": (BASE + timedelta(hours=h)).isoformat() + "/PT1H",
@@ -104,6 +106,35 @@ class TestAccumulationUnits:
         feature = model.predict(BASE + timedelta(hours=3), verbose=True)
         assert feature["properties"]["snowfall-amount"] == pytest.approx(1.0, abs=1e-6)
         assert feature["properties"]["uom"] == "in"
+
+
+class TestMissingUom:
+    def test_observation_without_uom(self, mock_gridpoint):
+        # A dimensionless layer (no uom, e.g. probabilityOfThunder) must not
+        # crash; units come back empty.
+        body = _gridpoint_json(
+            "probabilityOfThunder",
+            [(0, 5.0), (1, 20.0), (2, 60.0), (3, 10.0)],
+            uom=None,
+        )
+        mock_gridpoint(body)
+        model = ObservationModel(GP, "probability-of-thunder")
+        feature = model.predict(BASE + timedelta(hours=2), verbose=True)
+        assert feature["properties"]["uom"] == ""
+        assert feature["properties"]["probability-of-thunder"] == pytest.approx(60.0, abs=1e-6)
+
+    def test_accumulation_without_uom(self, mock_gridpoint):
+        # No uom -> no conversion factor; values pass through unchanged.
+        body = _gridpoint_json(
+            "someAccumulation",
+            [(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0)],
+            uom=None,
+        )
+        mock_gridpoint(body)
+        model = AccumulationModel(GP, "some-accumulation")
+        feature = model.predict(BASE + timedelta(hours=3), verbose=True)
+        assert feature["properties"]["uom"] == ""
+        assert feature["properties"]["some-accumulation"] == pytest.approx(4.0, abs=1e-6)
 
 
 class TestObservationNulls:

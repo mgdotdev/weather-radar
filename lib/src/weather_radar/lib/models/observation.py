@@ -1,5 +1,7 @@
 from functools import cached_property
 
+import logging
+
 from datetime import datetime
 from threading import Lock
 
@@ -8,6 +10,9 @@ from scipy import interpolate
 from weather_radar.lib.area import CoordinateArea, MapCoordinate, NOAAGridpoint, gridpoint_from_map_coordinate
 from ..connection import NOAAConnection
 from .utils import BoundsError, to_camel_case
+
+
+logger = logging.getLogger(__name__)
 
 
 WRAPPER_FUNCTIONS = {
@@ -69,7 +74,10 @@ class ObservationModel:
         center_coordinate = [sum(item) / len(item) for item in polygon]
         center_coordinate = MapCoordinate(*center_coordinate)
         data = data["properties"][attr]
-        _, units = data["uom"].split(":")
+        # Some layers are dimensionless (e.g. probabilityOfThunder) and omit
+        # `uom` entirely; others use "wmoUnit:degC" style. Default to no unit.
+        uom = data.get("uom", "")
+        units = uom.split(":")[-1] if uom else ""
         data = data["values"]
         data = [
             (datetime.fromisoformat(d["validTime"].split("/")[0]), d["value"])
@@ -147,12 +155,32 @@ class ObservationEnsemble:
         callers can stream/render results progressively. Gridpoints are
         resolved nearest-to-center first and emitted as they become
         available. Out-of-horizon points are skipped."""
-        for coordinate in self.area.iter_gridpoints():
+        gridpoints = list(self.area.iter_gridpoints())
+        # Batch-warm every gridpoint's data in a single concurrent writer job
+        # BEFORE the serial predict loop below. Otherwise each predict()'s
+        # cache miss would make its own blocking writer round-trip, one at a
+        # time — which is the dominant source of slow resolution.
+        try:
+            from ..cachewriter import ensure as _ensure_cached
+            _ensure_cached([f"/gridpoints/{gp}" for gp in gridpoints])
+        except Exception:
+            pass  # writer unavailable -> predict() falls back to inline fetch
+        for coordinate in gridpoints:
             try:
                 yield self[coordinate].predict(time, verbose=verbose)
             except BoundsError:
                 # Requested time is outside this gridpoint's forecast horizon;
                 # skip the point rather than failing the whole ensemble.
+                continue
+            except Exception:
+                # A single gridpoint may fail to build (e.g. the layer is
+                # absent here, has too few points to fit a spline, or has
+                # malformed data). Skip it so one bad cell doesn't 500 the
+                # whole area.
+                logger.warning(
+                    "skipping gridpoint %s for %s", coordinate, self.attribute,
+                    exc_info=True,
+                )
                 continue
 
     def predict(self, time: datetime, dt=0, verbose=False):

@@ -31,7 +31,12 @@
         padding: 8px 10px; border-radius: 6px; font-family: sans-serif;
         font-size: 12px; color: #222; box-shadow: 0 1px 4px rgba(0,0,0,0.3);
         cursor: move; user-select: none;">
-      <div id="legendTitle" style="font-weight: 600; margin-bottom: 4px;"></div>
+      <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
+        <select id="modelSelect" title="Weather model"
+          style="flex:1 1 auto; min-width:0; font-size:12px; font-weight:600;
+          padding:2px 4px; border:1px solid #bbb; border-radius:4px; background:#fff; cursor:pointer;"></select>
+        <span id="legendUnits" style="font-size:11px; color:#555; white-space:nowrap;"></span>
+      </div>
       <div id="legendBar" style="height: 12px; width: 100%; border-radius: 2px;
         border: 1px solid rgba(0,0,0,0.2); box-sizing: border-box;"></div>
       <div style="display: flex; justify-content: space-between; margin-top: 2px;">
@@ -42,17 +47,26 @@
       <!-- Playback controls. Rows share a grid so the −/+ buttons line up in
            consistent columns regardless of label/value width. -->
       <div style="margin-top:8px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12);">
-        <!-- Play/Pause sits beside the time scrubber, which reflects the
-             current animation time and lets you jump to any point in the
-             forecast window. -->
-        <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
+        <!-- Play/Pause sits beside a custom range scrubber: two bar handles
+             set the playback window [start, end] and a circle is the current
+             time (constrained between the bars). All three are draggable. -->
+        <div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
           <button id="playPause" title="Pause / Play" style="cursor:pointer; flex:0 0 auto; height:24px;
             border:1px solid #bbb; border-radius:4px; background:#f5f5f5; font-size:12px; line-height:1; padding:0 8px;">⏸</button>
-          <input id="timeSlider" type="range" min="0" max="1" step="1" value="0" disabled
-            style="flex:1 1 auto; cursor:pointer; margin:0; min-width:0;" title="Scrub through time" />
+          <svg id="timeScrubber" width="100%" height="28" style="flex:1 1 auto; min-width:0; touch-action:none; overflow:visible;">
+            <!-- Full track -->
+            <line id="scTrack" x1="0" y1="14" x2="100%" y2="14" stroke="#ccc" stroke-width="4" stroke-linecap="round"/>
+            <!-- Active window segment (between start & end bars) -->
+            <line id="scActive" x1="0" y1="14" x2="0" y2="14" stroke="#1565c0" stroke-width="4" stroke-linecap="round"/>
+            <!-- Start / end bound handles -->
+            <rect id="scStart" x="0" y="4" width="6" height="20" rx="2" fill="#1565c0" stroke="#fff" stroke-width="1" style="cursor:ew-resize"/>
+            <rect id="scEnd" x="0" y="4" width="6" height="20" rx="2" fill="#1565c0" stroke="#fff" stroke-width="1" style="cursor:ew-resize"/>
+            <!-- Current-time playhead -->
+            <circle id="scPlayhead" cx="0" cy="14" r="7" fill="#fff" stroke="#1565c0" stroke-width="2.5" style="cursor:grab"/>
+          </svg>
         </div>
-        <div id="timeSliderLabel" style="font-size:10px; color:#666; text-align:center;
-          margin-bottom:6px; font-variant-numeric:tabular-nums;
+        <div id="timeSliderLabel" style="font-size:13px; color:#333; text-align:center;
+          margin-bottom:6px; font-variant-numeric:tabular-nums; font-weight:600;
           white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">—</div>
         <div style="display:grid; grid-template-columns:1fr 22px 52px 22px; align-items:center;
             column-gap:6px; row-gap:6px;">
@@ -106,7 +120,7 @@
       <div style="width: 44px; height: 44px; margin: 0 auto 6px;
           border: 5px solid rgba(21,101,192,0.25); border-top-color: #1565c0;
           border-radius: 50%; animation: wrspin 0.8s linear infinite;"></div>
-      <div style="font-size: 12px; background: rgba(255,255,255,0.85);
+      <div id="spinnerText" style="font-size: 12px; background: rgba(255,255,255,0.85);
           padding: 2px 8px; border-radius: 4px;">Loading data…</div>
     </div>
   </body>
@@ -120,6 +134,9 @@
     let height = {{height}}
     let dt = {{dt}}
     const colorRamp = {{contour_color_ramp}}
+    // Available models for the in-legend selector, and the current one.
+    const modelOptions = {{model_options}}
+    const currentModel = "{{current_model}}"
     // Contour interval: the value delta between adjacent contour lines
     // (e.g. 1.0, 0.5, 2.0 degrees). Configurable live in the legend.
     let contourStep = {{contour_step}}
@@ -133,9 +150,14 @@
     // Null until fetched (then buildContours falls back to the frame range).
     let globalMin = null, globalMax = null
     // Forecast time window (epoch seconds) for the current area, from the
-    // range API. Used to loop the animation back to the start when `time`
-    // passes the end. Null until fetched.
+    // range API — the FULL available range. Null until fetched.
     let forecastStart = null, forecastEnd = null
+    // Active playback window (epoch seconds): the user-adjustable [start, end]
+    // the scrubber spans and the animation loops over. Defaults to the full
+    // forecast window; always kept within [forecastStart, forecastEnd].
+    let windowStart = null, windowEnd = null
+    // IANA timezone of the map center (from NOAA /points); null => browser-local.
+    let mapTimeZone = null
     let lastFeatures = []  // most recent frame's features (for instant re-render on contour-step change)
 
     // Grid resolution and interpolation smoothing for the contour field.
@@ -158,8 +180,22 @@
 
     // ---- Spinner ------------------------------------------------------------
     const spinnerEl = document.getElementById("spinner")
-    function showSpinner() { spinnerEl.style.display = "block" }
+    const spinnerTextEl = document.getElementById("spinnerText")
+    function showSpinner(msg) {
+      spinnerTextEl.textContent = msg || "Loading data…"
+      spinnerEl.style.display = "block"
+    }
     function hideSpinner() { spinnerEl.style.display = "none" }
+    // Show a per-phase completed/total fraction, e.g. "Resolving grid… 12 / 48"
+    // then "Fetching data… 30 / 46". Points and gridpoints are counted
+    // separately.
+    const PHASE_LABELS = { points: "Resolving grid", gridpoints: "Fetching data" }
+    function setSpinnerProgress(phase, done, total) {
+      const label = PHASE_LABELS[phase] || "Loading"
+      spinnerTextEl.textContent = total
+        ? `${label}… ${done} / ${total}`
+        : `${label}…`
+    }
 
     // ---- Color ramp ---------------------------------------------------------
     const rampStops = (() => {
@@ -196,7 +232,7 @@
         document.getElementById("legendBar").style.background = legendGradientCss()
         legendInitialized = true
       }
-      document.getElementById("legendTitle").textContent = model + (units ? ` (${units})` : "")
+      document.getElementById("legendUnits").textContent = units ? `(${units})` : ""
       document.getElementById("legendMin").textContent = vMin.toFixed(1)
       document.getElementById("legendMid").textContent = ((vMin + vMax) / 2).toFixed(1)
       document.getElementById("legendMax").textContent = vMax.toFixed(1)
@@ -494,6 +530,11 @@
         u.searchParams.set("width", width.toFixed(2))
         u.searchParams.set("height", height.toFixed(2))
         u.searchParams.set("zoom", map.getZoom().toFixed(2))
+        // Re-centering starts a fresh playback window for the new area; drop
+        // any persisted scrubber state so it doesn't carry over.
+        u.searchParams.delete("from")
+        u.searchParams.delete("to")
+        u.searchParams.delete("t")
         history.replaceState(null, "", u.toString())
 
         // Reset the animation clock to "now" and reload for the new area:
@@ -501,17 +542,35 @@
         time = Math.floor(Date.now() / 1000)
         globalMin = null; globalMax = null
         forecastStart = null; forecastEnd = null
-        document.getElementById("timeSlider").disabled = true
-        showSpinner()
+        windowStart = null; windowEnd = null
+        mapTimeZone = null
+        scrubberReady = false
+        // Invalidate any in-flight frame load from the previous area so a
+        // stale result can't render over the new one. The `loading` flag gates
+        // the animation tick (it keeps looping but won't render) until the new
+        // area is ready, so we don't need to pause/resume playback.
+        loadGeneration += 1
+        loading = true
+        // Clear the old area's contours immediately so stale lines aren't left
+        // on screen while the new area loads.
+        lastFeatures = []
+        const src = map.getSource("contours")
+        if (src) src.setData({ type: "FeatureCollection", features: [] })
+        showSpinner("Loading data…")
         try {
-          await fetch(`/api/models/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`)
+          await prefetchWithProgress()
           await fetchGlobalRange()
           time = clampToForecast(time)
           await loadFrame(time)
         } catch (err) {
           console.error("re-center load failed:", err)
         } finally {
+          loading = false
           hideSpinner()
+          // Resume the animation for the new area (unless the user has it
+          // paused). Kick the loop explicitly rather than assuming one is
+          // still scheduled — a gated tick may have already drained.
+          if (!paused) { if (tickTimer) { clearTimeout(tickTimer); tickTimer = null } scheduleNext() }
         }
       })
       map.on("click", hideMenu)
@@ -546,15 +605,62 @@
       // Fetch the full ensemble for a given time and render it. Returns true
       // on success. Waits for the entire response (no streaming) — simple.
       async function loadFrame(time) {
+        // Capture the current load generation; a re-center bumps it, so a
+        // frame request that was in flight across a re-center won't render its
+        // (now stale) result over the new area.
+        const gen = loadGeneration
         const resp = await fetch(
           `/api/models/${model}/type/ensemble?lat=${lat}&lon=${lon}&width=${width}&height=${height}&time=${time}&dt=${dt}&kind=${kind}`
         )
+        if (gen !== loadGeneration) return false  // superseded by a re-center
         if (!resp.ok) { console.error("ensemble request failed:", resp.status); return false }
         const data = await resp.json()
+        if (gen !== loadGeneration) return false
         const features = (data && data.features) || []
         renderFeatures(features)
         syncTimeSlider(time)
         return true
+      }
+
+      // Stream prefetch progress from NOAA and drive the spinner with a live
+      // completed/total fraction per phase (resolving grid, then fetching
+      // data). Resolves once the area is fully cached. Falls back to the plain
+      // (blocking, no-progress) prefetch if streaming isn't available.
+      async function prefetchWithProgress() {
+        const url = `/api/models/prefetch/stream?lat=${lat}&lon=${lon}&width=${width}&height=${height}`
+        let resp
+        try {
+          resp = await fetch(url)
+        } catch (err) {
+          resp = null
+        }
+        if (!resp || !resp.ok || !resp.body) {
+          // Fallback: blocking prefetch with a generic message.
+          showSpinner("Loading data…")
+          await fetch(`/api/models/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`)
+          return
+        }
+        const reader = resp.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ""
+        const handle = (line) => {
+          if (!line) return
+          try {
+            const p = JSON.parse(line)
+            setSpinnerProgress(p.phase, p.done, p.total)
+          } catch (_) {}
+        }
+        for (;;) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          let nl
+          while ((nl = buffer.indexOf("\n")) >= 0) {
+            handle(buffer.slice(0, nl).trim())
+            buffer = buffer.slice(nl + 1)
+          }
+        }
+        handle(buffer.trim())
       }
 
       // Fetch the fixed global value range for the current area (whole
@@ -573,24 +679,31 @@
             // has pinned a step manually / via URL).
             if (autoStep) applyAutoStep()
           }
-          // Capture the forecast window so the animation can loop over it.
+          // The map center's IANA timezone, so times display in the location's
+          // local zone rather than the browser's. Falls back to browser-local.
+          mapTimeZone = (r && r.timeZone) || null
+          // Capture the forecast window; default the playback window to it,
+          // then apply any persisted window/time from the URL (clamped into
+          // the available forecast range).
           const s = r && r.start ? Math.floor(Date.parse(r.start) / 1000) : NaN
           const e = r && r.end ? Math.floor(Date.parse(r.end) / 1000) : NaN
           if (Number.isFinite(s) && Number.isFinite(e) && e > s) {
             forecastStart = s; forecastEnd = e
+            windowStart = s; windowEnd = e
+            applyUrlWindow()
             console.log("[field] forecast window:", new Date(s * 1000).toISOString(), "->", new Date(e * 1000).toISOString())
-            configureTimeSlider()
+            configureScrubber()
           }
         } catch (err) {
           console.warn("global range fetch failed; using per-frame range:", err)
         }
       }
 
-      // Clamp a time (epoch seconds) into the forecast window if known, so the
-      // first frame after a (re)load always falls on valid data.
+      // Clamp a time (epoch seconds) into the active playback window if known,
+      // so the first frame after a (re)load always falls on valid data.
       function clampToForecast(t) {
-        if (forecastStart !== null && t < forecastStart) return forecastStart
-        if (forecastEnd !== null && t > forecastEnd) return forecastStart !== null ? forecastStart : t
+        if (windowStart !== null && t < windowStart) return windowStart
+        if (windowEnd !== null && t > windowEnd) return windowStart !== null ? windowStart : t
         return t
       }
 
@@ -603,12 +716,37 @@
       let tickTimer = null
       let tickRunning = false
       let time = Math.floor(Date.now() / 1000)
+      // Bumped whenever we switch areas (re-center), so in-flight frame loads
+      // from the previous area can detect they've been superseded and skip
+      // rendering stale contours over the new location.
+      let loadGeneration = 0
+      // True while a (re)load is in progress. The animation tick refuses to
+      // run while this is set, so the old area's frames can't keep animating
+      // underneath the loading spinner.
+      let loading = false
 
       function frameIntervalMs() {
-        return Math.max(100, BASE_FRAME_INTERVAL_MS / playbackSpeed)
+        // Floor of 20ms (=50x at the 1s base) so the top speeds aren't clamped
+        // to the same interval. Actual throughput is still bounded by per-frame
+        // render time; the loop schedules the next frame only after the current
+        // one finishes, so frames can't stack up regardless.
+        return Math.max(20, BASE_FRAME_INTERVAL_MS / playbackSpeed)
+      }
+      // Discrete speed ladder the +/- buttons step through. Includes the
+      // requested 20x and 50x at the top end.
+      const SPEED_STEPS = [0.25, 0.5, 1, 2, 5, 10, 20, 50]
+      function stepSpeed(dir) {
+        // Snap current speed to the nearest ladder index, then move one step.
+        let i = 0, best = Infinity
+        for (let k = 0; k < SPEED_STEPS.length; k++) {
+          const d = Math.abs(SPEED_STEPS[k] - playbackSpeed)
+          if (d < best) { best = d; i = k }
+        }
+        i = Math.max(0, Math.min(SPEED_STEPS.length - 1, i + dir))
+        setPlaybackSpeed(SPEED_STEPS[i])
       }
       function setPlaybackSpeed(mult) {
-        playbackSpeed = Math.max(0.1, Math.min(mult, 10))
+        playbackSpeed = Math.max(0.1, Math.min(mult, 50))
         const lbl = document.getElementById("speedLabel")
         if (lbl) lbl.textContent = playbackSpeed.toFixed(1) + "×"
         const u = new URL(window.location.href)
@@ -626,6 +764,10 @@
         if (!paused) { // resume: cancel stray timer, kick the loop
           if (tickTimer) { clearTimeout(tickTimer); tickTimer = null }
           scheduleNext()
+        } else if (!scrubbing) {
+          // Pausing to a resting state: capture the current time in the URL.
+          // (During a scrub, endDrag handles persistence instead.)
+          persistScrubberState()
         }
       }
       function scheduleNext() {
@@ -643,9 +785,6 @@
         dt = Math.max(DT_PRESETS[0], Math.min(secs, DT_PRESETS[DT_PRESETS.length - 1]))
         const lbl = document.getElementById("dtLabel")
         if (lbl) lbl.textContent = formatDt(dt)
-        // Keep the time slider's snap resolution in step with dt.
-        const ts = document.getElementById("timeSlider")
-        if (ts && !ts.disabled) ts.step = String(Math.max(1, dt))
         const u = new URL(window.location.href)
         u.searchParams.set("dt", String(dt))
         history.replaceState(null, "", u.toString())
@@ -730,76 +869,194 @@
         if (lastFeatures.length) renderFeatures(lastFeatures)
       }
 
-      // ---- Time scrubber ----------------------------------------------------
-      // The slider mirrors the animation clock and lets the user jump to any
-      // moment in the forecast window. While dragging, the animation is
-      // paused and frame loads are debounced so scrubbing stays responsive.
-      const timeSlider = document.getElementById("timeSlider")
+      // ---- Custom time scrubber --------------------------------------------
+      // An SVG with three draggable elements:
+      //   * two bar handles (scStart, scEnd) set the playback window;
+      //   * a circle (scPlayhead) is the current time, constrained to the
+      //     window. Dragging a bound that would cross the playhead pushes the
+      //     playhead; the invariant windowStart <= time <= windowEnd always
+      //     holds.
+      const scrubberEl = document.getElementById("timeScrubber")
+      const scTrack = document.getElementById("scTrack")
+      const scActive = document.getElementById("scActive")
+      const scStartEl = document.getElementById("scStart")
+      const scEndEl = document.getElementById("scEnd")
+      const scPlayheadEl = document.getElementById("scPlayhead")
       const timeSliderLabel = document.getElementById("timeSliderLabel")
+      const SC_PAD = 8 // px inset so edge handles aren't clipped
+      let scrubberReady = false
       let scrubbing = false
       let resumeAfterScrub = false
       let scrubLoadTimer = null
 
       function fmtTime(epochSec) {
-        return new Date(epochSec * 1000).toString()
+        const d = new Date(epochSec * 1000)
+        // Format in the map center's timezone when known, else browser-local.
+        // Use a concise, readable layout with the short tz abbreviation.
+        try {
+          const opts = {
+            weekday: "short", month: "short", day: "numeric", year: "numeric",
+            hour: "2-digit", minute: "2-digit", second: "2-digit",
+            timeZoneName: "short",
+          }
+          if (mapTimeZone) opts.timeZone = mapTimeZone
+          return new Intl.DateTimeFormat("en-US", opts).format(d)
+        } catch (_) {
+          // Bad/unsupported tz id -> fall back to the browser-local string
+          // with the long tz name abbreviated to initials.
+          return d.toString().replace(
+            /\(([^)]+)\)/,
+            (_m, name) => "(" + name.split(/\s+/).map(w => w[0] || "").join("") + ")"
+          )
+        }
       }
 
-      // Configure the slider's range from the forecast window. Called once the
-      // window is known (and again after re-centering to a new area).
-      function configureTimeSlider() {
+      function scWidth() {
+        const w = scrubberEl.getBoundingClientRect().width || 200
+        return Math.max(1, w - 2 * SC_PAD)
+      }
+      // epoch (within forecast range) -> x pixel, and inverse.
+      function epochToX(epochSec) {
+        if (forecastStart === null || forecastEnd === forecastStart) return SC_PAD
+        const frac = (epochSec - forecastStart) / (forecastEnd - forecastStart)
+        return SC_PAD + Math.max(0, Math.min(1, frac)) * scWidth()
+      }
+      function xToEpoch(x) {
+        const frac = (x - SC_PAD) / scWidth()
+        const raw = forecastStart + Math.max(0, Math.min(1, frac)) * (forecastEnd - forecastStart)
+        return Math.round(raw)
+      }
+
+      // Redraw all three handles + the active segment from current state.
+      function renderScrubber() {
+        if (!scrubberReady) return
+        const xs = epochToX(windowStart)
+        const xe = epochToX(windowEnd)
+        const xp = epochToX(time)
+        scStartEl.setAttribute("x", String(xs - 3))
+        scEndEl.setAttribute("x", String(xe - 3))
+        scActive.setAttribute("x1", String(xs))
+        scActive.setAttribute("x2", String(xe))
+        scPlayheadEl.setAttribute("cx", String(xp))
+        timeSliderLabel.textContent = fmtTime(time)
+      }
+
+      // Configure the scrubber once the forecast window is known. Named
+      // configureScrubber (fetchGlobalRange calls it) and also aliased to the
+      // old configureTimeSlider name used elsewhere.
+      function configureScrubber() {
         if (forecastStart === null || forecastEnd === null) return
-        timeSlider.min = String(forecastStart)
-        timeSlider.max = String(forecastEnd)
-        // Step by dt so the slider snaps to the same instants the animation
-        // visits; at least 1s to stay valid.
-        timeSlider.step = String(Math.max(1, dt))
-        timeSlider.disabled = false
-        syncTimeSlider(time)
+        scrubberReady = true
+        renderScrubber()
+      }
+      function configureTimeSlider() { configureScrubber() }
+
+      // --- URL persistence for the scrubber ---------------------------------
+      // The window bounds and current time are stored as absolute epoch
+      // seconds (from/to/t). On load they're clamped into the current forecast
+      // range, so a shared/refreshed URL stays valid even if the forecast
+      // window has since shifted.
+      function persistScrubberState() {
+        if (windowStart === null || windowEnd === null) return
+        const u = new URL(window.location.href)
+        u.searchParams.set("from", String(windowStart))
+        u.searchParams.set("to", String(windowEnd))
+        u.searchParams.set("t", String(time))
+        history.replaceState(null, "", u.toString())
+      }
+      // Apply persisted from/to/t (if present) over the default full window.
+      function applyUrlWindow() {
+        if (forecastStart === null || forecastEnd === null) return
+        const p = new URL(window.location.href).searchParams
+        const clampRange = (v) => Math.max(forecastStart, Math.min(v, forecastEnd))
+        const from = parseInt(p.get("from"), 10)
+        const to = parseInt(p.get("to"), 10)
+        const t = parseInt(p.get("t"), 10)
+        const MIN_SPAN = Math.max(1, dt)
+        if (Number.isFinite(from)) windowStart = clampRange(from)
+        if (Number.isFinite(to)) windowEnd = clampRange(to)
+        // Keep start < end with at least one dt of span.
+        if (windowEnd <= windowStart) windowEnd = Math.min(forecastEnd, windowStart + MIN_SPAN)
+        if (windowEnd <= windowStart) windowStart = Math.max(forecastStart, windowEnd - MIN_SPAN)
+        if (Number.isFinite(t)) time = Math.max(windowStart, Math.min(t, windowEnd))
+        else time = Math.max(windowStart, Math.min(time, windowEnd))
       }
 
-      // Reflect the current animation time on the slider + label. Skipped while
-      // the user is actively scrubbing so we don't fight their drag.
+      // Reflect the animation clock on the playhead (unless the user is
+      // actively dragging something).
       function syncTimeSlider(t) {
         if (scrubbing) return
-        if (!timeSlider.disabled) timeSlider.value = String(t)
-        timeSliderLabel.textContent = fmtTime(t)
+        renderScrubber()
       }
 
-      // Load the frame at the slider's current value (debounced during drag).
-      function scrubToSliderValue() {
-        const t = parseInt(timeSlider.value, 10)
-        if (!Number.isFinite(t)) return
-        time = t
-        timeSliderLabel.textContent = fmtTime(t)
-        if (scrubLoadTimer) clearTimeout(scrubLoadTimer)
-        scrubLoadTimer = window.setTimeout(() => { loadFrame(time) }, 60)
+      // Pointer-driven dragging. `which` is "start" | "end" | "time".
+      let dragWhich = null
+      function pointerToEpoch(evt) {
+        const rect = scrubberEl.getBoundingClientRect()
+        return xToEpoch(evt.clientX - rect.left)
       }
-
-      timeSlider.addEventListener("pointerdown", (e) => e.stopPropagation())
-      timeSlider.addEventListener("input", (e) => {
-        e.stopPropagation()
-        if (!scrubbing) { // begin scrub: pause the animation, remember state
+      function beginDrag(which, evt) {
+        if (!scrubberReady) return
+        evt.stopPropagation(); evt.preventDefault()
+        dragWhich = which
+        if (!scrubbing) { // pause animation while interacting
           scrubbing = true
           resumeAfterScrub = !paused
           setPaused(true)
         }
-        scrubToSliderValue()
-      })
-      // End of scrub (mouse release / keyboard commit): resume if we paused.
-      const endScrub = () => {
-        if (!scrubbing) return
+        scrubberEl.setPointerCapture(evt.pointerId)
+        onDrag(evt)
+      }
+      function onDrag(evt) {
+        if (!dragWhich) return
+        const MIN_SPAN = Math.max(1, dt) // keep at least one dt between bounds
+        let e = pointerToEpoch(evt)
+        if (dragWhich === "start") {
+          // start can't exceed end (minus a span); clamp to forecast low.
+          windowStart = Math.max(forecastStart, Math.min(e, windowEnd - MIN_SPAN))
+          if (time < windowStart) time = windowStart // push playhead
+        } else if (dragWhich === "end") {
+          windowEnd = Math.min(forecastEnd, Math.max(e, windowStart + MIN_SPAN))
+          if (time > windowEnd) time = windowEnd
+        } else { // "time": constrained to [windowStart, windowEnd]
+          time = Math.max(windowStart, Math.min(e, windowEnd))
+        }
+        renderScrubber()
+        // Debounced frame load so dragging stays responsive.
+        if (scrubLoadTimer) clearTimeout(scrubLoadTimer)
+        scrubLoadTimer = window.setTimeout(() => { loadFrame(time) }, 60)
+      }
+      function endDrag(evt) {
+        if (!dragWhich) return
+        try { scrubberEl.releasePointerCapture(evt.pointerId) } catch (_) {}
+        dragWhich = null
+        // Load the final frame immediately, then resume if we were playing.
+        if (scrubLoadTimer) { clearTimeout(scrubLoadTimer); scrubLoadTimer = null }
+        loadFrame(time)
+        persistScrubberState() // save window + time to the URL
         scrubbing = false
         if (resumeAfterScrub) setPaused(false)
         resumeAfterScrub = false
       }
-      timeSlider.addEventListener("change", endScrub)
-      timeSlider.addEventListener("pointerup", endScrub)
-      timeSlider.addEventListener("pointercancel", endScrub)
+
+      scStartEl.addEventListener("pointerdown", (e) => beginDrag("start", e))
+      scEndEl.addEventListener("pointerdown", (e) => beginDrag("end", e))
+      scPlayheadEl.addEventListener("pointerdown", (e) => beginDrag("time", e))
+      // Clicking the track jumps the playhead there (within the window).
+      scTrack.addEventListener("pointerdown", (e) => beginDrag("time", e))
+      scActive.addEventListener("pointerdown", (e) => beginDrag("time", e))
+      scrubberEl.addEventListener("pointermove", onDrag)
+      scrubberEl.addEventListener("pointerup", endDrag)
+      scrubberEl.addEventListener("pointercancel", endDrag)
+      // Don't let scrubber interaction drag the legend.
+      scrubberEl.addEventListener("pointerdown", (e) => e.stopPropagation())
+      // Keep handles positioned correctly if the legend/window resizes.
+      window.addEventListener("resize", renderScrubber)
 
       // Wire up the control buttons (stopPropagation so clicks don't drag the
       // legend).
-      ;[["speedUp", () => setPlaybackSpeed(playbackSpeed * 1.5)],
-        ["speedDown", () => setPlaybackSpeed(playbackSpeed / 1.5)],
+      ;[["speedUp", () => stepSpeed(+1)],
+        ["speedDown", () => stepSpeed(-1)],
         ["playPause", () => setPaused(!paused)],
         ["dtUp", () => stepDt(+1)],
         ["dtDown", () => stepDt(-1)],
@@ -815,10 +1072,12 @@
       // real step is set by applyAutoStep() once the global range arrives.
       document.getElementById("stepLabel").textContent = formatStep(contourStep)
 
-      showSpinner()
+      showSpinner("Loading data…")
+      loading = true
       try {
-        // Cache all the data for the area first (parallel prefetch).
-        await fetch(`/api/models/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`)
+        // Cache all the area's NOAA data first, streaming progress to the
+        // spinner as each resource is fetched.
+        await prefetchWithProgress()
         // Fix the color scale to the whole-lifecycle range before rendering.
         await fetchGlobalRange()
         time = clampToForecast(time)
@@ -826,17 +1085,23 @@
       } catch (err) {
         console.error("failed to load initial frame:", err)
       } finally {
+        loading = false
         hideSpinner()
       }
 
       async function tick() {
-        if (tickRunning) return // guard against double-entry (e.g. resume mid-fetch)
+        // If a tick is already running, try again shortly rather than
+        // returning without rescheduling (which would silently kill the loop).
+        if (tickRunning) { scheduleNext(); return }
+        // Don't animate while a (re)load is in progress — otherwise the old
+        // area's frames keep playing underneath the loading spinner.
+        if (loading) { scheduleNext(); return }
         tickRunning = true
         time += dt
-        // Loop the animation: once we step past the forecast's end, jump back
-        // to the start of the valid time window.
-        if (forecastEnd !== null && time > forecastEnd) {
-          time = forecastStart !== null ? forecastStart : time
+        // Loop the animation: once we step past the playback window's end,
+        // jump back to the window start.
+        if (windowEnd !== null && time > windowEnd) {
+          time = windowStart !== null ? windowStart : time
         }
         try {
           await loadFrame(time)
@@ -853,6 +1118,39 @@
     // Dismiss the basemap attribution popup.
     const items = document.getElementsByClassName("maplibregl-ctrl-attrib-button")
     for (const item of items) { item.click() }
+
+    // Model selector: populate from the server's registered models and, on
+    // change, navigate to that model's URL. Changing the model swaps the color
+    // ramp, units, step defaults and derived kind — all computed server-side —
+    // so a full navigation (reload) is the simplest correct approach. We keep
+    // the current view (lat/lon/size/zoom/dt/speed) but drop `step` and `kind`
+    // so the new model's auto-step and derived kind take effect.
+    ;(function setupModelSelect() {
+      const sel = document.getElementById("modelSelect")
+      if (!sel) return
+      for (const opt of modelOptions) {
+        const o = document.createElement("option")
+        o.value = opt.value
+        o.textContent = opt.label
+        if (opt.value === currentModel) o.selected = true
+        sel.appendChild(o)
+      }
+      // Don't let interacting with the select start a legend drag.
+      sel.addEventListener("pointerdown", (e) => e.stopPropagation())
+      sel.addEventListener("change", (e) => {
+        e.stopPropagation()
+        const newModel = sel.value
+        if (!newModel || newModel === currentModel) return
+        const cur = new URL(window.location.href)
+        const next = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
+        // Carry over view/animation params; drop model-specific ones.
+        for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed"]) {
+          const v = cur.searchParams.get(k)
+          if (v !== null) next.searchParams.set(k, v)
+        }
+        window.location.assign(next.toString())
+      })
+    })()
 
     // Make the legend draggable.
     ;(function makeLegendDraggable() {
