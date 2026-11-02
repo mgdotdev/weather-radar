@@ -131,6 +131,214 @@ def _retry_get(session, url, retries=6, attempt=0):
 _JOB_DONE = "__done__"
 
 
+# --- Frame-compute worker pool ----------------------------------------------
+# Frame compute (spline evaluation) is CPU-bound, so the GIL serializes it
+# within one process. Real parallelism needs separate PROCESSES. The manager
+# keeps its single-authority role but dispatches frame compute to a pool of
+# worker processes, and DEDUPLICATES concurrent requests for the same frame so
+# a duplicate attaches to the in-flight job instead of recomputing.
+
+FRAME_WORKERS = int(os.environ.get("FRAME_WORKERS", str(max(2, (os.cpu_count() or 4)))))
+
+
+def _set_pdeathsig():
+    """Ask the kernel to send SIGTERM to this process when its parent dies, so
+    non-daemon workers (and the non-daemon writer) can't be orphaned if their
+    parent goes away. Linux-only; a no-op elsewhere."""
+    try:
+        import ctypes, signal
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
+def _compute_frame_payload(params_json):
+    """Compute one frame and write it to the per-frame cache, returning the
+    FeatureCollection as a JSON string. Runs inside a frame-worker PROCESS, so
+    it's a module-level pure function (importable under the 'spawn' start
+    method) with no dependence on manager state."""
+    params = json.loads(params_json)
+    from . import framecache
+    from .area import MapCoordinate, CoordinateArea
+    from .models.accumulation import AccumulationEnsemble
+    from .models.observation import ObservationEnsemble
+
+    akey = framecache.area_key(
+        params["model"], params["kind"], params["lat"], params["lon"],
+        params["width"], params["height"],
+    )
+    epoch = int(params["time"])
+    coord = MapCoordinate(params["lat"], params["lon"])
+    area = CoordinateArea(coord, params["width"], params["height"])
+    grid_paths = [f"/gridpoints/{gp}" for gp in area.gridpoints]
+    fresh = framecache.area_is_fresh(grid_paths)
+    # Version-stamp frames by the current gridpoint data so a frame built from
+    # superseded data is detected as stale even once the (new) gridpoints are
+    # themselves fresh — NOAA data changing invalidates interpolation from it.
+    version = framecache.data_version(grid_paths)
+
+    if fresh:
+        cached = framecache.read_frame(akey, epoch, version=version)
+        if cached is not None:
+            return json.dumps(cached)
+
+    ENSEMBLE_KINDS = {
+        "accumulation": AccumulationEnsemble,
+        "observation": ObservationEnsemble,
+    }
+    ensemble_class = ENSEMBLE_KINDS.get(params["kind"], AccumulationEnsemble)
+    ensemble = ensemble_class(area, params["model"])
+    fc = ensemble.predict(datetime.fromtimestamp(epoch), verbose=True)
+    if fresh:
+        try:
+            framecache.write_frame(akey, epoch, fc, version=version)
+        except Exception:
+            logger.warning("failed to cache frame %s", epoch, exc_info=True)
+    return json.dumps(fc)
+
+
+def _frame_cache_key(params):
+    """Dedup key for a frame request: a stable function of the params that
+    determine the output (area + timestamp; dt-independent). Self-contained so
+    it works regardless of how the module was imported."""
+    import hashlib
+    raw = "|".join(str(params[k]) for k in (
+        "model", "kind", "lat", "lon", "width", "height", "time"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _frame_worker_loop(req_q, res_q):
+    """Frame-worker process entry point: pull (job_id, params_json), compute,
+    push (job_id, ok, payload). Exits on a None sentinel."""
+    _set_pdeathsig()
+    while True:
+        item = req_q.get()
+        if item is None:
+            return
+        job_id, params_json = item
+        try:
+            res_q.put((job_id, True, _compute_frame_payload(params_json)))
+        except Exception as e:
+            res_q.put((job_id, False, repr(e)))
+
+
+class _PendingJob:
+    """A frame compute in flight. Duplicate requests block on `event`; the
+    result dispatcher fills ok/payload and sets it, so all waiters return the
+    same result without recomputing."""
+    __slots__ = ("event", "ok", "payload")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.ok = False
+        self.payload = None
+
+
+class _FramePool:
+    """Pool of frame-worker processes with request dedup.
+
+    submit(params_json) (called by a manager RPC thread) blocks until the frame
+    is computed. If an identical frame is already in flight, it attaches to the
+    existing job (no duplicate compute). A background dispatcher thread drains
+    worker results and wakes the matching job's waiters.
+    """
+
+    def __init__(self, n_workers, ctx=None):
+        import multiprocessing as mp
+        # Start method, in order of preference:
+        #   forkserver - forks workers from a clean, single-threaded server
+        #                process: no fork-with-threads deadlock AND no fragile
+        #                re-import of our module (unlike spawn under --reload).
+        #   spawn      - clean interpreter, but re-imports the module (can fail
+        #                to bootstrap under some launchers).
+        #   fork       - last resort (tests inject this).
+        if ctx is None:
+            for method in ("forkserver", "spawn"):
+                try:
+                    ctx = mp.get_context(method)
+                    break
+                except ValueError:
+                    continue
+            else:
+                ctx = mp.get_context()
+        self._req_q = ctx.Queue()
+        self._res_q = ctx.Queue()
+        self._procs = []
+        for _ in range(n_workers):
+            p = ctx.Process(target=_frame_worker_loop,
+                            args=(self._req_q, self._res_q), daemon=False)
+            p.start()
+            self._procs.append(p)
+        self._lock = threading.Lock()
+        self._pending = {}        # key -> _PendingJob
+        self._job_by_id = {}      # job_id -> key
+        import itertools
+        self._ids = itertools.count(1)
+        self._healthy = True      # cleared if the pool proves unresponsive
+        threading.Thread(target=self._dispatch_loop, daemon=True).start()
+        logger.warning("frame pool started with %d %s worker process(es)",
+                       n_workers, ctx.get_start_method())
+
+    def _dispatch_loop(self):
+        while True:
+            job_id, ok, payload = self._res_q.get()
+            with self._lock:
+                key = self._job_by_id.pop(job_id, None)
+                job = self._pending.pop(key, None) if key is not None else None
+            if job is not None:
+                job.ok, job.payload = ok, payload
+                job.event.set()
+
+    def submit(self, params_json, timeout=20.0):
+        # If the pool has already proven unresponsive, skip it entirely and
+        # compute inline — don't make every request eat the timeout.
+        if not self._healthy:
+            return _compute_frame_payload(params_json)
+
+        key = _frame_cache_key(json.loads(params_json))
+        with self._lock:
+            job = self._pending.get(key)
+            if job is not None:
+                existing = True            # dedup onto the in-flight compute
+            else:
+                job = _PendingJob()
+                self._pending[key] = job
+                job_id = next(self._ids)
+                self._job_by_id[job_id] = key
+                existing = False
+        if not existing:
+            self._req_q.put((job_id, params_json))
+        if job.event.wait(timeout=timeout):
+            if not job.ok:
+                raise RuntimeError(f"frame compute failed: {job.payload}")
+            return job.payload
+        # Timed out: the worker pool isn't delivering results (broken IPC under
+        # a reloader, crashed-on-import workers, etc.). Mark it unhealthy so
+        # subsequent requests go straight to the inline path, and compute this
+        # one inline now. The frame is still cached on disk by the payload, so
+        # the system stays correct — just without the extra process parallelism.
+        logger.warning(
+            "frame pool unresponsive after %ss; falling back to inline compute",
+            timeout,
+        )
+        self._healthy = False
+        with self._lock:
+            self._pending.pop(key, None)
+        return _compute_frame_payload(params_json)
+
+    def shutdown(self):
+        for _ in self._procs:
+            try:
+                self._req_q.put(None)
+            except Exception:
+                pass
+        for p in self._procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+
+
 class _Writer:
     """Owns the session + thread pool and performs the actual fetch/write."""
 
@@ -149,6 +357,17 @@ class _Writer:
         self._frame_registry_lock = threading.Lock()
         import itertools
         self._job_counter = itertools.count(1)
+        # Worker-process pool for CPU-bound frame compute (created lazily so a
+        # NOAA-only deployment or tests don't spawn workers they never use).
+        self._frame_pool = None
+        self._frame_pool_lock = threading.Lock()
+
+    def _get_frame_pool(self):
+        if self._frame_pool is None:
+            with self._frame_pool_lock:
+                if self._frame_pool is None:
+                    self._frame_pool = _FramePool(FRAME_WORKERS)
+        return self._frame_pool
 
     def _lock_for(self, url):
         with self._registry_lock:
@@ -256,77 +475,17 @@ class _Writer:
             items.append(nxt)
         return json.dumps({"items": items, "done": ended})
 
-    # --- frame computation (single-writer invariant) ---
-    # The writer is the ONLY process that computes + writes ensemble frame
-    # cache files, mirroring how it's the only one that writes NOAA cache
-    # files. Web workers ask for a frame via compute_frame(); the writer serves
-    # it from the per-frame cache or computes+caches it, returning the
-    # FeatureCollection by value (JSON string) across the manager boundary.
-
-    def _frame_lock(self, key):
-        with self._frame_registry_lock:
-            lk = self._frame_locks.get(key)
-            if lk is None:
-                lk = threading.Lock()
-                self._frame_locks[key] = lk
-            return lk
+    # --- frame computation (coordinated worker pool) ---
+    # The manager stays the single authority but dispatches CPU-bound frame
+    # compute to a pool of worker processes (real parallelism), deduplicating
+    # concurrent requests for the same frame. The authoritative cache-hit /
+    # freshness / version logic lives in _compute_frame_payload (one source of
+    # truth, runs in the worker).
 
     def compute_frame(self, params_json):
         """Return the ensemble FeatureCollection for one frame as a JSON
-        string. Serves from the per-frame cache when the area's NOAA data is
-        fresh; otherwise computes it once (concurrent identical requests share
-        the compute via a per-key lock), caches it, and returns it."""
-        params = json.loads(params_json)
-        from . import framecache
-        from .area import MapCoordinate, CoordinateArea
-        from .models.accumulation import AccumulationEnsemble
-        from .models.observation import ObservationEnsemble
-        from datetime import datetime
-
-        akey = framecache.area_key(
-            params["model"], params["kind"], params["lat"], params["lon"],
-            params["width"], params["height"],
-        )
-        epoch = int(params["time"])
-
-        coord = MapCoordinate(params["lat"], params["lon"])
-        area = CoordinateArea(coord, params["width"], params["height"])
-        grid_paths = [f"/gridpoints/{gp}" for gp in area.gridpoints]
-        fresh = framecache.area_is_fresh(grid_paths)
-        # Version-stamp frames by the current gridpoint data so a frame built
-        # from superseded data is detected as stale even once the (new)
-        # gridpoints are themselves fresh — NOAA data changing invalidates any
-        # interpolation derived from it.
-        version = framecache.data_version(grid_paths)
-
-        # Fast path: fresh cache hit (matching data version), no lock needed.
-        if fresh:
-            cached = framecache.read_frame(akey, epoch, version=version)
-            if cached is not None:
-                return json.dumps(cached)
-
-        # Dedupe concurrent computes of the same frame.
-        lk = self._frame_lock(f"{akey}:{epoch}")
-        with lk:
-            # Re-check inside the lock (another thread may have just written).
-            if fresh:
-                cached = framecache.read_frame(akey, epoch, version=version)
-                if cached is not None:
-                    return json.dumps(cached)
-
-            ENSEMBLE_KINDS = {
-                "accumulation": AccumulationEnsemble,
-                "observation": ObservationEnsemble,
-            }
-            ensemble_class = ENSEMBLE_KINDS.get(params["kind"], AccumulationEnsemble)
-            ensemble = ensemble_class(area, params["model"])
-            fc = ensemble.predict(datetime.fromtimestamp(epoch), verbose=True)
-            if fresh:
-                try:
-                    framecache.write_frame(akey, epoch, fc, version=version)
-                except Exception:
-                    logger.warning("failed to cache frame %s", epoch, exc_info=True)
-            return json.dumps(fc)
+        string, computed by the worker pool with request dedup."""
+        return self._get_frame_pool().submit(params_json)
 
 
 # --- Manager wiring ----------------------------------------------------------
@@ -337,7 +496,13 @@ class _CacheManager(BaseManager):
 
 def run_writer(ready_event=None):
     """Entry point for the writer process: start the manager server and serve
-    forever. If `ready_event` is given, set it once the server is listening."""
+    forever. If `ready_event` is given, set it once the server is listening.
+
+    This process lazily spawns a pool of frame-worker child processes, so it
+    must be non-daemon (a daemon process can't have children). It sets
+    PR_SET_PDEATHSIG so it (and its workers, which do the same) are reaped by
+    the kernel if the parent dies."""
+    _set_pdeathsig()
     writer = _Writer()
 
     _CacheManager.register("ensure", callable=writer.ensure)
@@ -351,6 +516,36 @@ def run_writer(ready_event=None):
     )
     server = mgr.get_server()
     logger.warning("cache writer listening on %s:%s", CACHE_WRITER_HOST, CACHE_WRITER_PORT)
+
+    # Clean up the frame-worker pool on exit so its queue semaphores aren't
+    # leaked (otherwise you get the resource_tracker "leaked semaphore objects"
+    # warning on shutdown). Handle both normal interpreter exit and a SIGTERM/
+    # SIGINT (Ctrl-C / reload), then re-raise the default behavior.
+    import atexit
+    import signal
+
+    def _cleanup():
+        pool = getattr(writer, "_frame_pool", None)
+        if pool is not None:
+            try:
+                pool.shutdown()
+            except Exception:
+                pass
+
+    atexit.register(_cleanup)
+
+    def _on_signal(signum, _frame):
+        _cleanup()
+        # Restore default and re-raise so the process actually terminates.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _on_signal)
+        except Exception:
+            pass
+
     if ready_event is not None:
         ready_event.set()
     server.serve_forever()

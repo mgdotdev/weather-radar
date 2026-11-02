@@ -551,6 +551,9 @@
         // area is ready, so we don't need to pause/resume playback.
         loadGeneration += 1
         loading = true
+        // New area: drop the previous area's cached API responses so the
+        // client cache doesn't grow unbounded or serve stale frames.
+        apiClient.clear()
         // Clear the old area's contours immediately so stale lines aren't left
         // on screen while the new area loads.
         lastFeatures = []
@@ -602,20 +605,69 @@
         refreshPins()
       }
 
+      // --- Caching API client ------------------------------------------------
+      // A thin wrapper over fetch() that caches parsed JSON responses. Callers
+      // request a URL (with an optional explicit cache key); if we already have
+      // the data cached, it's returned immediately with NO network call. It
+      // also deduplicates in-flight requests — two callers asking for the same
+      // key while a fetch is pending share that one fetch (so the animation
+      // loop and a timeline scrub won't double-fetch the same frame).
+      //
+      // The cache is scoped to the current area: apiClient.clear() is called on
+      // re-center so stale frames from a previous location are dropped.
+      const apiClient = (() => {
+        const cache = new Map()      // key -> parsed JSON (resolved value)
+        const inflight = new Map()   // key -> Promise<parsed JSON>
+
+        async function getJson(url, cacheKey) {
+          const key = cacheKey || url
+          if (cache.has(key)) return cache.get(key)        // hit: no network
+          if (inflight.has(key)) return inflight.get(key)  // coalesce duplicates
+          const p = (async () => {
+            const resp = await fetch(url)
+            if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`)
+            const data = await resp.json()
+            cache.set(key, data)
+            return data
+          })()
+          inflight.set(key, p)
+          try {
+            return await p
+          } finally {
+            inflight.delete(key)
+          }
+        }
+
+        return {
+          getJson,
+          has: (key) => cache.has(key),
+          clear: () => { cache.clear(); inflight.clear() },
+          size: () => cache.size,
+        }
+      })()
+
       // Fetch the full ensemble for a given time and render it. Returns true
-      // on success. Waits for the entire response (no streaming) — simple.
+      // on success. Goes through the caching client, so a repeated time
+      // (looping / scrubbing back over) renders from memory with no network.
       async function loadFrame(time) {
         // Capture the current load generation; a re-center bumps it, so a
         // frame request that was in flight across a re-center won't render its
         // (now stale) result over the new area.
         const gen = loadGeneration
-        const resp = await fetch(
+        const url =
           `/api/models/${model}/type/ensemble?lat=${lat}&lon=${lon}&width=${width}&height=${height}&time=${time}&dt=${dt}&kind=${kind}`
-        )
+        // Cache key omits dt: the server's per-frame prediction depends only on
+        // the concrete `time`, so a timestamp fetched under one dt is reusable
+        // under another (scrubbing, looping, changing the step all hit cache).
+        const cacheKey = `ensemble|${model}|${kind}|${lat}|${lon}|${width}|${height}|${time}`
+        let data
+        try {
+          data = await apiClient.getJson(url, cacheKey)
+        } catch (err) {
+          console.error("ensemble request failed:", err)
+          return false
+        }
         if (gen !== loadGeneration) return false  // superseded by a re-center
-        if (!resp.ok) { console.error("ensemble request failed:", resp.status); return false }
-        const data = await resp.json()
-        if (gen !== loadGeneration) return false
         const features = (data && data.features) || []
         renderFeatures(features)
         syncTimeSlider(time)

@@ -72,7 +72,12 @@ def _start_background_processes():
             target=cachewriter.run_writer,
             args=(writer_ready,),
             name="cache-writer",
-            daemon=True,
+            # NOT daemon: the writer spawns a pool of frame-worker child
+            # processes and a daemon process may not have children. The writer
+            # sets PR_SET_PDEATHSIG so it's reaped if this parent dies; the
+            # flock leader-lock + port-reuse logic tolerates a writer that
+            # outlives a reload.
+            daemon=False,
         )
         writer.start()
         writer_ready.wait(timeout=10)
