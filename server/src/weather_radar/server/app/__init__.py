@@ -28,11 +28,15 @@ DARK_MODE = """
 #
 # The map can render any numeric NOAA gridpoint layer as a contour field. Two
 # pieces drive this:
-#   MODEL_CATALOG  - every supported layer: kebab-case name -> (kind, label).
-#                    `kind` selects the ensemble ("observation" for
-#                    instantaneous values, "accumulation" for cumulative storm
-#                    totals). Non-numeric NOAA layers ("weather", "hazards")
-#                    are intentionally excluded since they can't be contoured.
+#   MODEL_CATALOG  - every supported layer: dropdown key -> (kind, label,
+#                    attribute). `kind` selects the ensemble ("observation" for
+#                    instantaneous/per-interval values, "accumulation" for
+#                    cumulative storm totals). `attribute` is the NOAA gridpoint
+#                    attribute to read, usually equal to the key but distinct
+#                    where one attribute is offered under several keys (the
+#                    precip/snow/ice totals also appear as per-interval rates).
+#                    Non-numeric NOAA layers ("weather", "hazards") are
+#                    intentionally excluded since they can't be contoured.
 #   _CUSTOM_STYLE  - optional per-model styling (color_ramp, seed contour_step)
 #                    for the headline models; anything not listed falls back to
 #                    a neutral sequential ramp.
@@ -94,28 +98,47 @@ _RAMP_NEUTRAL = [
 #     often sparse, and poor as continuous contours.
 _ACCUMULATION = "accumulation"
 _OBSERVATION = "observation"
+
+# Each entry is (kind, label, attribute):
+#   kind      - which ensemble fetches the data ("observation" for
+#               instantaneous/per-interval values, "accumulation" for a
+#               cumulative running total).
+#   label     - friendly name shown in the in-legend model selector.
+#   attribute - the kebab-case NOAA gridpoint attribute to read. This is
+#               USUALLY the same as the catalog key, but is kept separate so a
+#               single NOAA attribute can be exposed under multiple dropdown
+#               keys with different kinds — e.g. the precipitation/snow/ice
+#               amounts are offered BOTH as a cumulative "accumulation" total
+#               and as a per-interval "observation" rate, both reading the same
+#               underlying NOAA attribute.
 MODEL_CATALOG = {
     # Temperature family
-    "temperature": (_OBSERVATION, "Temperature"),
-    "dewpoint": (_OBSERVATION, "Dewpoint"),
-    "apparent-temperature": (_OBSERVATION, "Apparent Temperature"),
-    "max-temperature": (_OBSERVATION, "High Temperature"),
-    "min-temperature": (_OBSERVATION, "Low Temperature"),
-    "heat-index": (_OBSERVATION, "Heat Index"),
-    "wind-chill": (_OBSERVATION, "Wind Chill"),
-    # Moisture / precipitation
-    "relative-humidity": (_OBSERVATION, "Relative Humidity"),
-    "probability-of-precipitation": (_OBSERVATION, "Probability of Precipitation"),
-    "quantitative-precipitation": (_ACCUMULATION, "Precipitation"),
-    "snowfall-amount": (_ACCUMULATION, "Snowfall"),
-    "ice-accumulation": (_ACCUMULATION, "Ice Accumulation"),
+    "temperature": (_OBSERVATION, "Temperature", "temperature"),
+    "dewpoint": (_OBSERVATION, "Dewpoint", "dewpoint"),
+    "apparent-temperature": (_OBSERVATION, "Apparent Temperature", "apparent-temperature"),
+    "max-temperature": (_OBSERVATION, "High Temperature", "max-temperature"),
+    "min-temperature": (_OBSERVATION, "Low Temperature", "min-temperature"),
+    "heat-index": (_OBSERVATION, "Heat Index", "heat-index"),
+    "wind-chill": (_OBSERVATION, "Wind Chill", "wind-chill"),
+    # Moisture / precipitation (cumulative totals)
+    "relative-humidity": (_OBSERVATION, "Relative Humidity", "relative-humidity"),
+    "probability-of-precipitation": (_OBSERVATION, "Probability of Precipitation", "probability-of-precipitation"),
+    "quantitative-precipitation": (_ACCUMULATION, "Precipitation (total)", "quantitative-precipitation"),
+    "snowfall-amount": (_ACCUMULATION, "Snowfall (total)", "snowfall-amount"),
+    "ice-accumulation": (_ACCUMULATION, "Ice Accumulation (total)", "ice-accumulation"),
+    # Moisture / precipitation (per-interval rate) — same NOAA attributes as
+    # the totals above, but rendered as the raw per-interval amount instead of
+    # a running sum.
+    "precipitation-rate": (_OBSERVATION, "Precipitation (per interval)", "quantitative-precipitation"),
+    "snowfall-rate": (_OBSERVATION, "Snowfall (per interval)", "snowfall-amount"),
+    "ice-accumulation-rate": (_OBSERVATION, "Ice Accumulation (per interval)", "ice-accumulation"),
     # Wind / sky
-    "wind-speed": (_OBSERVATION, "Wind Speed"),
-    "wind-gust": (_OBSERVATION, "Wind Gust"),
-    "sky-cover": (_OBSERVATION, "Sky Cover"),
+    "wind-speed": (_OBSERVATION, "Wind Speed", "wind-speed"),
+    "wind-gust": (_OBSERVATION, "Wind Gust", "wind-gust"),
+    "sky-cover": (_OBSERVATION, "Sky Cover", "sky-cover"),
     # Other continuous fields
-    "pressure": (_OBSERVATION, "Pressure"),
-    "visibility": (_OBSERVATION, "Visibility"),
+    "pressure": (_OBSERVATION, "Pressure", "pressure"),
+    "visibility": (_OBSERVATION, "Visibility", "visibility"),
 }
 
 # Optional bespoke styling per model (seed step + ramp). Anything omitted uses
@@ -131,24 +154,33 @@ _CUSTOM_STYLE = {
     "snowfall-amount": {"contour_step": 2.0, "color_ramp": _RAMP_BLUES},
     "quantitative-precipitation": {"contour_step": 0.5, "color_ramp": _RAMP_TEAL},
     "ice-accumulation": {"contour_step": 0.25, "color_ramp": _RAMP_BLUES},
+    # Per-interval rate variants reuse their total counterpart's ramp. A
+    # smaller seed step suits the per-interval amounts (a single interval is
+    # only a fraction of the storm total); auto-scaling refines it anyway.
+    "precipitation-rate": {"contour_step": 0.1, "color_ramp": _RAMP_TEAL},
+    "snowfall-rate": {"contour_step": 0.5, "color_ramp": _RAMP_BLUES},
+    "ice-accumulation-rate": {"contour_step": 0.1, "color_ramp": _RAMP_BLUES},
 }
 
 _DEFAULT_STYLE = {"contour_step": 1.0, "color_ramp": _RAMP_NEUTRAL}
 
 
 def _profile(model):
-    """Assemble a full profile (kind, label, contour_step, color_ramp) for a
-    model name, or None if it isn't a known contourable layer."""
+    """Assemble a full profile (kind, label, attribute, contour_step,
+    color_ramp) for a model name, or None if it isn't a known contourable
+    layer. `attribute` is the kebab-case NOAA attribute to read, which may
+    differ from the dropdown key (see MODEL_CATALOG)."""
     entry = MODEL_CATALOG.get(model)
     if entry is None:
         return None
-    kind, label = entry
+    kind, label, attribute = entry
     style = _CUSTOM_STYLE.get(model, _DEFAULT_STYLE)
-    return {"kind": kind, "label": label, **style}
+    return {"kind": kind, "label": label, "attribute": attribute, **style}
 
 
 # Fallback profile for an unknown attribute: render as an observation with the
-# neutral ramp so the map still shows something sensible.
+# neutral ramp so the map still shows something sensible. `attribute` is filled
+# in by the caller (it defaults to the requested model name).
 DEFAULT_PROFILE = {"kind": _OBSERVATION, "label": "Value", **_DEFAULT_STYLE}
 
 
@@ -159,10 +191,18 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
     # params). The data layer converts to the camelCase NOAA attribute only
     # when reading the gridpoint (see models.utils.to_camel_case), so nothing
     # here needs to convert.
-    profile = _profile(model) or DEFAULT_PROFILE
+    profile = _profile(model) or {**DEFAULT_PROFILE, "attribute": model}
     # The data kind (which ensemble fetches the attribute) is derived from the
     # model's profile. An explicit `kind` query param may still override it.
     kind = kind or profile["kind"]
+    # The NOAA attribute to actually read. This is usually the same as the
+    # dropdown/URL `model` key, but differs for the per-interval rate variants
+    # (e.g. model "precipitation-rate" reads attribute
+    # "quantitative-precipitation" as an observation). All API calls the client
+    # makes use this attribute (it's injected as the JS `model` var below), so
+    # the GeoJSON property key and the client's readout stay in sync; `model`
+    # (the URL key) is preserved separately for the dropdown selection.
+    attribute = profile["attribute"]
     # Contour interval: the value delta between adjacent contour lines. When
     # the user hasn't specified `step`, the client auto-scales it to the data's
     # global range (auto_step=True); the profile value is only a seed/fallback.
@@ -170,21 +210,23 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
     step = profile["contour_step"] if step is None else step
     step = max(0.1, min(float(step), 100.0))
     # Playback speed multiplier: higher = faster animation (shorter interval
-    # between frames). Clamped to a sensible range.
-    speed = max(0.1, min(float(speed), 10.0))
+    # between frames). Clamped to a sensible range. Max matches the client's
+    # speed ladder (SPEED_STEPS tops out at 50x) so a persisted ?speed= value
+    # survives a refresh instead of being capped back down.
+    speed = max(0.1, min(float(speed), 50.0))
     # Options for the in-legend model selector: every supported NOAA layer and
     # its friendly label. (Kind is derived per-model, so it isn't separately
     # user-selectable.)
     model_options = [
         {"value": key, "label": label}
-        for key, (_kind, label) in MODEL_CATALOG.items()
+        for key, (_kind, label, _attr) in MODEL_CATALOG.items()
     ]
     with open(MAP_HTML) as f:
         template = Template(f.read())
     html = template.render({
         "starting_longitude": lon,
         "starting_latitude": lat,
-        "weather_model": f"\"{model}\"",
+        "weather_model": f"\"{attribute}\"",
         "width": width,
         "height": height,
         "dt": dt,

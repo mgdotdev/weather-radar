@@ -51,8 +51,9 @@
              set the playback window [start, end] and a circle is the current
              time (constrained between the bars). All three are draggable. -->
         <div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
-          <button id="playPause" title="Pause / Play" style="cursor:pointer; flex:0 0 auto; height:24px;
-            border:1px solid #bbb; border-radius:4px; background:#f5f5f5; font-size:12px; line-height:1; padding:0 8px;">⏸</button>
+          <button id="playPause" title="Pause / Play" style="cursor:pointer; flex:0 0 auto; height:24px; width:28px;
+            display:inline-flex; align-items:center; justify-content:center; box-sizing:border-box;
+            border:1px solid #bbb; border-radius:4px; background:#f5f5f5; font-size:12px; line-height:1; padding:0;">⏸</button>
           <svg id="timeScrubber" width="100%" height="28" style="flex:1 1 auto; min-width:0; touch-action:none; overflow:visible;">
             <!-- Full track -->
             <line id="scTrack" x1="0" y1="14" x2="100%" y2="14" stroke="#ccc" stroke-width="4" stroke-linecap="round"/>
@@ -158,10 +159,30 @@
     let windowStart = null, windowEnd = null
     // IANA timezone of the map center (from NOAA /points); null => browser-local.
     let mapTimeZone = null
-    let lastFeatures = []  // most recent frame's features (for instant re-render on contour-step change)
+    let lastFeatures = []  // most recent frame's points (for instant re-render on contour-step change)
+    let lastUnits = ""     // unit of the most recent frame (reused on re-render when uom omitted)
 
     // Grid resolution and interpolation smoothing for the contour field.
-    const GRID = 64
+    // The isoband raster is GRID_MAX at most, but we ADAPT it per view toward
+    // the data's real resolution: NOAA gridpoints are ~2.5km apart, so a raster
+    // cell finer than that adds geometric smoothness but no new data detail.
+    // gridResFor() picks a size ~matching 2.5km cells for the current extent,
+    // clamped to [GRID_MIN, GRID_MAX]. Smoothness comes ENTIRELY from denser
+    // interpolation of the real field (no cosmetic geometry smoothing); cost is
+    // O(GRID^2 * K) per frame, kept affordable by the nearest-K bucket index.
+    const GRID_MIN = 96
+    const GRID_MAX = 256
+    // Target raster cell size in km (≈ NOAA gridpoint spacing). Finer than this
+    // yields diminishing returns since the underlying points are ~2.5km apart.
+    const TARGET_CELL_KM = 2.0
+    function gridResFor(wKm, hKm) {
+      const span = Math.max(wKm || 0, hKm || 0)
+      const n = Math.round(span / TARGET_CELL_KM)
+      return Math.max(GRID_MIN, Math.min(GRID_MAX, n))
+    }
+    // Max source points considered per raster cell (nearest-first). Enough to
+    // blend smoothly without the full O(points) sum at every cell.
+    const IDW_K = 12
     // IDW smoothing radius (squared, in deg^2) added to each weight's
     // denominator. NOAA gridpoints are ~2.5km (~0.023 deg) apart; a radius
     // around half the spacing blends neighbors smoothly and avoids the
@@ -241,14 +262,14 @@
 
     // ---- Contour construction ----------------------------------------------
 
-    // Build filled contour polygons (GeoJSON) from a scatter of features.
-    // Returns { fc, vMin, vMax, units } or null if there isn't enough data.
-    function buildContours(features) {
-      const pts = features.map(f => ({
-        lon: f.geometry.coordinates[0],
-        lat: f.geometry.coordinates[1],
-        v: f.properties[model]
-      })).filter(p => Number.isFinite(p.v))
+    // Build filled contour polygons (GeoJSON) from a scatter of points
+    // ({lon, lat, v}). Returns { fc, vMin, vMax, units } or null.
+    function buildContours(points) {
+      // Raster resolution adapted to the current view extent (toward ~2.5km
+      // data resolution), clamped. Local to this call so a recenter/zoom picks
+      // the right size without touching the rest of the function.
+      const GRID = gridResFor(width, height)
+      const pts = points.filter(p => Number.isFinite(p.v))
       if (pts.length < 3) return null
 
       let minLon = Math.min(...pts.map(p => p.lon))
@@ -259,6 +280,64 @@
       const padLat = (maxLat - minLat) * 0.05 || 0.01
       minLon -= padLon; maxLon += padLon; minLat -= padLat; maxLat += padLat
 
+      // Spatial bucket index over the source points so each raster cell can
+      // do IDW over just its nearest-K points instead of all of them. Bucket
+      // grid is sized to the point set (~a handful of points per bucket), so a
+      // small neighborhood of buckets around a cell yields enough candidates.
+      const spanLon = (maxLon - minLon) || 1e-6
+      const spanLat = (maxLat - minLat) || 1e-6
+      // Aim for roughly one bucket per source point, capped so the bucket grid
+      // isn't absurdly fine/coarse.
+      const bN = Math.max(1, Math.min(GRID, Math.round(Math.sqrt(pts.length))))
+      const buckets = Array.from({ length: bN * bN }, () => [])
+      const bOf = (lon, lat) => {
+        let bx = Math.floor(((lon - minLon) / spanLon) * bN)
+        let by = Math.floor(((lat - minLat) / spanLat) * bN)
+        bx = Math.max(0, Math.min(bN - 1, bx))
+        by = Math.max(0, Math.min(bN - 1, by))
+        return by * bN + bx
+      }
+      for (const p of pts) buckets[bOf(p.lon, p.lat)].push(p)
+
+      // IDW value at (plon,plat) from the nearest ~IDW_K source points, found
+      // by expanding bucket rings outward until enough candidates are gathered.
+      function idwValue(plon, plat) {
+        const cbx = Math.max(0, Math.min(bN - 1, Math.floor(((plon - minLon) / spanLon) * bN)))
+        const cby = Math.max(0, Math.min(bN - 1, Math.floor(((plat - minLat) / spanLat) * bN)))
+        let cand = []
+        // Expand ring radius until we have at least IDW_K candidates (or we've
+        // covered the whole bucket grid).
+        for (let r = 0; r < bN; r++) {
+          cand = []
+          const x0 = Math.max(0, cbx - r), x1 = Math.min(bN - 1, cbx + r)
+          const y0 = Math.max(0, cby - r), y1 = Math.min(bN - 1, cby + r)
+          for (let by = y0; by <= y1; by++) {
+            for (let bx = x0; bx <= x1; bx++) {
+              const b = buckets[by * bN + bx]
+              for (let i = 0; i < b.length; i++) cand.push(b[i])
+            }
+          }
+          if (cand.length >= IDW_K || (x0 === 0 && y0 === 0 && x1 === bN - 1 && y1 === bN - 1)) break
+        }
+        // Nearest-K by squared distance.
+        let num = 0, den = 0
+        // Partial selection: compute d2 for all candidates, then take K
+        // smallest. Candidate sets are small, so a sort is fine.
+        const scored = cand.map(p => {
+          const dLon = plon - p.lon, dLat = plat - p.lat
+          return { v: p.v, d2: dLon * dLon + dLat * dLat }
+        })
+        scored.sort((a, b) => a.d2 - b.d2)
+        const k = Math.min(IDW_K, scored.length)
+        for (let i = 0; i < k; i++) {
+          const s = scored[i]
+          if (s.d2 < 1e-12) return s.v  // exact hit
+          const w = 1 / (s.d2 + IDW_EPS) // IDW power 2
+          num += w * s.v; den += w
+        }
+        return den > 0 ? num / den : NaN
+      }
+
       // IDW resample onto a GRID x GRID lattice (row 0 = minLat).
       const values = new Array(GRID * GRID)
       let vMin = Infinity, vMax = -Infinity
@@ -266,15 +345,7 @@
         const plat = minLat + (gy / (GRID - 1)) * (maxLat - minLat)
         for (let gx = 0; gx < GRID; gx++) {
           const plon = minLon + (gx / (GRID - 1)) * (maxLon - minLon)
-          let num = 0, den = 0, exact = null
-          for (const p of pts) {
-            const dLon = plon - p.lon, dLat = plat - p.lat
-            const d2 = dLon * dLon + dLat * dLat
-            if (d2 < 1e-12) { exact = p.v; break }
-            const w = 1 / (d2 + IDW_EPS) // IDW power 2
-            num += w * p.v; den += w
-          }
-          const val = exact !== null ? exact : num / den
+          const val = idwValue(plon, plat)
           values[gy * GRID + gx] = val
           if (val < vMin) vMin = val
           if (val > vMax) vMax = val
@@ -286,7 +357,7 @@
       // full-extent polygons for thresholds at/below the constant value.
       const FLAT_EPS = 1e-9
       if (!(vMax - vMin > FLAT_EPS)) {
-        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax, units: features[0].properties.uom || "" }
+        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax, units: lastUnits || "" }
       }
 
       // Color scale: use the FIXED global range (whole forecast lifecycle)
@@ -310,7 +381,7 @@
         if (tv > vMin + 1e-9 && tv < vMax - 1e-9) thresholds.push(tv)
       }
       if (!thresholds.length) {
-        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax, units: features[0].properties.uom || "" }
+        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax, units: lastUnits || "" }
       }
 
       const polys = d3.contours().size([GRID, GRID]).thresholds(thresholds)(values)
@@ -332,7 +403,7 @@
         }
       })
 
-      const units = features[0].properties.uom || ""
+      const units = lastUnits || ""
       // Report the color-scale range (global when fixed) so the legend matches
       // the colors and stays stable across frames.
       return { fc: { type: "FeatureCollection", features: outFeatures }, vMin: cMin, vMax: cMax, units }
@@ -359,7 +430,7 @@
       map.addSource("contours", { type: 'geojson', data: { type: "FeatureCollection", features: [] } })
       map.addLayer({
         id: 'contours', type: 'fill', source: 'contours',
-        paint: { 'fill-color': ['get', 'fillColor'], 'fill-opacity': 0.05, 'fill-antialias': true }
+        paint: { 'fill-color': ['get', 'fillColor'], 'fill-opacity': 0.03, 'fill-antialias': true }
       })
       map.addLayer({
         id: 'contour-lines', type: 'line', source: 'contours',
@@ -564,37 +635,48 @@
           await prefetchWithProgress()
           await fetchGlobalRange()
           time = clampToForecast(time)
+          showSpinner("Rendering…")
           await loadFrame(time)
         } catch (err) {
           console.error("re-center load failed:", err)
         } finally {
           loading = false
           hideSpinner()
-          // Resume the animation for the new area (unless the user has it
-          // paused). Kick the loop explicitly rather than assuming one is
-          // still scheduled — a gated tick may have already drained.
-          if (!paused) { if (tickTimer) { clearTimeout(tickTimer); tickTimer = null } scheduleNext() }
+          // A recenter ALWAYS autoplays the new area, even if playback was
+          // paused beforehand. A tick from the OLD area may still be parked in
+          // loadFrame; reset the running flag so the new loop isn't blocked
+          // waiting on it (its stale result is discarded by the loadGeneration
+          // check anyway). setPaused(false) clears any paused state and kicks
+          // the (idempotent) loop; if already playing it still (re)starts one
+          // clean loop via the explicit scheduleNext below.
+          tickRunning = false
+          setPaused(false)
+          scheduleNext()
         }
+        // Stream the new area's window into the cache in the background.
+        fillCache()
       })
       map.on("click", hideMenu)
       map.on("movestart", hideMenu)
       window.addEventListener("keydown", (e) => { if (e.key === "Escape") hideMenu() })
 
       // ---- Rendering --------------------------------------------------------
-      // Render one frame's features as a contour field.
-      function renderFeatures(features) {
-        lastFeatures = features
-        latestPoints = features.map(f => ({
-          lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1], v: f.properties[model]
-        })).filter(p => Number.isFinite(p.v))
-        latestUnits = features.length ? (features[0].properties.uom || "") : ""
+      // Render one frame's points as a contour field. `points` is a flat array
+      // of {lon, lat, v} (produced by normalizeFrame from either wire shape).
+      // `uom` is the frame's unit; when omitted (e.g. a re-render triggered by
+      // a contour-step change) the last known unit is reused.
+      function renderFeatures(points, uom) {
+        lastFeatures = points
+        if (uom !== undefined) lastUnits = uom
+        latestPoints = points.filter(p => Number.isFinite(p.v))
+        latestUnits = points.length ? (lastUnits || "") : ""
 
         // Now that units are known, make sure the contour-interval label shows
         // them (e.g. "2 mm" instead of a placeholder degree symbol).
         const stepLbl = document.getElementById("stepLabel")
         if (stepLbl) stepLbl.textContent = formatStep(contourStep)
 
-        const info = buildContours(features)
+        const info = buildContours(points)
         if (info) {
           map.getSource("contours").setData(info.fc)
           updateLegend(info.vMin, info.vMax, info.units)
@@ -618,6 +700,7 @@
       const apiClient = (() => {
         const cache = new Map()      // key -> parsed JSON (resolved value)
         const inflight = new Map()   // key -> Promise<parsed JSON>
+        const waiters = new Map()    // key -> [resolve, ...] awaiting a put()
 
         async function getJson(url, cacheKey) {
           const key = cacheKey || url
@@ -627,7 +710,7 @@
             const resp = await fetch(url)
             if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`)
             const data = await resp.json()
-            cache.set(key, data)
+            put(key, data)
             return data
           })()
           inflight.set(key, p)
@@ -638,40 +721,386 @@
           }
         }
 
+        function put(key, data) {
+          cache.set(key, data)
+          // Wake anyone awaiting this key (e.g. the render path waiting for the
+          // cache-fill to deliver a frame).
+          const ws = waiters.get(key)
+          if (ws) {
+            waiters.delete(key)
+            for (const r of ws) r(data)
+          }
+        }
+
+        // Resolve when `key` is put into the cache (or immediately if already
+        // present). With a positive `timeout` (ms) it resolves `null` if the
+        // key hasn't arrived by then; with timeout <= 0 it waits INDEFINITELY
+        // (until a put(), or until clear() releases all waiters with null on a
+        // re-center). Lets the render path hold the current frame until the
+        // streaming cache-fill delivers the requested one.
+        function waitFor(key, timeout) {
+          if (cache.has(key)) return Promise.resolve(cache.get(key))
+          return new Promise((resolve) => {
+            const arr = waiters.get(key) || []
+            arr.push(resolve)
+            waiters.set(key, arr)
+            if (timeout > 0) {
+              setTimeout(() => {
+                const cur = waiters.get(key)
+                if (cur) {
+                  const i = cur.indexOf(resolve)
+                  if (i >= 0) cur.splice(i, 1)
+                  if (!cur.length) waiters.delete(key)
+                }
+                resolve(cache.get(key) || null)
+              }, timeout)
+            }
+          })
+        }
+
+        // Release every pending waiter with `null` (used by clear() so a
+        // re-center doesn't leave a loadFrame awaiting a frame that will never
+        // come from the old area).
+        function releaseWaiters() {
+          for (const arr of waiters.values()) {
+            for (const r of arr) r(null)
+          }
+          waiters.clear()
+        }
+
+        // Release waiters for a specific key with `null` (used when a fill
+        // ends without ever delivering that key — e.g. the server skipped an
+        // empty/errored frame — so a waiting loadFrame doesn't hang forever).
+        function releaseKey(key) {
+          const arr = waiters.get(key)
+          if (!arr) return
+          waiters.delete(key)
+          for (const r of arr) r(null)
+        }
+
         return {
           getJson,
+          put,
+          waitFor,
+          releaseKey,
           has: (key) => cache.has(key),
-          clear: () => { cache.clear(); inflight.clear() },
+          clear: () => { cache.clear(); inflight.clear(); releaseWaiters() },
           size: () => cache.size,
         }
       })()
 
-      // Fetch the full ensemble for a given time and render it. Returns true
-      // on success. Goes through the caching client, so a repeated time
-      // (looping / scrubbing back over) renders from memory with no network.
+      // Shared cache key for an ensemble frame. Omits dt: the server's
+      // per-frame prediction depends only on the concrete `time`, so a frame
+      // produced under one dt is reusable under another (scrubbing, looping, or
+      // changing the step all hit cache). Both loadFrame and the cache-fill use
+      // this so they share entries.
+      function frameCacheKey(t) {
+        return `ensemble|${model}|${kind}|${lat}|${lon}|${width}|${height}|${t}`
+      }
+
+      // Normalize a cached frame into a flat points array [{lon, lat, v}] plus
+      // its unit, accepting EITHER wire shape:
+      //   * slim (series/stream): { time, uom, coords:[[c0,c1],...], vals:[...] }
+      //   * GeoJSON (one-shot /ensemble, and the empty negative-cache entry):
+      //     { type:"FeatureCollection", features:[{geometry:{coordinates:[c0,c1]},
+      //       properties:{[model]:v, uom}}] }
+      // Coordinate order is preserved EXACTLY as before (c0 -> lon slot, c1 ->
+      // lat slot) so rendering is unchanged — this is purely a payload slimming.
+      function normalizeFrame(data) {
+        if (!data) return { points: [], uom: "" }
+        if (Array.isArray(data.vals) && Array.isArray(data.coords)) {
+          const pts = []
+          const co = data.coords, vs = data.vals
+          for (let i = 0; i < co.length; i++) {
+            const v = vs[i]
+            if (v === null || v === undefined || !Number.isFinite(v)) continue
+            pts.push({ lon: co[i][0], lat: co[i][1], v })
+          }
+          return { points: pts, uom: data.uom || "" }
+        }
+        // GeoJSON FeatureCollection fallback.
+        const feats = data.features || []
+        const pts = feats.map(f => ({
+          lon: f.geometry.coordinates[0],
+          lat: f.geometry.coordinates[1],
+          v: f.properties[model],
+        })).filter(p => Number.isFinite(p.v))
+        return { points: pts, uom: feats.length ? (feats[0].properties.uom || "") : "" }
+      }
+
+      // Snap an epoch onto the frame grid (anchored at the window start,
+      // stepped by dt). The cache-fill only ever produces grid-aligned frames,
+      // so loadFrame MUST render grid-aligned times too — otherwise it would
+      // wait on a cache key (an off-grid time) the fill never delivers and hang
+      // forever. `time` is often off-grid initially (now / a URL `t`), so every
+      // render snaps through here.
+      function snapToGrid(t) {
+        const lo = windowStart !== null ? windowStart
+                 : (forecastStart !== null ? forecastStart : null)
+        const hi = windowEnd !== null ? windowEnd
+                 : (forecastEnd !== null ? forecastEnd : null)
+        const step = dt > 0 ? dt : 3600
+        if (lo === null || !Number.isFinite(t)) return t
+        const k = Math.max(0, Math.round((t - lo) / step))
+        let snapped = lo + k * step
+        if (hi !== null && snapped > hi) snapped = lo + Math.floor((hi - lo) / step) * step
+        return snapped
+      }
+
+      // Monotonic counter so that when several loadFrame() calls are waiting on
+      // the cache at once (e.g. a fast scrub across uncached frames), only the
+      // most recently requested one renders — an earlier wait that resolves
+      // late can't paint a stale frame over a newer one.
+      let frameSeq = 0
+
+      // Render a frame for the given time STRICTLY from the cache. The client
+      // never fetches a single frame directly — all frames arrive via the
+      // streaming cache-fill (fillCache). On a cache miss we (re)compute what
+      // the window still needs and kick off a stream to fill it, then wait for
+      // THIS frame to land in the cache, holding the currently-rendered frame
+      // in the meantime (so the map never blanks out on a miss).
+      //
+      // This miss-driven kick is the whole re-targeting mechanism: e.g. when
+      // the playhead loops back to the window start, that first frame is a
+      // miss, which recomputes the missing set and streams it.
       async function loadFrame(time) {
+        // Snap to the frame grid so the key we wait on matches a frame the fill
+        // actually produces (the fill only emits grid-aligned times).
+        time = snapToGrid(time)
         // Capture the current load generation; a re-center bumps it, so a
-        // frame request that was in flight across a re-center won't render its
-        // (now stale) result over the new area.
+        // frame we were waiting on across a re-center won't render its (now
+        // stale) result over the new area.
         const gen = loadGeneration
-        const url =
-          `/api/models/${model}/type/ensemble?lat=${lat}&lon=${lon}&width=${width}&height=${height}&time=${time}&dt=${dt}&kind=${kind}`
-        // Cache key omits dt: the server's per-frame prediction depends only on
-        // the concrete `time`, so a timestamp fetched under one dt is reusable
-        // under another (scrubbing, looping, changing the step all hit cache).
-        const cacheKey = `ensemble|${model}|${kind}|${lat}|${lon}|${width}|${height}|${time}`
-        let data
-        try {
-          data = await apiClient.getJson(url, cacheKey)
-        } catch (err) {
-          console.error("ensemble request failed:", err)
-          return false
+        const seq = ++frameSeq
+        const cacheKey = frameCacheKey(time)
+
+        let data = apiClient.has(cacheKey) ? apiClient.getJson(null, cacheKey) : null
+        if (data === null) {
+          // Miss: hold the current frame and wait for the single streaming
+          // fill to deliver this one. Poll in bounded slices (not an indefinite
+          // wait) so we can detect supersession and never deadlock the tick:
+          //   * if no fill is running, kick one anchored at THIS time (its
+          //     stream starts at this frame, so it arrives first);
+          //   * if a fill is running, trust it and keep waiting;
+          //   * bail if a re-center (loadGeneration) or newer frame request
+          //     (frameSeq) supersedes us.
+          for (;;) {
+            if (!fillActive) fillCache(time)
+            data = await apiClient.waitFor(cacheKey, 1500)
+            if (data) break
+            if (gen !== loadGeneration || seq !== frameSeq) return false
+            if (apiClient.has(cacheKey)) { data = await apiClient.getJson(null, cacheKey); break }
+          }
+        } else {
+          data = await data
         }
         if (gen !== loadGeneration) return false  // superseded by a re-center
-        const features = (data && data.features) || []
-        renderFeatures(features)
+        if (seq !== frameSeq) return false        // a newer frame was requested
+        if (!data) return false                   // fill superseded / aborted
+        const frame = normalizeFrame(data)
+        renderFeatures(frame.points, frame.uom)
         syncTimeSlider(time)
         return true
+      }
+
+      // --- Cache fill: stream the window into the cache ----------------------
+      // The SINGLE path by which frames enter the cache. Given the current
+      // window + dt, it inventories which grid times are still uncached and
+      // streams exactly those (and no more) via the combined batch+sequence
+      // endpoint. The contour map (loadFrame) only ever READS the cache; a
+      // miss there kicks this off. Recomputed on load / re-center / dt-change /
+      // scrub, and whenever loadFrame hits a miss (e.g. looping back to start).
+      //
+      // Grid: anchored at `lo` (window start), stepped by `dt`, covering
+      // lo..hi. The frame cache key is dt-INDEPENDENT, so instants shared
+      // across two dt values are reused: e.g. filled 0,15,30,45,60 at dt=15,
+      // then switching to dt=10 only needs 10,20,40,50,... (0 and 30 are hits).
+      //
+      // The uncached grid times are split for the endpoint:
+      //   * SEQUENCE = the final contiguous uncached run, sent as start/end,
+      //                streamed in order.
+      //   * BATCH    = every other uncached time before that run (scattered
+      //                gaps), sent as `times=`, streamed first, nearest to the
+      //                current playhead first.
+      // Superseded via a token + AbortController so only the latest fill
+      // populates the cache.
+      // Fill the cache in ONE streaming request per sweep. `fromTime` anchors
+      // the pivot (defaults to the live playhead). The request covers the
+      // contiguous uncached run FORWARD from the pivot to the window end (play
+      // order), or — if everything ahead is cached — the contiguous uncached
+      // run behind the pivot. The server streams frames incrementally, so the
+      // client renders the pivot first and the rest arrives in order; no
+      // chunking/chaining, so one sweep = one request (minimal per-request
+      // overhead). Strictly single-flight: each call bumps fillToken and aborts
+      // the prior stream at entry, so a scrub / loadFrame miss / re-aim always
+      // supersedes — the abort stops the server after at most one more frame.
+      let fillToken = 0
+      let fillAbort = null
+      let fillActive = false
+
+      function stopFill() {
+        fillActive = false
+        if (fillAbort) { try { fillAbort.abort() } catch (_) {} fillAbort = null }
+      }
+
+      function fillCache(fromTime) {
+        // Supersede any in-flight fill immediately (single-flight).
+        const myToken = ++fillToken
+        const gen = loadGeneration
+        stopFill()
+
+        if (forecastStart === null || forecastEnd === null) return
+        const lo = windowStart !== null ? windowStart : forecastStart
+        const hi = windowEnd !== null ? windowEnd : forecastEnd
+        const step = dt > 0 ? dt : 3600
+        if (lo > hi) return
+
+        // Pivot snapped onto the grid anchored at lo.
+        const anchor = Number.isFinite(fromTime) ? fromTime : time
+        let pivot = lo
+        if (Number.isFinite(anchor)) {
+          const k = Math.max(0, Math.round((anchor - lo) / step))
+          pivot = Math.min(hi, lo + k * step)
+        }
+
+        // Inventory the window grid; collect uncached times.
+        const uncached = []
+        for (let t = lo; t <= hi; t += step) {
+          if (!apiClient.has(frameCacheKey(t))) uncached.push(t)
+        }
+        if (!uncached.length) return  // whole window already cached
+
+        // Build ONE request covering ALL uncached frames in the window, split
+        // into two parts the server combines:
+        //   * SEQUENCE (start/end) = the contiguous run from the pivot forward,
+        //     streamed in play order so the frame the user is on arrives first.
+        //   * BATCH (times=) = every OTHER uncached frame (before the pivot, or
+        //     the scattered gaps that appear when dt changes — e.g. switching
+        //     30min->15min leaves the new 15min slots isolated between cached
+        //     30min slots). Ordered nearest-the-pivot first.
+        // This consolidates what would otherwise be many single-frame requests
+        // (each isolated gap) into a single stream. The server's 5000-frame cap
+        // bounds pathological windows.
+        let fwdStart = null
+        for (const t of uncached) {
+          if (t >= pivot) { fwdStart = t; break }
+        }
+
+        let seqStart, seqHi
+        if (fwdStart !== null) {
+          seqStart = fwdStart
+          seqHi = fwdStart
+          for (let t = fwdStart + step; t <= hi; t += step) {
+            if (apiClient.has(frameCacheKey(t))) break  // contiguous run only
+            seqHi = t
+          }
+        } else {
+          const runEnd = uncached[uncached.length - 1]  // largest uncached < pivot
+          let runStart = runEnd
+          for (let t = runEnd - step; t >= lo; t -= step) {
+            if (apiClient.has(frameCacheKey(t))) break
+            runStart = t
+          }
+          seqStart = runStart
+          seqHi = runEnd
+        }
+
+        // Batch = all uncached frames NOT already covered by the sequence run,
+        // nearest-the-pivot first (so gaps near the playhead fill soonest).
+        const batch = uncached
+          .filter((t) => t < seqStart || t > seqHi)
+          .sort((a, b) => Math.abs(a - pivot) - Math.abs(b - pivot))
+
+        const ctrl = new AbortController()
+        fillAbort = ctrl
+
+        const qs = [
+          `lat=${lat}`, `lon=${lon}`, `width=${width}`, `height=${height}`,
+          `kind=${kind}`, `dt=${step}`,
+          `start=${seqStart}`, `end=${seqHi}`,
+        ]
+        if (batch.length) qs.push(`times=${batch.join(",")}`)
+        const url = `/api/models/${model}/type/series/stream?${qs.join("&")}`
+        console.log(`[fill] seq=${seqStart}..${seqHi} batch=${batch.length} uncached=${uncached.length} pivot=${pivot}`)
+
+        // Every uncached frame this request is responsible for (sequence run +
+        // batch). On completion, any still-missing one is negative-cached as
+        // empty so it isn't re-requested forever.
+        const targetTimes = uncached.slice()
+
+        fillActive = true
+        ;(async () => {
+          let completed = false
+          try {
+            let resp
+            try {
+              resp = await fetch(url, { signal: ctrl.signal })
+            } catch (_) { return }
+            if (!resp || !resp.ok || !resp.body) return
+            const reader = resp.body.getReader()
+            const decoder = new TextDecoder()
+            let buffer = ""
+            const handle = (line) => {
+              if (!line) return
+              try {
+                const fr = JSON.parse(line)
+                if (gen === loadGeneration && myToken === fillToken) {
+                  // Slim wire format: cache the frame record itself
+                  // ({time, uom, coords, vals}). normalizeFrame() lets the
+                  // render path consume this or a GeoJSON FeatureCollection
+                  // (the one-shot /ensemble endpoint still returns GeoJSON).
+                  apiClient.put(frameCacheKey(fr.time), fr)
+                }
+              } catch (_) {}
+            }
+            for (;;) {
+              if (gen !== loadGeneration || myToken !== fillToken) {
+                try { reader.cancel() } catch (_) {}
+                return
+              }
+              let readChunk
+              try { readChunk = await reader.read() } catch (_) { return }
+              if (readChunk.done) break
+              buffer += decoder.decode(readChunk.value, { stream: true })
+              let nl
+              while ((nl = buffer.indexOf("\n")) >= 0) {
+                handle(buffer.slice(0, nl).trim())
+                buffer = buffer.slice(nl + 1)
+              }
+            }
+            handle(buffer.trim())
+            completed = true  // stream read to completion (not aborted)
+          } finally {
+            if (myToken === fillToken) {
+              fillActive = false
+              if (completed) {
+                // NEGATIVE-CACHE skipped frames (only on a fully-read stream,
+                // never on abort/supersede — an aborted sweep hasn't proven
+                // those frames empty). The server omits a frame when it has no
+                // features (e.g. accumulation models early in the window with
+                // zero precip, or all gridpoints out of horizon). Without this,
+                // those grid slots stay "uncached" forever and every sweep
+                // re-requests them one-by-one (start==end) in an endless
+                // single-frame storm. Caching an empty FeatureCollection marks
+                // the slot filled: the contiguous-run logic skips it and
+                // loadFrame renders an empty frame. Correct for ALL kinds.
+                for (const t of targetTimes) {
+                  const k = frameCacheKey(t)
+                  if (!apiClient.has(k)) {
+                    apiClient.put(k, { type: "FeatureCollection", features: [] })
+                  }
+                }
+              } else {
+                // Aborted/superseded: just release waiters so a parked
+                // loadFrame doesn't hang; do NOT negative-cache.
+                for (const t of targetTimes) {
+                  const k = frameCacheKey(t)
+                  if (!apiClient.has(k)) apiClient.releaseKey(k)
+                }
+              }
+            }
+          }
+        })()
       }
 
       // Stream prefetch progress from NOAA and drive the spinner with a live
@@ -823,7 +1252,12 @@
         }
       }
       function scheduleNext() {
-        if (!paused) tickTimer = window.setTimeout(tick, frameIntervalMs())
+        if (paused) return
+        // Idempotent: never leave two timers pending. Any caller (tick finally,
+        // setPaused, recenter) can call this freely; there is always at most
+        // one scheduled tick.
+        if (tickTimer) { clearTimeout(tickTimer); tickTimer = null }
+        tickTimer = window.setTimeout(tick, frameIntervalMs())
       }
 
       // Time-step (dt) control. Steps through a preset list of nice durations.
@@ -840,6 +1274,10 @@
         const u = new URL(window.location.href)
         u.searchParams.set("dt", String(dt))
         history.replaceState(null, "", u.toString())
+        // The frame grid changed; recompute the cache fill for the new dt's
+        // times (cached instants that overlap are reused via the shared
+        // dt-independent key — this is exactly the batch+sequence case).
+        fillCache()
       }
       function stepDt(dir) {
         // Move to the neighboring preset (dir = +1 bigger, -1 smaller).
@@ -1089,6 +1527,10 @@
         scrubbing = false
         if (resumeAfterScrub) setPaused(false)
         resumeAfterScrub = false
+        // The window and/or playhead moved; recompute the cache fill for the
+        // new window (ordered nearest the new playhead). Already-cached frames
+        // are skipped.
+        fillCache()
       }
 
       scStartEl.addEventListener("pointerdown", (e) => beginDrag("start", e))
@@ -1133,13 +1575,23 @@
         // Fix the color scale to the whole-lifecycle range before rendering.
         await fetchGlobalRange()
         time = clampToForecast(time)
-        await loadFrame(time) // first frame
+        // The first frame now comes from the streaming cache-fill (loadFrame
+        // waits for it), which can take a moment on a large cold area. Swap the
+        // spinner message off the prefetch "Fetching data…" label so it doesn't
+        // look stuck while the first frame computes.
+        showSpinner("Rendering…")
+        await loadFrame(time) // first frame (from the fill)
       } catch (err) {
         console.error("failed to load initial frame:", err)
       } finally {
         loading = false
         hideSpinner()
       }
+      // loadFrame above already kicked off the cache fill on its miss; this is
+      // a no-op if that fill already covers the window, or recomputes it if the
+      // window/time changed in between. Not awaited — the first frame rendered;
+      // the fill populates the rest in the background.
+      fillCache()
 
       async function tick() {
         // If a tick is already running, try again shortly rather than

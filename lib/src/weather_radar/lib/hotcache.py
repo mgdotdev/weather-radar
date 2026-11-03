@@ -102,57 +102,6 @@ def paths_for_url(url):
     return unique
 
 
-# --- app URL -> frame spec (for precomputing animation frames) ---------------
-
-# NOAA layer name (kebab in URL) -> ensemble kind, mirroring the server's
-# MODEL_CATALOG. Accumulation layers are cumulative totals; everything else is
-# an instantaneous observation. Used to pick the right ensemble when warming
-# frames. Unknown models default to observation.
-_ACCUMULATION_MODELS = {
-    "quantitative-precipitation", "snowfall-amount", "ice-accumulation",
-}
-
-
-def frame_spec_for_url(url):
-    """Extract the parameters needed to precompute a map URL's animation
-    frames: model, kind, lat/lon/width/height, and dt. Returns None for URLs
-    that aren't map URLs (e.g. /graph/), which have no frames to warm."""
-    from urllib.parse import urlparse, parse_qs
-    import re
-
-    parsed = urlparse(url)
-    m = re.search(r"/map/models/([^/]+)/?", parsed.path)
-    if not m:
-        return None
-    model = m.group(1)
-    q = parse_qs(parsed.query)
-
-    def _num(name, default=None):
-        vals = q.get(name)
-        if not vals:
-            return default
-        try:
-            return float(vals[0])
-        except (TypeError, ValueError):
-            return default
-
-    lat, lon = _num("lat"), _num("lon")
-    if lat is None or lon is None:
-        return None
-    kind = (q.get("kind", [None])[0]
-            or ("accumulation" if model in _ACCUMULATION_MODELS else "observation"))
-    dt = _num("dt", 3600.0)
-    return {
-        "model": model,
-        "kind": kind,
-        "lat": lat,
-        "lon": lon,
-        "width": _num("width", 1.0),
-        "height": _num("height", 1.0),
-        "dt": int(dt) if dt else 3600,
-    }
-
-
 # --- cache-file expiry -------------------------------------------------------
 
 def _cache_file_for(path):
@@ -185,8 +134,6 @@ class _Scheduler:
         self._cond = threading.Condition()
         self._heap = []                 # (expiry_ts, path)
         self._url_paths = {}            # url -> set(paths)
-        self._url_spec = {}             # url -> frame spec (map URLs only)
-        self._path_urls = {}            # path -> set(urls) that depend on it
         self._stop = False
 
     # ---- public (manager) API ----
@@ -198,43 +145,20 @@ class _Scheduler:
         except Exception as e:
             logger.warning("hotcache: cannot resolve %s: %s", url, e)
             return json.dumps({"ok": False, "error": str(e)})
-        spec = None
-        try:
-            spec = frame_spec_for_url(url)
-        except Exception:
-            logger.warning("hotcache: cannot parse frame spec for %s", url, exc_info=True)
         with self._cond:
             self._url_paths[url] = set(paths)
-            if spec is not None:
-                self._url_spec[url] = spec
             now = time.time()
             for p in paths:
-                self._path_urls.setdefault(p, set()).add(url)
                 heapq.heappush(self._heap, (expiry_of(p) or now, p))
             self._persist_locked()
             self._cond.notify()
         logger.warning("hotcache: watching %s (%d paths)", url, len(paths))
-        # Warm the computed frames for this URL now (NOAA data is scheduled
-        # above; frames are derived from it). Done in a background thread so the
-        # watch() call returns promptly.
-        if spec is not None:
-            threading.Thread(
-                target=self._warm_frames, args=(url, spec), daemon=True
-            ).start()
         return json.dumps({"ok": True, "paths": len(paths)})
 
     def unwatch(self, url):
         with self._cond:
             paths = self._url_paths.pop(url, None)
             existed = paths is not None
-            self._url_spec.pop(url, None)
-            if paths:
-                for p in paths:
-                    urls = self._path_urls.get(p)
-                    if urls:
-                        urls.discard(url)
-                        if not urls:
-                            self._path_urls.pop(p, None)
             # Heap entries for now-orphaned paths are dropped lazily when popped
             # (see loop), so no need to rebuild the heap here.
             self._persist_locked()
@@ -255,78 +179,6 @@ class _Scheduler:
             if path in paths:
                 return True
         return False
-
-    def _warm_frames(self, url, spec):
-        """Precompute the animation frames for a watched map URL across its
-        forecast window, so navigating there finds every frame already cached.
-
-        Also the invalidation hook: because NOAA data may have just been
-        refreshed, any previously cached frames for this area were interpolated
-        from now-stale data. The writer's compute_frame version-stamps frames
-        by the current gridpoint data, so recomputing here overwrites them with
-        current-data frames; we additionally clear the area dir first to reclaim
-        the superseded files. Runs in its own thread; best-effort."""
-        from datetime import datetime
-        try:
-            from . import framecache
-            from .area import CoordinateArea, MapCoordinate
-            from .models.accumulation import AccumulationEnsemble
-            from .models.observation import ObservationEnsemble
-        except Exception:
-            logger.warning("hotcache: frame warming unavailable (imports)", exc_info=True)
-            return
-
-        area = CoordinateArea(MapCoordinate(spec["lat"], spec["lon"]),
-                              spec["width"], spec["height"])
-        kinds = {"accumulation": AccumulationEnsemble, "observation": ObservationEnsemble}
-        ensemble_class = kinds.get(spec["kind"], AccumulationEnsemble)
-        try:
-            vr = ensemble_class(area, spec["model"]).value_range()
-        except Exception:
-            logger.warning("hotcache: value_range failed for %s", url, exc_info=True)
-            return
-        if not vr or not vr.get("start") or not vr.get("end"):
-            return  # no valid forecast window -> nothing to warm
-
-        start = int(datetime.fromisoformat(vr["start"]).timestamp())
-        end = int(datetime.fromisoformat(vr["end"]).timestamp())
-        dt = int(spec["dt"]) or 3600
-
-        # Drop superseded frames for this area (defensive; version check already
-        # prevents serving them).
-        akey = framecache.area_key(
-            spec["model"], spec["kind"], spec["lat"], spec["lon"],
-            spec["width"], spec["height"],
-        )
-        try:
-            framecache.clear_area(akey)
-        except Exception:
-            pass
-
-        # Enqueue each frame to the writer (single-writer invariant: the writer
-        # computes + caches; we're just a client, like a web worker). Cap to a
-        # sane number of frames.
-        count = 0
-        t = start
-        warmed = 0
-        while t <= end and count < 5000:
-            params = {
-                "model": spec["model"], "kind": spec["kind"],
-                "lat": spec["lat"], "lon": spec["lon"],
-                "width": spec["width"], "height": spec["height"],
-                "time": t,
-            }
-            try:
-                cachewriter.frame(params)
-                warmed += 1
-            except cachewriter.WriterUnavailable:
-                logger.warning("hotcache: writer unavailable while warming frames")
-                return
-            except Exception:
-                logger.warning("hotcache: frame warm failed at %s", t, exc_info=True)
-            count += 1
-            t += dt
-        logger.warning("hotcache: warmed %d frames for %s", warmed, url)
 
     def _persist_locked(self):
         try:
@@ -388,10 +240,7 @@ class _Scheduler:
                     self._cond.wait(timeout=5)
                 continue
 
-            # Reschedule each refreshed path by its NEW expiry, and collect the
-            # URLs whose GRIDPOINT data changed so we can recompute their frames
-            # (any interpolation built from the old data is now invalid).
-            affected_urls = set()
+            # Reschedule each refreshed path by its NEW expiry.
             with self._cond:
                 now = time.time()
                 for p in due_paths:
@@ -402,22 +251,6 @@ class _Scheduler:
                         # Still missing (e.g. NOAA error): retry soon.
                         new_exp = now + 60 + LEAD_SECONDS
                     heapq.heappush(self._heap, (new_exp, p))
-                    # Only gridpoint changes affect computed frames; /points
-                    # just resolve the grid geometry (stable for the area).
-                    if p.startswith("/gridpoints/"):
-                        for u in self._path_urls.get(p, ()):
-                            if u in self._url_spec:
-                                affected_urls.add(u)
-                specs = {u: self._url_spec[u] for u in affected_urls}
-
-            # Recompute frames for affected URLs (outside the lock). The writer
-            # version-stamps frames by current data, so this overwrites stale
-            # ones. Threaded so a slow warm doesn't stall the scheduler loop.
-            for u, spec in specs.items():
-                logger.warning("hotcache: NOAA data changed, rewarming frames for %s", u)
-                threading.Thread(
-                    target=self._warm_frames, args=(u, spec), daemon=True
-                ).start()
 
 
 # --- Manager wiring ----------------------------------------------------------

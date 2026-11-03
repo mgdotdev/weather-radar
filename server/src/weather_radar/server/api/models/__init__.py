@@ -8,7 +8,7 @@ from weather_radar.lib.models import model_from_type
 from weather_radar.lib.models.accumulation import AccumulationEnsemble
 from weather_radar.lib.models.observation import ObservationEnsemble
 from weather_radar.lib.area import MapCoordinate, CoordinateArea
-from weather_radar.lib import cachewriter
+from weather_radar.lib.models.utils import BoundsError
 
 router = APIRouter(prefix="/models")
 
@@ -69,21 +69,13 @@ def ensemble(
     kind: str="accumulation",
 ):
     dtime = datetime_from_time(time)
-    epoch = int(dtime.timestamp())
-    params = {
-        "model": model, "kind": kind, "lat": lat, "lon": lon,
-        "width": width, "height": height, "time": epoch,
-    }
-    # Preferred path: the writer process computes + caches the frame (single-
-    # writer invariant) and returns it. Fall back to inline compute if the
-    # writer is unreachable (tests / standalone runs).
-    try:
-        return cachewriter.frame(params)
-    except cachewriter.WriterUnavailable:
-        coord = MapCoordinate(lat, lon)
-        area = CoordinateArea(coord, width, height)
-        ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
-        return ensemble_class(area, model).predict(dtime, dt=dt, verbose=True)
+    coord = MapCoordinate(lat, lon)
+    area = CoordinateArea(coord, width, height)
+    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
+    # Compute from the (NOAA-cached) gridpoint data. The interpolation itself
+    # isn't cached server-side — the browser caches results (apiClient), and
+    # the NOAA source data is kept warm by the writer/hotcache.
+    return ensemble_class(area, model).predict(dtime, dt=dt, verbose=True)
 
 
 @router.get("/{model}/type/range", response_class=JSONResponse)
@@ -124,32 +116,183 @@ def ensemble_stream(
     kind: str="accumulation",
 ):
     """Stream the ensemble as newline-delimited JSON (NDJSON): one GeoJSON
-    feature per line. Lets the client render points progressively.
-
-    The frame itself is computed + cached by the writer process (single-writer
-    invariant); this endpoint fetches it (a cache hit after the first time) and
-    streams its features out. Falls back to inline progressive compute if the
-    writer is unreachable."""
+    feature per line, computed from the (NOAA-cached) gridpoint data as each
+    point is produced, so the client can render progressively."""
     dtime = datetime_from_time(time)
-    epoch = int(dtime.timestamp())
-    params = {
-        "model": model, "kind": kind, "lat": lat, "lon": lon,
-        "width": width, "height": height, "time": epoch,
-    }
+    coord = MapCoordinate(lat, lon)
+    area = CoordinateArea(coord, width, height)
+    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
 
     def generate():
-        try:
-            fc = cachewriter.frame(params)
-        except cachewriter.WriterUnavailable:
-            # Writer down: compute inline, streaming each gridpoint as it's
-            # produced (no caching in this fallback path).
-            coord = MapCoordinate(lat, lon)
-            area = CoordinateArea(coord, width, height)
-            ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
-            for feature in ensemble_class(area, model).iter_predict(dtime, verbose=True):
-                yield json.dumps(feature) + "\n"
-            return
-        for feature in (fc or {}).get("features", []):
+        for feature in ensemble_class(area, model).iter_predict(dtime, verbose=True):
             yield json.dumps(feature) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+def _frame_times(start, end, dt, times):
+    """Resolve the list of frame epochs to stream, in the order to emit them.
+
+    Supports two modes, which may be COMBINED in one request:
+      * batch    - an explicit comma-separated list of epochs (`times=`),
+                   emitted first. Used to fill arbitrary gaps the client is
+                   missing (e.g. the odd 5-min slots when it already has the
+                   evens), in no particular spacing.
+      * sequence - a contiguous series start..end stepped by dt, emitted after
+                   the batch. Used to stream the continuous tail.
+
+    Duplicates are removed while preserving order (batch before sequence), so a
+    time present in both isn't computed/emitted twice.
+    """
+    out = []
+    seen = set()
+
+    def add(epoch):
+        e = int(epoch)
+        if e not in seen:
+            seen.add(e)
+            out.append(e)
+
+    # Batch first.
+    if times:
+        for tok in str(times).split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                add(float(tok))
+            except ValueError:
+                continue
+
+    # Then the contiguous sequence.
+    if start is not None and end is not None:
+        step = int(dt) if dt and int(dt) > 0 else 3600
+        t = float(start)
+        count = 0
+        while t <= float(end) + 1 and count < 5000:
+            add(t)
+            t += step
+            count += 1
+
+    return out
+
+
+@router.get("/{model}/type/series/stream")
+def ensemble_series_stream(
+    model: str,
+    lat: float,
+    lon: float,
+    start: float = None,
+    end: float = None,
+    dt: int = 0,
+    times: str = None,
+    width: float = 1,
+    height: float = 1,
+    kind: str = "accumulation",
+):
+    """Stream many frames as NDJSON — one line per frame,
+    {"time": <epoch>, "fc": <FeatureCollection>}.
+
+    Two modes, combinable in a single request (see _frame_times):
+      * BATCH    : `times=5,15,25,...` — an explicit set of epochs, streamed
+                   first. Lets the client fill arbitrary gaps it's missing.
+      * SEQUENCE : `start`, `end`, `dt` — a contiguous series, streamed after
+                   the batch. Lets the client stream the continuous tail.
+
+    Example (client has 0,10,20,30,40,50 cached; now stepping dt=5m): request
+    `times=5,15,25,35,45&start=55&end=<window end>&dt=300` — the gap frames
+    arrive as a batch, then 55,60,65,... stream in sequence.
+
+    Each frame is computed from the (NOAA-cached) gridpoint data; results are
+    not cached server-side (the browser caches them). Repeat requests recompute
+    cheaply from warm NOAA data."""
+    from datetime import datetime
+
+    epochs = _frame_times(start, end, dt, times)
+    coord = MapCoordinate(lat, lon)
+    area = CoordinateArea(coord, width, height)
+    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
+    ensemble = ensemble_class(area, model)
+
+    def generate():
+        if not epochs:
+            return
+
+        # Resolve gridpoints + fit every spline ONCE for the whole sweep.
+        # Previously each frame called ensemble.predict(), which re-resolved
+        # the gridpoint set AND re-ran ensure() — re-opening/parsing all ~N
+        # gridpoint cache files from disk every frame (N files × M frames I/O).
+        # That per-frame redundancy, not the spline math, dominated the cost.
+        # Here we build the per-gridpoint models once, then each frame is just
+        # spline evaluations against already-fitted models.
+        try:
+            gridpoints = list(area.iter_gridpoints())
+        except Exception:
+            return
+        # Warm all gridpoint data in one batched writer job before fitting.
+        try:
+            from weather_radar.lib.cachewriter import ensure as _ensure_cached
+            _ensure_cached([f"/gridpoints/{gp}" for gp in gridpoints])
+        except Exception:
+            pass
+        # Fetch (and fit) each gridpoint's model once. ensemble[gp] returns the
+        # process-wide cached model, fitting it on first access. Skip any that
+        # fail to build so one bad cell doesn't abort the sweep.
+        models = []
+        for gp in gridpoints:
+            try:
+                m = ensemble[gp]
+                m.model  # force the spline fit now (cached_property)
+                models.append(m)
+            except Exception:
+                continue
+        if not models:
+            return
+
+        # Precompute each model's coordinate + units ONCE (identical across all
+        # frames). Coordinate order is preserved EXACTLY as the GeoJSON path
+        # emitted it — [center.lat, center.lon] — so the client reads coords the
+        # same way it always has; this is purely a wire-format slimming, not a
+        # semantic change.
+        coords = []   # [[c0, c1], ...] parallel to `models`
+        uom = ""
+        kept = []
+        for m in models:
+            try:
+                _st, _et, center, _f, units, _exp = m.model
+            except Exception:
+                continue
+            coords.append([center.lat, center.lon])
+            uom = uom or units
+            kept.append(m)
+        models = kept
+        if not models:
+            return
+
+        # Each frame is emitted as a SLIM record instead of a full GeoJSON
+        # FeatureCollection: per-frame `time` and `uom` once (not repeated on
+        # every point), and parallel `coords`/`vals` arrays instead of ~N nested
+        # Feature objects. This cuts payload size and client JSON.parse cost
+        # several-fold. Records are SELF-CONTAINED (coords included each frame)
+        # so the client can cache and render any frame independently; coords is
+        # just numbers, so even repeated it's far smaller than GeoJSON. `vals`
+        # is aligned to `coords`; null where a gridpoint is out of horizon.
+        for epoch in epochs:
+            t = datetime.fromtimestamp(epoch)
+            fcoords = []
+            vals = []
+            any_val = False
+            for m, c in zip(models, coords):
+                try:
+                    y = m.predict(t, verbose=False)
+                except BoundsError:
+                    continue  # out of horizon this frame -> omit the point
+                except Exception:
+                    continue
+                fcoords.append(c)
+                vals.append(y)
+                any_val = True
+            if any_val:
+                yield json.dumps({"time": epoch, "uom": uom, "coords": fcoords, "vals": vals}) + "\n"
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")

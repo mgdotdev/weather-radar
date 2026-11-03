@@ -41,6 +41,12 @@
     code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
     td.url a { color: var(--accent); text-decoration: none; }
     td.url a:hover { text-decoration: underline; }
+    .badge { display:inline-block; margin-top:4px; font-size:11px; padding:1px 7px;
+             border-radius:10px; font-family: system-ui, sans-serif; }
+    .badge-ready { background:#e6f4ea; color:#1e7e34; }
+    .badge-warming { background:#fff4e5; color:#8a5a00; }
+    .badge-error { background:#fdecea; color:var(--danger); }
+    .badge-unknown { background:#eee; color:#666; }
     .preview { width: 160px; height: 100px; border-radius: 6px; overflow: hidden;
                border: 1px solid var(--border); background: #eee; }
     .preview .maplibregl-ctrl-attrib, .preview .maplibregl-ctrl { display: none !important; }
@@ -279,6 +285,8 @@
     urlEl.addEventListener("keydown", (e) => { if (e.key === "Enter") add() })
 
     refresh()
+    // Auto-refresh so warming progress updates live.
+    setInterval(refresh, 3000)
   </script>
 </body>
 </html>
