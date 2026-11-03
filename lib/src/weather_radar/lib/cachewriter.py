@@ -110,6 +110,12 @@ def _retry_get(session, url, retries=6, attempt=0):
     resp = session.get(url)
     if resp.status_code == 200:
         return resp
+    # Permanent no-coverage (NOAA 404 /problems/InvalidPoint): never retry.
+    # Fail fast so the writer doesn't spend the full backoff ladder on points
+    # it can never serve (e.g. coordinates outside US coverage). _fetch_one
+    # catches this and simply writes nothing for the path.
+    if resp.status_code == 404:
+        raise RuntimeError(f"no coverage (404): {url}")
     if not retries:
         resp.raise_for_status()
         raise RuntimeError(f"NWS unresponsive: {url}")

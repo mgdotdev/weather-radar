@@ -53,9 +53,12 @@ class AccumulationModel:
 
     @classmethod
     def from_map_coordinate(cls, coordinate: MapCoordinate, attribute: str):
-        return cls(
-            gridpoint_from_map_coordinate(coordinate), attribute
-        )
+        gp = gridpoint_from_map_coordinate(coordinate)
+        if gp is None:
+            # NOAA has no coverage for this point (outside the US). Signal "no
+            # data here" rather than constructing a model on a None gridpoint.
+            raise BoundsError(f"no NOAA coverage for {coordinate}")
+        return cls(gp, attribute)
 
     @property
     def is_expired(self) -> bool:

@@ -5,7 +5,7 @@ import threading
 import math
 from functools import cached_property
 
-from .connection import NOAAConnection, PathObj, get_and_write
+from .connection import NOAAConnection, PathObj, get_and_write, NoCoverageError
 
 lock = multiprocessing.Lock()
 
@@ -234,6 +234,8 @@ class CoordinateArea:
         # adjacent samples often map to the same gridpoint.
         with concurrent.futures.ThreadPoolExecutor(max_workers=NOAA_MAX_CONCURRENCY) as executor:
             for gp in executor.map(gridpoint_from_map_coordinate, coordinates):
+                if gp is None:
+                    continue  # out-of-coverage sample (e.g. across the border)
                 if gp in seen:
                     continue
                 seen.add(gp)
@@ -283,8 +285,16 @@ class CoordinateArea:
 
 
 def gridpoint_from_map_coordinate(coordinate: MapCoordinate):
+    """Resolve a sample coordinate to its NOAA gridpoint, or None if NOAA has
+    no coverage for that point (e.g. it falls outside the US — in Canada,
+    Mexico, or open ocean). Returning None instead of raising lets an area that
+    straddles the coverage boundary resolve its in-coverage gridpoints and skip
+    the rest, rather than aborting the whole resolution."""
     conn = NOAAConnection()
-    resp = conn.get(f"/points/{coordinate}")
+    try:
+        resp = conn.get(f"/points/{coordinate}")
+    except NoCoverageError:
+        return None
     resp = resp["properties"]
     return NOAAGridpoint(resp["gridId"], resp["gridX"], resp["gridY"])
 

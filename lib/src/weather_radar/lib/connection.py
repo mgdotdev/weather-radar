@@ -36,6 +36,13 @@ class _KeyedLocks:
 _url_locks = _KeyedLocks()
 
 
+class NoCoverageError(Exception):
+    """Raised when NOAA reports it has no data for a requested point (HTTP 404
+    /problems/InvalidPoint) — e.g. a coordinate outside US coverage (Canada,
+    Mexico, open ocean). This is PERMANENT, not transient: callers should skip
+    the point rather than retry it."""
+
+
 def _retry_time(attempt):
     """Exponential backoff with a cap, in seconds, for the given 0-based
     attempt number: 1, 2, 4, 8, ... capped at 16s."""
@@ -52,6 +59,13 @@ def retry_get(session, path, retries=6, resp=None, attempt=0):
     resp = session.get(path)
     if resp.status_code == 200:
         return resp
+
+    # Permanent "no coverage" for this point: NOAA returns 404 with
+    # /problems/InvalidPoint for coordinates it can't serve (outside the US,
+    # ocean, etc.). Retrying never helps, so fail fast and let callers skip the
+    # point instead of burning the full backoff ladder (~47s) on every one.
+    if resp.status_code == 404:
+        raise NoCoverageError(path)
 
     # Rate limited: NOAA documents that throttling typically clears within a
     # few seconds. Honor an explicit Retry-After header when present, else
@@ -117,13 +131,20 @@ def get_from_external_source(path, session):
                 return json.loads(f.read())
         except Exception:
             return bad_cache
-    # Writer ran but produced nothing (e.g. NOAA error) -> treat as a miss.
-    return bad_cache
+    # Writer ran but produced nothing. This is either a transient miss (NOAA
+    # error, timeout) or a PERMANENT no-coverage 404 (the writer can't signal
+    # which — it just doesn't write a file). Do one inline fetch to classify:
+    # a NoCoverageError propagates (so callers skip the point); anything else
+    # is treated as a transient miss. Without this, a 404 would make
+    # get_with_expiry recurse forever (bad_cache -> retry -> bad_cache -> ...).
+    return _inline_fetch(path, session)
 
 
 def _inline_fetch(path, session):
     """Fetch + write a single path in-process (fallback when the cache-writer
-    process isn't available). Coalesces concurrent fetches of the same URL."""
+    process isn't available, or to classify a writer miss). Coalesces
+    concurrent fetches of the same URL. Propagates NoCoverageError (permanent
+    404) so callers can skip the point instead of retrying."""
     url_lock = _url_locks.get(path.url)
     with url_lock:
         if os.path.isfile(path.tempfile):
@@ -134,6 +155,8 @@ def _inline_fetch(path, session):
                 return bad_cache
         try:
             return get_and_write(path, session)
+        except NoCoverageError:
+            raise  # permanent: let it propagate so the point is skipped
         except Exception:
             logger.warning("inline fetch failed for %s", path.path, exc_info=True)
             return bad_cache
