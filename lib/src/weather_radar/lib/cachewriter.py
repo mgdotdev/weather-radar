@@ -102,6 +102,11 @@ def _retry_time(attempt):
     return min(2 ** attempt, 16)
 
 
+class _NoCoverage(Exception):
+    """NOAA 404 for a path it can't serve (point/cell past coverage). Expected
+    during gridpoint-walk edge probing — NOT an error to log loudly."""
+
+
 def _retry_get(session, url, retries=6, attempt=0):
     """GET with 429/Retry-After handling + exponential backoff. Mirrors
     connection.retry_get but lives in the writer so all network writes share
@@ -110,12 +115,12 @@ def _retry_get(session, url, retries=6, attempt=0):
     resp = session.get(url)
     if resp.status_code == 200:
         return resp
-    # Permanent no-coverage (NOAA 404 /problems/InvalidPoint): never retry.
-    # Fail fast so the writer doesn't spend the full backoff ladder on points
-    # it can never serve (e.g. coordinates outside US coverage). _fetch_one
-    # catches this and simply writes nothing for the path.
+    # Permanent no-coverage (NOAA 404): never retry. Fail fast with a
+    # recognizable exception so _fetch_one can treat it as an expected miss
+    # (no traceback) — the walk deliberately probes cells past the grid edge,
+    # so 404s here are normal, not errors.
     if resp.status_code == 404:
-        raise RuntimeError(f"no coverage (404): {url}")
+        raise _NoCoverage(url)
     if not retries:
         resp.raise_for_status()
         raise RuntimeError(f"NWS unresponsive: {url}")
@@ -187,6 +192,11 @@ class _Writer:
                     if os.path.exists(tmp):
                         os.unlink(tmp)
                 return True
+            except _NoCoverage:
+                # Expected: this cell/point is past NOAA's coverage (the walk
+                # probes grid edges). Not an error — write nothing, no trace.
+                logger.debug("cachewriter: no coverage for %s (expected edge)", path)
+                return False
             except Exception:
                 logger.warning("cachewriter failed to cache %s", path, exc_info=True)
                 return False

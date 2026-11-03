@@ -15,6 +15,9 @@ container() {
       -v /tmp:/tmp \
       -v "$PWD":"$CODE_DIR" \
       -v /etc/localtime:/etc/localtime:ro \
+      -e LOG_LEVEL \
+      -e WR_STREAM_TIMING \
+      -e NOAA_MAX_CONCURRENCY \
       "$IMAGE" bash
 }
 
@@ -31,6 +34,9 @@ server() {
           -v /tmp:/tmp \
           -v "$PWD":"$CODE_DIR" \
           -v /etc/localtime:/etc/localtime:ro \
+          -e LOG_LEVEL \
+          -e WR_STREAM_TIMING \
+          -e NOAA_MAX_CONCURRENCY \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh server $workers"
     else
         local py="$VENV_PY"
@@ -55,6 +61,9 @@ dev() {
           -v /tmp:/tmp \
           -v "$PWD":"$CODE_DIR" \
           -v /etc/localtime:/etc/localtime:ro \
+          -e LOG_LEVEL \
+          -e WR_STREAM_TIMING \
+          -e NOAA_MAX_CONCURRENCY \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh dev"
     else
         local py="$VENV_PY"

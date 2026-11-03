@@ -204,7 +204,8 @@ class CoordinateArea:
         waiting for the whole area to resolve.
 
         If a matching (exact or nearby) gridpoint set is already cached, yields
-        it from the cache. Otherwise resolves lazily and populates the cache
+        it from the cache. Otherwise resolves lazily (one /points lookup per
+        lattice sample, deduped to unique gridpoints) and populates the cache
         once the full set has been produced.
         """
         cached = self._find_cached_gridpoints()
