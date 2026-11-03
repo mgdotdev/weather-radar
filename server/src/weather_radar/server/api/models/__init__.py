@@ -1,6 +1,9 @@
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 import json
+import logging
+import os
+import time
 
 from weather_radar.server.api.models.utils import datetime_from_time, time_t
 
@@ -9,6 +12,14 @@ from weather_radar.lib.models.accumulation import AccumulationEnsemble
 from weather_radar.lib.models.observation import ObservationEnsemble
 from weather_radar.lib.area import MapCoordinate, CoordinateArea
 from weather_radar.lib.models.utils import BoundsError
+
+logger = logging.getLogger(__name__)
+
+# When set (any truthy value), emit a per-request timing summary for the
+# series-stream sweep at WARNING — useful for diagnosing first-frame latency
+# (NOAA warm vs. spline fit vs. evaluation). Off by default to avoid per-request
+# log noise in normal operation.
+_TIMING = bool(os.environ.get("WR_STREAM_TIMING"))
 
 router = APIRouter(prefix="/models")
 
@@ -218,6 +229,11 @@ def ensemble_series_stream(
         if not epochs:
             return
 
+        # --- Phase timing (to locate first-frame latency: NOAA warm vs spline
+        # fit vs evaluation). Logged once per request at WARNING so it surfaces
+        # without extra log config. Monotonic clock; negligible overhead. ---
+        t_start = time.perf_counter()
+
         # Resolve gridpoints + fit every spline ONCE for the whole sweep.
         # Previously each frame called ensemble.predict(), which re-resolved
         # the gridpoint set AND re-ran ensure() — re-opening/parsing all ~N
@@ -229,23 +245,38 @@ def ensemble_series_stream(
             gridpoints = list(area.iter_gridpoints())
         except Exception:
             return
+        t_resolved = time.perf_counter()
         # Warm all gridpoint data in one batched writer job before fitting.
         try:
             from weather_radar.lib.cachewriter import ensure as _ensure_cached
             _ensure_cached([f"/gridpoints/{gp}" for gp in gridpoints])
         except Exception:
             pass
+        t_warmed = time.perf_counter()
         # Fetch (and fit) each gridpoint's model once. ensemble[gp] returns the
         # process-wide cached model, fitting it on first access. Skip any that
         # fail to build so one bad cell doesn't abort the sweep.
+        #
+        # Track how many models were already fitted (hot in this worker's
+        # _MODEL_CACHE) vs. fit cold right now — the key signal for whether
+        # keeping splines hot would help. A model is "hot" if its `model`
+        # cached_property is already populated and not expired.
+        n_hot = 0
+        n_cold = 0
         models = []
         for gp in gridpoints:
             try:
                 m = ensemble[gp]
+                was_hot = ("model" in m.__dict__) and (not m.is_expired)
                 m.model  # force the spline fit now (cached_property)
+                if was_hot:
+                    n_hot += 1
+                else:
+                    n_cold += 1
                 models.append(m)
             except Exception:
                 continue
+        t_fit = time.perf_counter()
         if not models:
             return
 
@@ -277,6 +308,9 @@ def ensemble_series_stream(
         # so the client can cache and render any frame independently; coords is
         # just numbers, so even repeated it's far smaller than GeoJSON. `vals`
         # is aligned to `coords`; null where a gridpoint is out of horizon.
+        t_eval_start = time.perf_counter()
+        t_first_frame = None
+        frames_emitted = 0
         for epoch in epochs:
             t = datetime.fromtimestamp(epoch)
             fcoords = []
@@ -293,6 +327,32 @@ def ensemble_series_stream(
                 vals.append(y)
                 any_val = True
             if any_val:
+                if t_first_frame is None:
+                    t_first_frame = time.perf_counter()
+                frames_emitted += 1
                 yield json.dumps({"time": epoch, "uom": uom, "coords": fcoords, "vals": vals}) + "\n"
+
+        # --- One structured timing line per request. Durations in ms. ---
+        #   resolve     : area.iter_gridpoints()
+        #   warm        : _ensure_cached (NOAA gridpoint data onto disk)
+        #   fit         : build/fit per-gridpoint splines (cold) or reuse (hot)
+        #   to_first    : fit end -> first frame emitted (eval of frame 1)
+        #   total       : whole generate() span
+        #   models      : hot (reused from _MODEL_CACHE) / cold (fit now)
+        # If `fit` is large and `cold` dominates, keeping splines hot would cut
+        # first-frame latency; if `warm` dominates, it's NOAA I/O instead.
+        t_end = time.perf_counter()
+        if _TIMING:
+            ms = lambda a, b: round((b - a) * 1000, 1)
+            logger.warning(
+                "series_stream timing model=%s kind=%s gp=%d frames=%d "
+                "resolve=%sms warm=%sms fit=%sms to_first=%sms total=%sms "
+                "models_hot=%d models_cold=%d",
+                model, kind, len(gridpoints), frames_emitted,
+                ms(t_start, t_resolved), ms(t_resolved, t_warmed), ms(t_warmed, t_fit),
+                ms(t_fit, t_first_frame) if t_first_frame else None,
+                ms(t_start, t_end),
+                n_hot, n_cold,
+            )
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")

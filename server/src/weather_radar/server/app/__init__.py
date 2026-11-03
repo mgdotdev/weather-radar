@@ -143,6 +143,18 @@ MODEL_CATALOG = {
 
 # Optional bespoke styling per model (seed step + ramp). Anything omitted uses
 # the neutral ramp and a generic seed step (auto-scaling handles the rest).
+#
+# `render` selects the client overlay type:
+#   "isoband" (default) - filled d3-contour isobands + lines; right for
+#                         smoothly-varying continuous scalars (temperature,
+#                         pressure, humidity, accumulation totals).
+#   "heatmap"           - a continuous intensity wash (per-cell fill whose
+#                         opacity scales with value, transparent at the low
+#                         end) over the SAME IDW raster; suits per-interval
+#                         precip/snow/ice rate, which reads like radar imagery
+#                         rather than discrete bands.
+_RENDER_ISOBAND = "isoband"
+_RENDER_HEATMAP = "heatmap"
 _CUSTOM_STYLE = {
     "temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP},
     "apparent-temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP},
@@ -154,12 +166,13 @@ _CUSTOM_STYLE = {
     "snowfall-amount": {"contour_step": 2.0, "color_ramp": _RAMP_BLUES},
     "quantitative-precipitation": {"contour_step": 0.5, "color_ramp": _RAMP_TEAL},
     "ice-accumulation": {"contour_step": 0.25, "color_ramp": _RAMP_BLUES},
-    # Per-interval rate variants reuse their total counterpart's ramp. A
+    # Per-interval rate variants reuse their total counterpart's ramp but
+    # render as an intensity heatmap (radar-style wash) instead of isobands. A
     # smaller seed step suits the per-interval amounts (a single interval is
     # only a fraction of the storm total); auto-scaling refines it anyway.
-    "precipitation-rate": {"contour_step": 0.1, "color_ramp": _RAMP_TEAL},
-    "snowfall-rate": {"contour_step": 0.5, "color_ramp": _RAMP_BLUES},
-    "ice-accumulation-rate": {"contour_step": 0.1, "color_ramp": _RAMP_BLUES},
+    "precipitation-rate": {"contour_step": 0.1, "color_ramp": _RAMP_TEAL, "render": _RENDER_HEATMAP},
+    "snowfall-rate": {"contour_step": 0.5, "color_ramp": _RAMP_BLUES, "render": _RENDER_HEATMAP},
+    "ice-accumulation-rate": {"contour_step": 0.1, "color_ramp": _RAMP_BLUES, "render": _RENDER_HEATMAP},
 }
 
 _DEFAULT_STYLE = {"contour_step": 1.0, "color_ramp": _RAMP_NEUTRAL}
@@ -175,18 +188,25 @@ def _profile(model):
         return None
     kind, label, attribute = entry
     style = _CUSTOM_STYLE.get(model, _DEFAULT_STYLE)
-    return {"kind": kind, "label": label, "attribute": attribute, **style}
+    # `render` defaults to isobands unless the style opts into another overlay.
+    return {
+        "kind": kind,
+        "label": label,
+        "attribute": attribute,
+        "render": _RENDER_ISOBAND,
+        **style,
+    }
 
 
 # Fallback profile for an unknown attribute: render as an observation with the
 # neutral ramp so the map still shows something sensible. `attribute` is filled
 # in by the caller (it defaults to the requested model name).
-DEFAULT_PROFILE = {"kind": _OBSERVATION, "label": "Value", **_DEFAULT_STYLE}
+DEFAULT_PROFILE = {"kind": _OBSERVATION, "label": "Value", "render": _RENDER_ISOBAND, **_DEFAULT_STYLE}
 
 
 
 @router.get("/map/models/{model}/", response_class=HTMLResponse)
-def map(model: str, width: float, height: float, lat: float, lon: float, dt: int, kind: str = None, step: float = None, speed: float = 1.0):
+def map(model: str, width: float, height: float, lat: float, lon: float, dt: int, kind: str = None, step: float = None, speed: float = 1.0, render: str = None):
     # Model names are kebab-case end-to-end (URL, GeoJSON property key, API
     # params). The data layer converts to the camelCase NOAA attribute only
     # when reading the gridpoint (see models.utils.to_camel_case), so nothing
@@ -203,6 +223,11 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
     # the GeoJSON property key and the client's readout stay in sync; `model`
     # (the URL key) is preserved separately for the dropdown selection.
     attribute = profile["attribute"]
+    # Overlay type: isobands by default, heatmap for the rate layers. An
+    # explicit `render` query param may override the profile default.
+    render_type = render or profile["render"]
+    if render_type not in (_RENDER_ISOBAND, _RENDER_HEATMAP):
+        render_type = _RENDER_ISOBAND
     # Contour interval: the value delta between adjacent contour lines. When
     # the user hasn't specified `step`, the client auto-scales it to the data's
     # global range (auto_step=True); the profile value is only a seed/fallback.
@@ -237,6 +262,7 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
         "contour_color_ramp": json.dumps(profile["color_ramp"]),
         "model_options": json.dumps(model_options),
         "current_model": model,
+        "render_type": render_type,
     })
     return html
 

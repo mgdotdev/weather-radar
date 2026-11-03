@@ -138,6 +138,11 @@
     // Available models for the in-legend selector, and the current one.
     const modelOptions = {{model_options}}
     const currentModel = "{{current_model}}"
+    // Overlay type chosen by the server for this model: "isoband" (filled
+    // d3-contour bands + lines) or "heatmap" (a continuous intensity wash
+    // whose opacity scales with value). Both consume the same IDW raster.
+    const renderType = "{{render_type}}"
+    const isHeatmap = renderType === "heatmap"
     // Contour interval: the value delta between adjacent contour lines
     // (e.g. 1.0, 0.5, 2.0 degrees). Configurable live in the legend.
     let contourStep = {{contour_step}}
@@ -199,6 +204,12 @@
       zoom: initialZoom,
     })
 
+    // Distance scale bar (bottom-left; bottom-right holds the basemap
+    // attribution, top-left holds the legend). Metric units; `maxWidth` is the
+    // bar's max pixel length, which MapLibre rounds to a nice round distance
+    // for the current zoom/latitude (e.g. 1 km, 500 m).
+    map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "bottom-left")
+
     // ---- Spinner ------------------------------------------------------------
     const spinnerEl = document.getElementById("spinner")
     const spinnerTextEl = document.getElementById("spinnerText")
@@ -238,6 +249,18 @@
       const f = (t - a.pos) / span
       return `rgb(${Math.round(a.r + (b.r - a.r) * f)}, ${Math.round(a.g + (b.g - a.g) * f)}, ${Math.round(a.b + (b.b - a.b) * f)})`
     }
+    // Numeric [r,g,b] variant of rampColorAt for hot pixel loops (the heatmap
+    // raster), avoiding per-pixel string formatting/parsing.
+    function rampRgbAt(t) {
+      t = Math.max(0, Math.min(1, t))
+      let a = rampStops[0], b = rampStops[rampStops.length - 1]
+      for (let i = 0; i < rampStops.length - 1; i++) {
+        if (t >= rampStops[i].pos && t <= rampStops[i + 1].pos) { a = rampStops[i]; b = rampStops[i + 1]; break }
+      }
+      const span = (b.pos - a.pos) || 1
+      const f = (t - a.pos) / span
+      return [a.r + (b.r - a.r) * f, a.g + (b.g - a.g) * f, a.b + (b.b - a.b) * f]
+    }
 
     // ---- Legend -------------------------------------------------------------
     let legendInitialized = false
@@ -260,22 +283,43 @@
       document.getElementById("legend").style.display = "block"
     }
 
-    // ---- Contour construction ----------------------------------------------
+    // ---- Field raster (shared by all overlays) -----------------------------
 
-    // Build filled contour polygons (GeoJSON) from a scatter of points
-    // ({lon, lat, v}). Returns { fc, vMin, vMax, units } or null.
-    function buildContours(points) {
+    // IDW-resample the scatter of points ({lon,lat,v}) onto a regular lattice
+    // adapted to the current view extent. Returns
+    //   { GRID, minLon, maxLon, minLat, maxLat, values, vMin, vMax }
+    // (values is row-major, row 0 = minLat), or null if there isn't enough
+    // data / the field is flat. Both the isoband and heatmap overlays consume
+    // this, so the interpolation is defined once.
+    function buildField(points) {
       // Raster resolution adapted to the current view extent (toward ~2.5km
       // data resolution), clamped. Local to this call so a recenter/zoom picks
       // the right size without touching the rest of the function.
       const GRID = gridResFor(width, height)
-      const pts = points.filter(p => Number.isFinite(p.v))
-      if (pts.length < 3) return null
+      // Pack the finite points into parallel typed arrays once. The hot IDW
+      // loop below reads these by index (cache-friendly, zero per-cell object
+      // allocation) instead of walking arrays of {lon,lat,v} objects.
+      const srcN0 = points.length
+      const ptLon = new Float64Array(srcN0)
+      const ptLat = new Float64Array(srcN0)
+      const ptV = new Float64Array(srcN0)
+      let nPts = 0
+      for (let i = 0; i < srcN0; i++) {
+        const p = points[i]
+        if (Number.isFinite(p.v)) { ptLon[nPts] = p.lon; ptLat[nPts] = p.lat; ptV[nPts] = p.v; nPts++ }
+      }
+      if (nPts < 3) return null
 
-      let minLon = Math.min(...pts.map(p => p.lon))
-      let maxLon = Math.max(...pts.map(p => p.lon))
-      let minLat = Math.min(...pts.map(p => p.lat))
-      let maxLat = Math.max(...pts.map(p => p.lat))
+      // Bounds (plain loop; avoids Math.min(...spread) which allocates and can
+      // overflow the arg stack on large point sets).
+      let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity
+      for (let i = 0; i < nPts; i++) {
+        const lo = ptLon[i], la = ptLat[i]
+        if (lo < minLon) minLon = lo
+        if (lo > maxLon) maxLon = lo
+        if (la < minLat) minLat = la
+        if (la > maxLat) maxLat = la
+      }
       const padLon = (maxLon - minLon) * 0.05 || 0.01
       const padLat = (maxLat - minLat) * 0.05 || 0.01
       minLon -= padLon; maxLon += padLon; minLat -= padLat; maxLat += padLat
@@ -288,58 +332,104 @@
       const spanLat = (maxLat - minLat) || 1e-6
       // Aim for roughly one bucket per source point, capped so the bucket grid
       // isn't absurdly fine/coarse.
-      const bN = Math.max(1, Math.min(GRID, Math.round(Math.sqrt(pts.length))))
-      const buckets = Array.from({ length: bN * bN }, () => [])
-      const bOf = (lon, lat) => {
-        let bx = Math.floor(((lon - minLon) / spanLon) * bN)
-        let by = Math.floor(((lat - minLat) / spanLat) * bN)
-        bx = Math.max(0, Math.min(bN - 1, bx))
-        by = Math.max(0, Math.min(bN - 1, by))
+      const bN = Math.max(1, Math.min(GRID, Math.round(Math.sqrt(nPts))))
+      const nB = bN * bN
+      const bOfIdx = (i) => {
+        let bx = Math.floor(((ptLon[i] - minLon) / spanLon) * bN)
+        let by = Math.floor(((ptLat[i] - minLat) / spanLat) * bN)
+        if (bx < 0) bx = 0; else if (bx > bN - 1) bx = bN - 1
+        if (by < 0) by = 0; else if (by > bN - 1) by = bN - 1
         return by * bN + bx
       }
-      for (const p of pts) buckets[bOf(p.lon, p.lat)].push(p)
+      // CSR-style bucket index built by counting sort: bucketStart[b]..
+      // bucketStart[b+1] is the slice of `bucketPts` (point indices) in bucket
+      // b. No array-of-arrays, no per-point push.
+      const bucketCount = new Int32Array(nB)
+      for (let i = 0; i < nPts; i++) bucketCount[bOfIdx(i)]++
+      const bucketStart = new Int32Array(nB + 1)
+      for (let b = 0; b < nB; b++) bucketStart[b + 1] = bucketStart[b] + bucketCount[b]
+      const bucketPts = new Int32Array(nPts)
+      const cursor = bucketStart.slice(0, nB) // mutable write cursors per bucket
+      for (let i = 0; i < nPts; i++) {
+        const b = bOfIdx(i)
+        bucketPts[cursor[b]++] = i
+      }
 
-      // IDW value at (plon,plat) from the nearest ~IDW_K source points, found
-      // by expanding bucket rings outward until enough candidates are gathered.
+      // Scratch for the K nearest, reused across every raster cell (no
+      // allocation in the hot loop). bestD2/bestIdx hold the current K-nearest
+      // kept so far, unordered; `worstSlot` tracks the largest d2 among them so
+      // a new candidate only displaces it if strictly nearer.
+      const K = IDW_K
+      const bestD2 = new Float64Array(K)
+      const bestIdx = new Int32Array(K)
+
+      // IDW value at (plon,plat) from the nearest ~K source points, found by
+      // expanding bucket rings outward until enough candidates are gathered.
       function idwValue(plon, plat) {
-        const cbx = Math.max(0, Math.min(bN - 1, Math.floor(((plon - minLon) / spanLon) * bN)))
-        const cby = Math.max(0, Math.min(bN - 1, Math.floor(((plat - minLat) / spanLat) * bN)))
-        let cand = []
-        // Expand ring radius until we have at least IDW_K candidates (or we've
-        // covered the whole bucket grid).
+        let cbx = Math.floor(((plon - minLon) / spanLon) * bN)
+        let cby = Math.floor(((plat - minLat) / spanLat) * bN)
+        if (cbx < 0) cbx = 0; else if (cbx > bN - 1) cbx = bN - 1
+        if (cby < 0) cby = 0; else if (cby > bN - 1) cby = bN - 1
+
+        // Expand ring radius until we've SCANNED at least K candidates (or
+        // covered the whole bucket grid), matching the original stop rule;
+        // then the final ring's candidates are all considered for nearest-K.
         for (let r = 0; r < bN; r++) {
-          cand = []
-          const x0 = Math.max(0, cbx - r), x1 = Math.min(bN - 1, cbx + r)
-          const y0 = Math.max(0, cby - r), y1 = Math.min(bN - 1, cby + r)
+          let kept = 0            // how many of bestD2/bestIdx are populated
+          let worstSlot = -1      // slot holding the current largest kept d2
+          let worstD2 = -Infinity
+          let scanned = 0
+          const x0 = cbx - r < 0 ? 0 : cbx - r
+          const x1 = cbx + r > bN - 1 ? bN - 1 : cbx + r
+          const y0 = cby - r < 0 ? 0 : cby - r
+          const y1 = cby + r > bN - 1 ? bN - 1 : cby + r
           for (let by = y0; by <= y1; by++) {
+            const rowBase = by * bN
             for (let bx = x0; bx <= x1; bx++) {
-              const b = buckets[by * bN + bx]
-              for (let i = 0; i < b.length; i++) cand.push(b[i])
+              const b = rowBase + bx
+              const s = bucketStart[b], e = bucketStart[b + 1]
+              for (let j = s; j < e; j++) {
+                const pi = bucketPts[j]
+                const dLon = plon - ptLon[pi], dLat = plat - ptLat[pi]
+                const d2 = dLon * dLon + dLat * dLat
+                scanned++
+                if (d2 < 1e-12) return ptV[pi]  // exact hit
+                // Bounded insertion into the K-nearest scratch.
+                if (kept < K) {
+                  bestD2[kept] = d2; bestIdx[kept] = pi; kept++
+                  if (kept === K) {
+                    // Find the worst (largest) once the buffer fills.
+                    worstD2 = -Infinity; worstSlot = 0
+                    for (let m = 0; m < K; m++) if (bestD2[m] > worstD2) { worstD2 = bestD2[m]; worstSlot = m }
+                  }
+                } else if (d2 < worstD2) {
+                  // Replace the current worst, then rescan for the new worst.
+                  bestD2[worstSlot] = d2; bestIdx[worstSlot] = pi
+                  worstD2 = -Infinity
+                  for (let m = 0; m < K; m++) if (bestD2[m] > worstD2) { worstD2 = bestD2[m]; worstSlot = m }
+                }
+              }
             }
           }
-          if (cand.length >= IDW_K || (x0 === 0 && y0 === 0 && x1 === bN - 1 && y1 === bN - 1)) break
+          const coveredAll = (x0 === 0 && y0 === 0 && x1 === bN - 1 && y1 === bN - 1)
+          if (scanned >= K || coveredAll) {
+            // Weighted sum over the kept K-nearest (IDW power 2).
+            let num = 0, den = 0
+            for (let m = 0; m < kept; m++) {
+              const w = 1 / (bestD2[m] + IDW_EPS)
+              num += w * ptV[bestIdx[m]]; den += w
+            }
+            return den > 0 ? num / den : NaN
+          }
+          // else: not enough candidates yet — widen the ring and retry. (Scratch
+          // is rebuilt from scratch next iteration via the `kept`/`worst*`
+          // resets at the top of the loop body.)
         }
-        // Nearest-K by squared distance.
-        let num = 0, den = 0
-        // Partial selection: compute d2 for all candidates, then take K
-        // smallest. Candidate sets are small, so a sort is fine.
-        const scored = cand.map(p => {
-          const dLon = plon - p.lon, dLat = plat - p.lat
-          return { v: p.v, d2: dLon * dLon + dLat * dLat }
-        })
-        scored.sort((a, b) => a.d2 - b.d2)
-        const k = Math.min(IDW_K, scored.length)
-        for (let i = 0; i < k; i++) {
-          const s = scored[i]
-          if (s.d2 < 1e-12) return s.v  // exact hit
-          const w = 1 / (s.d2 + IDW_EPS) // IDW power 2
-          num += w * s.v; den += w
-        }
-        return den > 0 ? num / den : NaN
+        return NaN
       }
 
       // IDW resample onto a GRID x GRID lattice (row 0 = minLat).
-      const values = new Array(GRID * GRID)
+      const values = new Float64Array(GRID * GRID)
       let vMin = Infinity, vMax = -Infinity
       for (let gy = 0; gy < GRID; gy++) {
         const plat = minLat + (gy / (GRID - 1)) * (maxLat - minLat)
@@ -351,6 +441,26 @@
           if (val > vMax) vMax = val
         }
       }
+      return { GRID, minLon, maxLon, minLat, maxLat, values, vMin, vMax }
+    }
+
+    // Shared color-scale resolution: prefer the FIXED global range (whole
+    // forecast lifecycle) so a given value is the same color in every frame
+    // and the legend never shifts; fall back to the frame's own range.
+    function colorScale(vMin, vMax) {
+      const cMin = (globalMin !== null) ? globalMin : vMin
+      const cMax = (globalMax !== null && globalMax > globalMin) ? globalMax : vMax
+      return { cMin, cMax, cSpan: (cMax - cMin) || 1 }
+    }
+
+    // ---- Contour construction ----------------------------------------------
+
+    // Build filled contour polygons (GeoJSON) from a scatter of points
+    // ({lon, lat, v}). Returns { fc, vMin, vMax, units } or null.
+    function buildContours(points) {
+      const field = buildField(points)
+      if (!field) return null
+      const { GRID, minLon, maxLon, minLat, maxLat, values, vMin, vMax } = field
       // If the field is completely flat (e.g. an all-zero accumulation like
       // snowfall with no snow forecast), there are no contours to draw. Emit
       // an empty collection rather than letting d3-contour produce spurious
@@ -363,9 +473,7 @@
       // Color scale: use the FIXED global range (whole forecast lifecycle)
       // when available, so a given temperature is the same color in every
       // frame and the legend never shifts. Fall back to the frame's own range.
-      const cMin = (globalMin !== null) ? globalMin : vMin
-      const cMax = (globalMax !== null && globalMax > globalMin) ? globalMax : vMax
-      const cSpan = (cMax - cMin) || 1
+      const { cMin, cMax, cSpan } = colorScale(vMin, vMax)
 
       // Thresholds are anchored to FIXED absolute values spaced `contourStep`
       // apart (e.g. every 1.0 degree), so a given isoline is always at the
@@ -409,6 +517,67 @@
       return { fc: { type: "FeatureCollection", features: outFeatures }, vMin: cMin, vMax: cMax, units }
     }
 
+    // ---- Heatmap construction ----------------------------------------------
+
+    // Build a continuous intensity wash from the same IDW raster the contours
+    // use, rendered as a raster IMAGE (not GeoJSON polygons). Each raster cell
+    // becomes one pixel in an RGBA canvas: COLOR from the shared ramp, ALPHA
+    // scaling with intensity (transparent below a low-signal floor so quiet
+    // areas show the basemap, like radar reflectivity). MapLibre draws it via
+    // an `image` source with linear resampling, so it's smoothly interpolated
+    // on the GPU — no visible blockiness and no per-feature tessellation.
+    //
+    // Returns { image: {data, width, height}, coordinates, vMin, vMax, units }
+    // where `coordinates` is the image-source corner quad, or null.
+    //
+    // Below this fraction of the color span a pixel is fully transparent, so
+    // light trace values don't haze the whole map.
+    const HEATMAP_FLOOR = 0.04
+    function buildHeatmap(points) {
+      const field = buildField(points)
+      if (!field) return null
+      const { GRID, minLon, maxLon, minLat, maxLat, values, vMin, vMax } = field
+
+      const FLAT_EPS = 1e-9
+      if (!(vMax - vMin > FLAT_EPS)) {
+        return { empty: true, vMin, vMax, units: lastUnits || "" }
+      }
+
+      const { cMin, cMax, cSpan } = colorScale(vMin, vMax)
+
+      // Paint the full-resolution raster: one pixel per grid cell. Row 0 of
+      // `values` is minLat (south), but image rows go top-down (north first),
+      // so we write row gy into image row (GRID-1-gy) to flip vertically.
+      const data = new Uint8ClampedArray(GRID * GRID * 4)
+      for (let gy = 0; gy < GRID; gy++) {
+        const imgRow = (GRID - 1 - gy)
+        for (let gx = 0; gx < GRID; gx++) {
+          const v = values[gy * GRID + gx]
+          const o = (imgRow * GRID + gx) * 4
+          if (!Number.isFinite(v)) { data[o + 3] = 0; continue }
+          const raw = Math.max(0, Math.min(1, (v - cMin) / cSpan))
+          if (raw < HEATMAP_FLOOR) { data[o + 3] = 0; continue }
+          const t = COLOR_BUFFER + raw * (1 - 2 * COLOR_BUFFER)
+          const [r, g, b] = rampRgbAt(t)
+          // Alpha ramps with intensity (sqrt eases the low end up so light
+          // snow is visible), capped below 1 so the basemap faintly shows
+          // through even in the heaviest cells.
+          const alpha = Math.min(0.85, 0.15 + 0.7 * Math.sqrt(raw))
+          data[o] = r; data[o + 1] = g; data[o + 2] = b; data[o + 3] = Math.round(alpha * 255)
+        }
+      }
+
+      // Image-source corner coordinates: [TL, TR, BR, BL] in lng/lat.
+      const coordinates = [
+        [minLon, maxLat], [maxLon, maxLat], [maxLon, minLat], [minLon, minLat],
+      ]
+      const units = lastUnits || ""
+      return {
+        image: { data, width: GRID, height: GRID },
+        coordinates,
+        vMin: cMin, vMax: cMax, units,
+      }
+    }
     // ---- Cursor readout -----------------------------------------------------
     let latestPoints = [], latestUnits = ""
     function sampleAt(plon, plat) {
@@ -425,16 +594,20 @@
     }
 
     map.on("load", async () => {
-      // Contour sources + layers. A faint fill keeps the basemap visible while
-      // strong, opaque borders make the contour structure legible.
+      // Overlay sources + layers. The isoband overlay uses the `contours`
+      // source (faint fill + strong lines). The heatmap overlay uses a raster
+      // `image` source, created lazily on the first heatmap frame (MapLibre
+      // image sources require a valid image + coordinates at creation, so they
+      // can't be pre-created empty) and updated in place thereafter.
       map.addSource("contours", { type: 'geojson', data: { type: "FeatureCollection", features: [] } })
       map.addLayer({
         id: 'contours', type: 'fill', source: 'contours',
+        layout: { visibility: isHeatmap ? 'none' : 'visible' },
         paint: { 'fill-color': ['get', 'fillColor'], 'fill-opacity': 0.03, 'fill-antialias': true }
       })
       map.addLayer({
         id: 'contour-lines', type: 'line', source: 'contours',
-        layout: { 'line-join': 'round' },
+        layout: { 'line-join': 'round', visibility: isHeatmap ? 'none' : 'visible' },
         paint: { 'line-color': ['get', 'fillColor'], 'line-width': 1.6, 'line-opacity': 0.9 }
       })
 
@@ -625,11 +798,16 @@
         // New area: drop the previous area's cached API responses so the
         // client cache doesn't grow unbounded or serve stale frames.
         apiClient.clear()
-        // Clear the old area's contours immediately so stale lines aren't left
-        // on screen while the new area loads.
+        // Clear the old area's overlay immediately so stale geometry isn't
+        // left on screen while the new area loads.
         lastFeatures = []
-        const src = map.getSource("contours")
-        if (src) src.setData({ type: "FeatureCollection", features: [] })
+        if (isHeatmap) {
+          // Blank the raster image if it exists yet (nothing to do otherwise).
+          if (heatReady) showHeatmap({ empty: true })
+        } else {
+          const src = map.getSource("contours")
+          if (src) src.setData({ type: "FeatureCollection", features: [] })
+        }
         showSpinner("Loading data…")
         try {
           await prefetchWithProgress()
@@ -661,10 +839,60 @@
       window.addEventListener("keydown", (e) => { if (e.key === "Escape") hideMenu() })
 
       // ---- Rendering --------------------------------------------------------
-      // Render one frame's points as a contour field. `points` is a flat array
-      // of {lon, lat, v} (produced by normalizeFrame from either wire shape).
-      // `uom` is the frame's unit; when omitted (e.g. a re-render triggered by
-      // a contour-step change) the last known unit is reused.
+
+      // Heatmap raster plumbing. We paint the field into an offscreen canvas
+      // and show it via a MapLibre `image` source (lazily created on first
+      // use, then updated in place). Linear resampling lets the GPU smoothly
+      // interpolate the raster so it doesn't look blocky.
+      const heatCanvas = document.createElement("canvas")
+      const heatCtx = heatCanvas.getContext("2d")
+      let heatReady = false  // true once the image source + layer exist
+      let lastHeatCoords = null  // most recent image corner quad (for blanking)
+
+      function paintHeatImage(info) {
+        const { data, width, height } = info.image
+        if (heatCanvas.width !== width) heatCanvas.width = width
+        if (heatCanvas.height !== height) heatCanvas.height = height
+        heatCtx.putImageData(new ImageData(data, width, height), 0, 0)
+        return heatCanvas.toDataURL()
+      }
+
+      function showHeatmap(info) {
+        // Empty/flat frame: blank the existing image (if any) by uploading a
+        // fully transparent raster at the last known size/coords. Cheaper than
+        // remove/re-add of the source/layer every blank frame.
+        if (info.empty || !info.image) {
+          if (heatReady && lastHeatCoords) {
+            const w = heatCanvas.width || 1, h = heatCanvas.height || 1
+            heatCtx.clearRect(0, 0, w, h)
+            map.getSource("heatmap").updateImage({
+              url: heatCanvas.toDataURL(),
+              coordinates: lastHeatCoords,
+            })
+          }
+          return
+        }
+        const url = paintHeatImage(info)
+        lastHeatCoords = info.coordinates
+        if (!heatReady) {
+          map.addSource("heatmap", { type: "image", url, coordinates: info.coordinates })
+          // Insert ABOVE the basemap but below labels where possible. Simplest
+          // robust placement: add on top (labels in positron are drawn by the
+          // basemap style; the semi-transparent wash keeps them legible).
+          map.addLayer({
+            id: "heatmap", type: "raster", source: "heatmap",
+            paint: { "raster-opacity": 1, "raster-resampling": "linear", "raster-fade-duration": 0 },
+          })
+          heatReady = true
+        } else {
+          map.getSource("heatmap").updateImage({ url, coordinates: info.coordinates })
+        }
+      }
+
+      // Render one frame's points. `points` is a flat array of {lon, lat, v}
+      // (produced by normalizeFrame from either wire shape). `uom` is the
+      // frame's unit; when omitted (e.g. a re-render triggered by a legend
+      // change) the last known unit is reused.
       function renderFeatures(points, uom) {
         lastFeatures = points
         if (uom !== undefined) lastUnits = uom
@@ -676,10 +904,18 @@
         const stepLbl = document.getElementById("stepLabel")
         if (stepLbl) stepLbl.textContent = formatStep(contourStep)
 
-        const info = buildContours(points)
-        if (info) {
-          map.getSource("contours").setData(info.fc)
-          updateLegend(info.vMin, info.vMax, info.units)
+        if (isHeatmap) {
+          const info = buildHeatmap(points)
+          if (info) {
+            showHeatmap(info)
+            updateLegend(info.vMin, info.vMax, info.units)
+          }
+        } else {
+          const info = buildContours(points)
+          if (info) {
+            map.getSource("contours").setData(info.fc)
+            updateLegend(info.vMin, info.vMax, info.units)
+          }
         }
         // Keep the cursor readout and dropped pins in sync with the new
         // frame's data.
@@ -828,22 +1064,32 @@
         return { points: pts, uom: feats.length ? (feats[0].properties.uom || "") : "" }
       }
 
-      // Snap an epoch onto the frame grid (anchored at the window start,
-      // stepped by dt). The cache-fill only ever produces grid-aligned frames,
+      // Snap an epoch onto the frame grid. The grid is anchored at
+      // `forecastStart` (the NOAA spline-intersection start returned by the
+      // range API) and stepped by dt, so the lattice phase is STABLE across
+      // scrubs, dt changes, and window adjustments within a view — a given
+      // instant always maps to the same tick, which is what makes the frame
+      // cache usable. The cache-fill produces only these grid-aligned frames,
       // so loadFrame MUST render grid-aligned times too — otherwise it would
-      // wait on a cache key (an off-grid time) the fill never delivers and hang
-      // forever. `time` is often off-grid initially (now / a URL `t`), so every
-      // render snaps through here.
+      // wait on a cache key the fill never delivers and hang.
+      //
+      // Note: the grid phase is anchored to forecastStart, but the result is
+      // CLAMPED into the active playback window [windowStart, windowEnd]. The
+      // window bounds the playable range; forecastStart fixes the phase.
       function snapToGrid(t) {
+        const anchor = forecastStart !== null ? forecastStart
+                     : (windowStart !== null ? windowStart : null)
         const lo = windowStart !== null ? windowStart
                  : (forecastStart !== null ? forecastStart : null)
         const hi = windowEnd !== null ? windowEnd
                  : (forecastEnd !== null ? forecastEnd : null)
         const step = dt > 0 ? dt : 3600
-        if (lo === null || !Number.isFinite(t)) return t
-        const k = Math.max(0, Math.round((t - lo) / step))
-        let snapped = lo + k * step
-        if (hi !== null && snapped > hi) snapped = lo + Math.floor((hi - lo) / step) * step
+        if (anchor === null || !Number.isFinite(t)) return t
+        let snapped = anchor + Math.round((t - anchor) / step) * step
+        // Clamp into the window on the same lattice (ceil at lo, floor at hi so
+        // the clamped value is still a grid tick).
+        if (lo !== null && snapped < lo) snapped = anchor + Math.ceil((lo - anchor) / step) * step
+        if (hi !== null && snapped > hi) snapped = anchor + Math.floor((hi - anchor) / step) * step
         return snapped
       }
 
@@ -955,17 +1201,23 @@
         const step = dt > 0 ? dt : 3600
         if (lo > hi) return
 
-        // Pivot snapped onto the grid anchored at lo.
-        const anchor = Number.isFinite(fromTime) ? fromTime : time
-        let pivot = lo
-        if (Number.isFinite(anchor)) {
-          const k = Math.max(0, Math.round((anchor - lo) / step))
-          pivot = Math.min(hi, lo + k * step)
-        }
+        // Frame lattice is anchored at forecastStart (NOT lo), matching
+        // snapToGrid, so the pivot and inventory ticks are identical to the
+        // ones loadFrame waits on. The first tick inside the window is the
+        // ceil of lo onto that lattice.
+        const gridAnchor = forecastStart
+        const firstTick = gridAnchor + Math.ceil((lo - gridAnchor) / step) * step
 
-        // Inventory the window grid; collect uncached times.
+        // Pivot: the requested time snapped onto the (forecastStart) lattice
+        // and clamped to the window — reuse snapToGrid so there is exactly one
+        // definition of "which tick".
+        const anchor = Number.isFinite(fromTime) ? fromTime : time
+        const pivot = snapToGrid(Number.isFinite(anchor) ? anchor : lo)
+
+        // Inventory the window grid (forecastStart-anchored); collect uncached
+        // times.
         const uncached = []
-        for (let t = lo; t <= hi; t += step) {
+        for (let t = firstTick; t <= hi; t += step) {
           if (!apiClient.has(frameCacheKey(t))) uncached.push(t)
         }
         if (!uncached.length) return  // whole window already cached
@@ -1508,8 +1760,10 @@
         } else if (dragWhich === "end") {
           windowEnd = Math.min(forecastEnd, Math.max(e, windowStart + MIN_SPAN))
           if (time > windowEnd) time = windowEnd
-        } else { // "time": constrained to [windowStart, windowEnd]
-          time = Math.max(windowStart, Math.min(e, windowEnd))
+        } else { // "time": constrained to [windowStart, windowEnd], snapped
+                 // onto the frame lattice so the playhead lands on a real tick
+                 // (and the frame the fill delivers matches what we display).
+          time = snapToGrid(Math.max(windowStart, Math.min(e, windowEnd)))
         }
         renderScrubber()
         // Debounced frame load so dragging stays responsive.
@@ -1566,6 +1820,16 @@
       // real step is set by applyAutoStep() once the global range arrives.
       document.getElementById("stepLabel").textContent = formatStep(contourStep)
 
+      // The contour-interval control only applies to isobands. In heatmap mode
+      // intensity is continuous (no bands), so hide the whole row to avoid a
+      // dead control.
+      if (isHeatmap) {
+        for (const id of ["contourRowLabel", "stepDown", "stepLabel", "stepUp"]) {
+          const el = document.getElementById(id)
+          if (el) el.style.display = "none"
+        }
+      }
+
       showSpinner("Loading data…")
       loading = true
       try {
@@ -1603,10 +1867,15 @@
         tickRunning = true
         time += dt
         // Loop the animation: once we step past the playback window's end,
-        // jump back to the window start.
+        // jump back to the window start. Snap both the stepped time and the
+        // wrap target onto the frame lattice so `time` never drifts off-grid
+        // (adding dt to an off-grid value would otherwise accumulate phase
+        // error and miss cached frames). snapToGrid clamps to [windowStart,
+        // windowEnd] and returns the first in-window tick at the wrap.
         if (windowEnd !== null && time > windowEnd) {
           time = windowStart !== null ? windowStart : time
         }
+        time = snapToGrid(time)
         try {
           await loadFrame(time)
         } catch (err) {
