@@ -204,22 +204,37 @@ class _DecompBudgetExceeded(Exception):
 
 
 class _Budget:
-    """Shared probe-count budget for one decomposition. `spend(n)` raises
-    _DecompBudgetExceeded once total probes exceed `cap`, so the caller falls
-    back to the plain concurrent bulk scan (which probes exactly total_cells —
-    the decomposition must never make MORE calls than that)."""
-    __slots__ = ("used", "cap", "lock")
+    """Shared budget + progress counter for one decomposition.
+
+    `spend(n)` counts /points PROBES and raises _DecompBudgetExceeded once
+    probes exceed `cap` (so the caller falls back to the plain bulk scan, which
+    probes exactly total_cells — decomposition must never make MORE calls).
+
+    `resolve(n)` counts CELLS that have been resolved — whether by a probe or
+    by a local single-WFO fill (computed, not fetched). `resolved` reaches the
+    area's full cell count as resolution completes, so a caller can report a
+    real "cells resolved / total" progress fraction that includes the locally-
+    computed fills, not just API calls.
+    """
+    __slots__ = ("used", "cap", "lock", "resolved")
 
     def __init__(self, cap):
-        self.used = 0
+        self.used = 0        # /points probes issued
+        self.resolved = 0    # cells resolved (probed OR locally filled)
         self.cap = cap
         self.lock = threading.Lock()
 
     def spend(self, n):
         with self.lock:
             self.used += n
+            self.resolved += n
             if self.used > self.cap:
                 raise _DecompBudgetExceeded(f"probes {self.used} > {self.cap}")
+
+    def fill(self, n):
+        """Count `n` cells resolved by a local single-WFO fill (no API call)."""
+        with self.lock:
+            self.resolved += n
 
 
 def _coord_for_index(i, j, step=None):
@@ -370,6 +385,11 @@ def resolve_area_gridpoints(i0, i1, j0, j1, step=None, memo=None, budget=None,
     if len(wfos) == 1 and not has_gap:
         (wfo,) = wfos
         gps = _fill_single_wfo(wfo, boundary)
+        # The interior cells (everything but the already-counted boundary) are
+        # resolved by LOCAL computation, not an API call — count them toward
+        # progress so the fraction advances on compute, not just probes.
+        if budget is not None:
+            budget.fill(n_i * n_j - len(bidx))
         if _RESOLVE_TIMING:
             logger.warning("%s  SINGLE-WFO %s: %d gridpoints (no interior probe)",
                            indent, wfo, len(gps))
@@ -628,19 +648,23 @@ class CoordinateArea:
 
         return sorted(self.map_coordinates, key=dist2)
 
-    def _resolve_by_decomposition(self):
+    def _resolve_by_decomposition(self, budget=None):
         """Resolve the area's unique gridpoints via recursive single-WFO
         decomposition over the lattice index rectangle. Returns the unique
         gridpoint list, or None if the decomposition exceeds its probe budget
         (pathological fractal border) so the caller falls back to the
-        per-sample scan."""
+        per-sample scan.
+
+        `budget` may be supplied by the caller (e.g. to observe `budget.used`
+        for live progress); one is created if not given."""
         i0, i1, j0, j1 = self.index_bounds
         total_cells = (i1 - i0 + 1) * (j1 - j0 + 1)
-        budget = _Budget(
-            total_cells + 1
-            if ((i1 - i0 + 1) <= RECT_FLOOR or (j1 - j0 + 1) <= RECT_FLOOR)
-            else int(total_cells * DECOMP_BUDGET_FRACTION)
-        )
+        if budget is None:
+            budget = _Budget(
+                total_cells + 1
+                if ((i1 - i0 + 1) <= RECT_FLOOR or (j1 - j0 + 1) <= RECT_FLOOR)
+                else int(total_cells * DECOMP_BUDGET_FRACTION)
+            )
         try:
             gps = resolve_area_gridpoints(i0, i1, j0, j1, budget=budget)
         except _DecompBudgetExceeded as e:
@@ -655,6 +679,78 @@ class CoordinateArea:
                 "of %d cells (%.0f%% fewer than a full scan)",
                 len(gps), budget.used, total_cells, saved)
         return list(gps)
+
+    def iter_resolve_progress(self):
+        """Resolve the area's gridpoints, yielding progress dicts
+        {"done", "total"} as /points are probed, then a final {"gridpoints":
+        [...]} item carrying the resolved list.
+
+        Runs resolution in a background thread and polls the shared probe
+        budget so a long cold resolve streams live progress to the client
+        instead of appearing frozen. `total` is the lattice cell count (an
+        UPPER bound — the decomposition probes fewer), so the bar advances
+        steadily and is snapped to 100% on completion.
+
+        If the area's gridpoint set is already cached, yields it immediately.
+        """
+        cached = self._find_cached_gridpoints()
+        if cached is not None:
+            yield {"done": 1, "total": 1}
+            yield {"gridpoints": list(cached)}
+            return
+
+        i0, i1, j0, j1 = self.index_bounds
+        total_cells = (i1 - i0 + 1) * (j1 - j0 + 1)
+        budget = _Budget(
+            total_cells + 1
+            if ((i1 - i0 + 1) <= RECT_FLOOR or (j1 - j0 + 1) <= RECT_FLOOR)
+            else int(total_cells * DECOMP_BUDGET_FRACTION)
+        )
+
+        result = {}
+
+        def _run():
+            # Mirror iter_gridpoints: try decomposition (observing `budget`),
+            # fall back to the per-sample scan, and populate the caches.
+            gps = None
+            if os.environ.get("WR_WFO_DECOMP", "1") != "0":
+                try:
+                    gps = self._resolve_by_decomposition(budget=budget)
+                except Exception:
+                    logger.warning("decomposition failed; scan fallback",
+                                   exc_info=True)
+                    gps = None
+            if gps is None:
+                gps = list(self.iter_gridpoints())  # scan path (own progress-less)
+            else:
+                with _GRIDPOINTS_LOCK:
+                    _GRIDPOINTS_CACHE[self.signature] = gps
+                if os.environ.get("WR_POLYGON_INDEX", "1") != "0":
+                    try:
+                        index_cached_gridpoints(gps)
+                    except Exception:
+                        pass
+            result["gridpoints"] = gps
+
+        worker = threading.Thread(target=_run, name="resolve-progress", daemon=True)
+        worker.start()
+        # Progress fraction = cells RESOLVED / total cells. A cell is resolved
+        # either by a /points probe OR by a local single-WFO fill (compute, no
+        # API call) — budget.resolved counts both — so this reaches 100% as
+        # resolution completes and reflects the real work, including the
+        # locally-computed fills, not just API calls.
+        yield {"done": 0, "total": total_cells}
+        last = -1
+        while worker.is_alive():
+            worker.join(timeout=0.2)
+            done = min(budget.resolved, total_cells)
+            if done != last:
+                last = done
+                yield {"done": done, "total": total_cells}
+        # Snap to 100% (covers the scan-fallback path, which doesn't touch the
+        # budget, and any off-by-the-pad-ring rounding).
+        yield {"done": total_cells, "total": total_cells}
+        yield {"gridpoints": result.get("gridpoints", [])}
 
     def iter_gridpoints(self):
         """Yield unique NOAA gridpoints for this area, nearest-to-center
@@ -820,15 +916,20 @@ class CoordinateArea:
                 rate, elapsed, remaining,
             )
 
-        # Phase 1: resolve the unique gridpoint set. The decomposition (inside
-        # self.gridpoints) fetches only the /points it actually probes
-        # (boundaries + border splits), NOT the full lattice — so we must NOT
-        # bulk-fetch every /points/{c} here. Progress for this phase is coarse
-        # (resolution is now fast relative to the /gridpoints fetch); we report
-        # a single step.
-        yield {"phase": "points", "done": 0, "total": 1}
-        gridpoints = self.gridpoints  # runs decomposition; fetches probed /points
-        yield {"phase": "points", "done": 1, "total": 1}
+        # Phase 1: resolve the unique gridpoint set, streaming live progress as
+        # /points are probed. The decomposition fetches only the /points it
+        # probes (boundaries + border splits), NOT the full lattice; progress
+        # is reported against the lattice cell count (an upper bound), snapped
+        # to 100% on completion.
+        gridpoints = []
+        _pstate = {"last": 0.0}
+        for prog in self.iter_resolve_progress():
+            if "gridpoints" in prog:
+                gridpoints = prog["gridpoints"]
+                break
+            if _RESOLVE_TIMING:
+                _progress("points", prog["done"], prog["total"], t0, _pstate)
+            yield {"phase": "points", "done": prog["done"], "total": prog["total"]}
         t_points = time.perf_counter()
         t_resolve = t_points  # resolution + /points fetch folded into one phase
 

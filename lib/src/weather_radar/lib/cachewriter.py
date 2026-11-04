@@ -125,42 +125,48 @@ def _is_fresh(cache_file):
 def is_fresh(path):
     """True if the NOAA `path` does NOT need (re)fetching: either its cache
     file exists and is unexpired, OR it's tombstoned as permanently
-    no-coverage (a 404 cell that NOAA will never serve). A pure local disk
-    read (no IPC), so callers can cheaply filter before enqueuing."""
+    no-coverage (a 404 cell that NOAA will never serve) or tombstoned as a
+    recent server error (5xx). A pure local disk read (no IPC), so callers can
+    cheaply filter before enqueuing."""
     _url, _d, cache_file = _tempfile_for(path)
     if _is_fresh(cache_file):
         return True
-    return _is_nocoverage_fresh(cache_file)
+    return _tombstone_valid(cache_file)
 
 
-# How long a no-coverage tombstone is trusted before we re-probe. NOAA office
-# coverage is effectively static, so this is long; a re-probe now and then
-# costs one 404 and refreshes the tombstone.
+# Tombstone TTLs. A 404 (no coverage) is effectively permanent — NOAA office
+# coverage is static — so trust it for a long time (a rare re-probe costs one
+# 404). A 5xx is a transient-ish NOAA server error on a specific resource;
+# trust it only briefly so we retry soon once NOAA recovers, but not on EVERY
+# pass (which spammed retries + tracebacks).
 NOCOVERAGE_TTL_SEC = 7 * 24 * 3600
+SERVERERROR_TTL_SEC = 10 * 60
 
 
-def _nocoverage_file(cache_file):
-    return cache_file + ".nocov"
+def _tombstone_file(cache_file):
+    return cache_file + ".tombstone"
 
 
-def _write_nocoverage(path):
-    """Tombstone a path as permanently no-coverage (404). Best-effort."""
+def _write_tombstone(path, ttl):
+    """Record that `path` should NOT be re-fetched for `ttl` seconds (a 404 or
+    persistent 5xx). Stores expiry epoch. Best-effort."""
     _url, d, cache_file = _tempfile_for(path)
     try:
         os.makedirs(d, exist_ok=True)
-        with open(_nocoverage_file(cache_file), "w") as f:
-            f.write(str(time.time()))
+        with open(_tombstone_file(cache_file), "w") as f:
+            f.write(str(time.time() + ttl))
     except OSError:
         pass
 
 
-def _is_nocoverage_fresh(cache_file):
-    """True if a no-coverage tombstone exists and is within its TTL."""
+def _tombstone_valid(cache_file):
+    """True if a tombstone exists and its stored expiry is still in the future."""
     try:
-        ts = os.path.getmtime(_nocoverage_file(cache_file))
-    except OSError:
+        with open(_tombstone_file(cache_file)) as f:
+            expiry = float(f.read().strip())
+    except (OSError, ValueError):
         return False
-    return (time.time() - ts) < NOCOVERAGE_TTL_SEC
+    return time.time() < expiry
 
 
 def not_fresh(paths):
@@ -178,6 +184,11 @@ def _retry_time(attempt):
 class _NoCoverage(Exception):
     """NOAA 404 for a path it can't serve (point/cell past coverage). Expected
     during gridpoint-walk edge probing — NOT an error to log loudly."""
+
+
+class _ServerError(Exception):
+    """Persistent NOAA 5xx for a specific resource (seen: /gridpoints 500 on
+    certain cells). Tombstoned briefly so it isn't retried every pass."""
 
 
 def _retry_get(session, url, retries=6, attempt=0):
@@ -208,6 +219,13 @@ def _retry_get(session, url, retries=6, attempt=0):
     if resp.status_code == 404:
         raise _NoCoverage(url)
     if not retries:
+        # Exhausted retries. A persistent 5xx is a NOAA-side error on this
+        # specific resource (seen: /gridpoints 500 on certain cells); surface
+        # it as a recognizable exception so _fetch_one can tombstone it briefly
+        # and NOT retry it every pass (which spammed tracebacks). Other codes
+        # keep the old raise_for_status behavior.
+        if 500 <= resp.status_code < 600:
+            raise _ServerError(f"{resp.status_code} from {url}")
         resp.raise_for_status()
         raise RuntimeError(f"NWS unresponsive: {url}")
     # Rate limiting. NOAA usually signals this with 429 (+ Retry-After), but
@@ -263,12 +281,12 @@ class _Writer:
         fresh on disk when we return (already-fresh or newly written), False
         if the fetch failed. Safe to call concurrently for different paths."""
         url, d, cache_file = _tempfile_for(path)
-        if _is_fresh(cache_file):
+        if _is_fresh(cache_file) or _tombstone_valid(cache_file):
             return True
         lk = self._lock_for(url)
         with lk:
             # Re-check inside the lock (another thread may have just written).
-            if _is_fresh(cache_file):
+            if _is_fresh(cache_file) or _tombstone_valid(cache_file):
                 return True
             try:
                 resp = _retry_get(self._session, url)
@@ -288,21 +306,29 @@ class _Writer:
                 # freshness check (_is_fresh) is a cheap os.stat instead of a
                 # JSON parse of this (large) doc. Best-effort.
                 _stamp_expiry(cache_file, payload["headers"].get("Expires"))
-                # Clear any stale no-coverage tombstone (coverage returned).
+                # Clear any stale tombstone (the resource is serving again).
                 try:
-                    os.unlink(_nocoverage_file(cache_file))
+                    os.unlink(_tombstone_file(cache_file))
                 except OSError:
                     pass
                 return True
             except _NoCoverage:
                 # Permanent: this cell/point is past NOAA's coverage (the
                 # index-box fill / grid-edge walk can over-include cells an
-                # office doesn't actually have). NOAA will keep 404ing it, so
-                # write a tombstone and stop re-fetching it every pass —
-                # otherwise these phantom edges show as "need fetch" forever and
-                # burn a fetch+backoff on each prefetch.
-                _write_nocoverage(path)
+                # office doesn't actually have). NOAA keeps 404ing it, so
+                # tombstone it (long TTL) and stop re-fetching every pass —
+                # otherwise these phantom edges show as "need fetch" forever.
+                _write_tombstone(path, NOCOVERAGE_TTL_SEC)
                 logger.debug("cachewriter: no coverage for %s (tombstoned)", path)
+                return False
+            except _ServerError as e:
+                # Transient-ish NOAA 5xx on a specific resource. Tombstone
+                # briefly (short TTL) so we retry soon once NOAA recovers but
+                # don't hammer it (and spam tracebacks) every pass. Logged at
+                # WARNING WITHOUT a traceback — it's a NOAA-side error, not ours.
+                _write_tombstone(path, SERVERERROR_TTL_SEC)
+                logger.warning("cachewriter: NOAA server error for %s (%s); "
+                               "tombstoned %ds", path, e, SERVERERROR_TTL_SEC)
                 return False
             except Exception:
                 logger.warning("cachewriter failed to cache %s", path, exc_info=True)

@@ -234,15 +234,17 @@
       positionSpinnerOverArea()
     }
     function hideSpinner() { spinnerEl.style.display = "none" }
-    // Show a per-phase completed/total fraction, e.g. "Resolving grid… 12 / 48"
-    // then "Fetching data… 30 / 46". Points and gridpoints are counted
-    // separately.
+    // Progress label. With a known total (e.g. the /gridpoints fetch) show a
+    // "done / total" fraction. With total=0 (gridpoint RESOLUTION, whose total
+    // is indeterminate) show just the running count — "Resolving grid… 4454" —
+    // so there's visible motion without a misleading percentage. With no
+    // count at all, show the bare label.
     const PHASE_LABELS = { points: "Resolving grid", gridpoints: "Fetching data" }
     function setSpinnerProgress(phase, done, total) {
       const label = PHASE_LABELS[phase] || "Loading"
-      spinnerTextEl.textContent = total
-        ? `${label}… ${done} / ${total}`
-        : `${label}…`
+      if (total) spinnerTextEl.textContent = `${label}… ${done} / ${total}`
+      else if (done) spinnerTextEl.textContent = `${label}… ${done}`
+      else spinnerTextEl.textContent = `${label}…`
     }
 
     // ---- Color ramp ---------------------------------------------------------
@@ -1567,7 +1569,14 @@
         // The frame grid changed; recompute the cache fill for the new dt's
         // times (cached instants that overlap are reused via the shared
         // dt-independent key — this is exactly the batch+sequence case).
-        fillCache()
+        //
+        // DEBOUNCED: rapid +/- presses would otherwise each kick off a
+        // fillCache — building the (potentially large) uncached inventory and
+        // firing a stream — making the buttons feel laggy. The label and URL
+        // above update instantly on every press; only the last dt (after a
+        // short quiet period) triggers the actual fill.
+        if (setDt._fillTimer) clearTimeout(setDt._fillTimer)
+        setDt._fillTimer = setTimeout(() => { setDt._fillTimer = null; fillCache() }, 200)
       }
       function stepDt(dir) {
         // Move to the neighboring preset (dir = +1 bigger, -1 smaller).
