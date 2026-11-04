@@ -211,12 +211,27 @@
     // for the current zoom/latitude (e.g. 1 km, 500 m).
     map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "bottom-left")
 
+    // Keep the loading spinner pinned over the area center as the map moves.
+    map.on("move", () => positionSpinnerOverArea())
+
     // ---- Spinner ------------------------------------------------------------
     const spinnerEl = document.getElementById("spinner")
     const spinnerTextEl = document.getElementById("spinnerText")
+    // Keep the spinner pinned over the CENTER OF THE AREA being loaded (the
+    // geographic center lat/lon), not the viewport center — so if the user
+    // pans/zooms while data loads, the spinner stays on the loading region.
+    function positionSpinnerOverArea() {
+      if (spinnerEl.style.display === "none") return
+      // Only called after the map exists (from showSpinner during load and
+      // the map 'move' handler), so `map` is always initialized here.
+      const p = map.project([lon, lat])
+      spinnerEl.style.left = `${p.x}px`
+      spinnerEl.style.top = `${p.y}px`
+    }
     function showSpinner(msg) {
       spinnerTextEl.textContent = msg || "Loading data…"
       spinnerEl.style.display = "block"
+      positionSpinnerOverArea()
     }
     function hideSpinner() { spinnerEl.style.display = "none" }
     // Show a per-phase completed/total fraction, e.g. "Resolving grid… 12 / 48"

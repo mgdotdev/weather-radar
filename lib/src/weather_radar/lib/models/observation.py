@@ -9,7 +9,7 @@ from scipy import interpolate
 
 from weather_radar.lib.area import CoordinateArea, MapCoordinate, NOAAGridpoint, gridpoint_from_map_coordinate
 from ..connection import NOAAConnection
-from .utils import BoundsError, to_camel_case
+from .utils import BoundsError, to_camel_case, clamp_value
 
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,7 @@ class ObservationModel:
             raise BoundsError
         t = (time - start_time).total_seconds()
         y = f(t).item()
+        y = clamp_value(self.attribute, y)
         if verbose:
             return {
                 "type": "Feature",
@@ -233,7 +234,7 @@ class ObservationEnsemble:
                 continue
             for i in range(samples + 1):
                 t = total * i / samples
-                y = f(t).item()
+                y = clamp_value(self.attribute, f(t).item())
                 if vmin is None or y < vmin:
                     vmin = y
                 if vmax is None or y > vmax:

@@ -30,8 +30,9 @@ import queue
 import logging
 import threading
 import tempfile
+import time
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timezone
 from multiprocessing.managers import BaseManager
 
 import requests
@@ -69,25 +70,97 @@ def _tempfile_for(path):
     return url, d, os.path.join(d, "data.json")
 
 
+def _stamp_expiry(cache_file, expires_header):
+    """Set `cache_file`'s mtime to its NOAA `Expires` time so freshness checks
+    are a cheap os.stat (see _is_fresh). Best-effort; a missing/unparseable
+    header leaves mtime at the write time (which _is_fresh handles via its
+    JSON fallback)."""
+    if not expires_header:
+        return
+    try:
+        exp = datetime.strptime(expires_header, "%a, %d %b %Y %H:%M:%S %Z")
+        ts = exp.replace(tzinfo=timezone.utc).timestamp()
+        os.utime(cache_file, (ts, ts))
+    except Exception:
+        pass
+
+
 def _is_fresh(cache_file):
-    """True if the cache file exists and its stored Expires is still in the
-    future. A missing/!unreadable/undated file is treated as not fresh."""
+    """True if the cache file exists and is unexpired.
+
+    Fast path: the writer sets each file's MTIME to its NOAA `Expires` time
+    (see _fetch_one), so freshness is a single os.stat — no read/parse. This
+    matters a lot: an area can have thousands of cached /gridpoints docs (each
+    large), and checking them all by parsing JSON dominated prefetch/model-
+    switch time. Falls back to parsing the stored Expires header for files
+    written before this optimization (mtime not yet meaningful)."""
+    try:
+        mtime = os.path.getmtime(cache_file)
+    except OSError:
+        return False
+    # mtime == expiry epoch. A file whose mtime is in the future is fresh.
+    if mtime >= time.time():
+        return True
+    # Legacy/ambiguous: mtime in the past could mean "expired" OR "written
+    # before we set mtime=expiry" (where mtime is the write time). Parse the
+    # stored Expires to be sure, and (cheaply) correct the mtime for next time.
     try:
         with open(cache_file, "r") as f:
             body = json.loads(f.read())
         expires = body["headers"]["Expires"]
         exp = datetime.strptime(expires, "%a, %d %b %Y %H:%M:%S %Z")
-        return exp >= datetime.now()
+        fresh = exp >= datetime.now()
+        if fresh:
+            # Repair mtime so future checks hit the fast path.
+            try:
+                ts = exp.replace(tzinfo=timezone.utc).timestamp()
+                os.utime(cache_file, (ts, ts))
+            except OSError:
+                pass
+        return fresh
     except Exception:
         return False
 
 
 def is_fresh(path):
-    """True if the NOAA `path`'s cache file exists and is unexpired. A pure
-    local disk read (no IPC), so callers can cheaply filter out paths that
-    don't need the writer before enqueuing."""
+    """True if the NOAA `path` does NOT need (re)fetching: either its cache
+    file exists and is unexpired, OR it's tombstoned as permanently
+    no-coverage (a 404 cell that NOAA will never serve). A pure local disk
+    read (no IPC), so callers can cheaply filter before enqueuing."""
     _url, _d, cache_file = _tempfile_for(path)
-    return _is_fresh(cache_file)
+    if _is_fresh(cache_file):
+        return True
+    return _is_nocoverage_fresh(cache_file)
+
+
+# How long a no-coverage tombstone is trusted before we re-probe. NOAA office
+# coverage is effectively static, so this is long; a re-probe now and then
+# costs one 404 and refreshes the tombstone.
+NOCOVERAGE_TTL_SEC = 7 * 24 * 3600
+
+
+def _nocoverage_file(cache_file):
+    return cache_file + ".nocov"
+
+
+def _write_nocoverage(path):
+    """Tombstone a path as permanently no-coverage (404). Best-effort."""
+    _url, d, cache_file = _tempfile_for(path)
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(_nocoverage_file(cache_file), "w") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
+
+
+def _is_nocoverage_fresh(cache_file):
+    """True if a no-coverage tombstone exists and is within its TTL."""
+    try:
+        ts = os.path.getmtime(_nocoverage_file(cache_file))
+    except OSError:
+        return False
+    return (time.time() - ts) < NOCOVERAGE_TTL_SEC
 
 
 def not_fresh(paths):
@@ -211,11 +284,25 @@ class _Writer:
                 finally:
                     if os.path.exists(tmp):
                         os.unlink(tmp)
+                # Stamp the file's mtime with its NOAA Expires time so the
+                # freshness check (_is_fresh) is a cheap os.stat instead of a
+                # JSON parse of this (large) doc. Best-effort.
+                _stamp_expiry(cache_file, payload["headers"].get("Expires"))
+                # Clear any stale no-coverage tombstone (coverage returned).
+                try:
+                    os.unlink(_nocoverage_file(cache_file))
+                except OSError:
+                    pass
                 return True
             except _NoCoverage:
-                # Expected: this cell/point is past NOAA's coverage (the walk
-                # probes grid edges). Not an error — write nothing, no trace.
-                logger.debug("cachewriter: no coverage for %s (expected edge)", path)
+                # Permanent: this cell/point is past NOAA's coverage (the
+                # index-box fill / grid-edge walk can over-include cells an
+                # office doesn't actually have). NOAA will keep 404ing it, so
+                # write a tombstone and stop re-fetching it every pass —
+                # otherwise these phantom edges show as "need fetch" forever and
+                # burn a fetch+backoff on each prefetch.
+                _write_nocoverage(path)
+                logger.debug("cachewriter: no coverage for %s (tombstoned)", path)
                 return False
             except Exception:
                 logger.warning("cachewriter failed to cache %s", path, exc_info=True)
