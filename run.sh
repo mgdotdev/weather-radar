@@ -17,6 +17,7 @@ container() {
       -v /etc/localtime:/etc/localtime:ro \
       -e LOG_LEVEL \
       -e WR_STREAM_TIMING \
+      -e WR_RESOLVE_TIMING \
       -e NOAA_MAX_CONCURRENCY \
       "$IMAGE" bash
 }
@@ -36,6 +37,7 @@ server() {
           -v /etc/localtime:/etc/localtime:ro \
           -e LOG_LEVEL \
           -e WR_STREAM_TIMING \
+          -e WR_RESOLVE_TIMING \
           -e NOAA_MAX_CONCURRENCY \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh server $workers"
     else
@@ -63,6 +65,7 @@ dev() {
           -v /etc/localtime:/etc/localtime:ro \
           -e LOG_LEVEL \
           -e WR_STREAM_TIMING \
+          -e WR_RESOLVE_TIMING \
           -e NOAA_MAX_CONCURRENCY \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh dev"
     else

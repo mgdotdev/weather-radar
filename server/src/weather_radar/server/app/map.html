@@ -103,6 +103,7 @@
         box-shadow: 0 2px 8px rgba(0,0,0,0.25); font-family: sans-serif;
         font-size: 13px; color: #222; overflow: hidden; min-width: 160px;">
       <div id="ctxCenterHere" style="padding: 8px 12px; cursor: pointer;">Center map here</div>
+      <div id="ctxCaptureArea" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Capture area</div>
       <div id="ctxDropPin" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Drop pin here</div>
       <div id="ctxSeeGraph" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">See graph</div>
       <div id="ctxCoords" style="padding: 6px 12px; font-size: 11px;
@@ -747,13 +748,22 @@
         hideMenu()
         window.open(u.toString(), "_blank")
       })
-      document.getElementById("ctxCenterHere").addEventListener("click", async () => {
-        if (!menuLngLat) return
-        lat = menuLngLat.lat
-        lon = menuLngLat.lng
-        hideMenu()
+      // Shared reload for both "Center map here" and "Capture area". It sizes
+      // the measured area to the current viewport and reloads the data, color
+      // range, and playback window for it. When `recenter` is a {lat, lon} the
+      // map pans there first and that point becomes the new area center;
+      // otherwise ("Capture area") the current map center/view is used as-is.
+      async function loadArea({ recenter = null } = {}) {
+        if (recenter) {
+          lat = recenter.lat
+          lon = recenter.lon
+        } else {
+          const c = map.getCenter()
+          lat = c.lat
+          lon = c.lng
+        }
 
-        // Centering moves to a new area, so existing pins no longer apply.
+        // Moving to a new area invalidates existing pins.
         clearPins()
 
         // Size the fetched area to the current viewport so the contour field
@@ -765,9 +775,10 @@
         width = Math.abs(b.getEast() - b.getWest()) * 110.574
         height = Math.abs(b.getNorth() - b.getSouth()) * (111.320 * Math.cos(lat * Math.PI / 180))
 
-        // Pan to the new center (keep current zoom) and sync the URL in place
-        // — no page reload.
-        map.easeTo({ center: [lon, lat], duration: 500 })
+        // Pan to the new center when recentering (keep current zoom); "Capture
+        // area" keeps the current view. Either way, sync the URL in place — no
+        // page reload.
+        if (recenter) map.easeTo({ center: [lon, lat], duration: 500 })
         const u = new URL(window.location.href)
         u.searchParams.set("lat", lat.toFixed(6))
         u.searchParams.set("lon", lon.toFixed(6))
@@ -816,7 +827,7 @@
           showSpinner("Rendering…")
           await loadFrame(time)
         } catch (err) {
-          console.error("re-center load failed:", err)
+          console.error("area load failed:", err)
         } finally {
           loading = false
           hideSpinner()
@@ -833,6 +844,18 @@
         }
         // Stream the new area's window into the cache in the background.
         fillCache()
+      }
+      document.getElementById("ctxCenterHere").addEventListener("click", () => {
+        if (!menuLngLat) return
+        const target = { lat: menuLngLat.lat, lon: menuLngLat.lng }
+        hideMenu()
+        loadArea({ recenter: target })
+      })
+      // "Capture area": make the current map view the area to measure (keep
+      // the current center, size the area to the viewport).
+      document.getElementById("ctxCaptureArea").addEventListener("click", () => {
+        hideMenu()
+        loadArea()
       })
       map.on("click", hideMenu)
       map.on("movestart", hideMenu)

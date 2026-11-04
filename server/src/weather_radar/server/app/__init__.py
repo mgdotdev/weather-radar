@@ -75,6 +75,16 @@ _RAMP_TEAL = [
     0.75, "rgb(44, 127, 184)",
     1.0, "rgb(8, 64, 129)",
 ]
+# Cloud-shading ramp for sky cover: a near-white haze at low cover deepening
+# to a flat overcast grey. Rendered as a heatmap wash (opacity scales with
+# cover) so it reads like cloud shadow over the basemap rather than banded
+# contour zones.
+_RAMP_CLOUD = [
+    0.0, "rgb(245, 245, 245)",
+    0.5, "rgb(180, 182, 186)",
+    1.0, "rgb(110, 112, 118)",
+]
+
 # Neutral sequential ramp (light grey -> deep purple) used for any layer
 # without a bespoke ramp, so every model still renders legibly.
 _RAMP_NEUTRAL = [
@@ -173,6 +183,11 @@ _CUSTOM_STYLE = {
     "precipitation-rate": {"contour_step": 0.1, "color_ramp": _RAMP_TEAL, "render": _RENDER_HEATMAP},
     "snowfall-rate": {"contour_step": 0.5, "color_ramp": _RAMP_BLUES, "render": _RENDER_HEATMAP},
     "ice-accumulation-rate": {"contour_step": 0.1, "color_ramp": _RAMP_BLUES, "render": _RENDER_HEATMAP},
+    # Sky cover (0-100% cloud): a grey heatmap wash whose opacity scales with
+    # cover reads like cloud shadow over the basemap, rather than contour bands
+    # that imply hard cloud edges. Seed step of 10% ~= one okta; auto-scaling
+    # refines it.
+    "sky-cover": {"contour_step": 10.0, "color_ramp": _RAMP_CLOUD, "render": _RENDER_HEATMAP},
 }
 
 _DEFAULT_STYLE = {"contour_step": 1.0, "color_ramp": _RAMP_NEUTRAL}

@@ -50,9 +50,24 @@ class _Session:
         self._status = status_code
         self._body = body
 
-    def get(self, url):
+    def get(self, url, timeout=None):
         self.calls += 1
         return _Resp(self._status, body=self._body)
+
+
+class _FlakySession:
+    """Raises a transient error for the first `fail_times` calls, then returns
+    200. Models a brief DNS/connection blip."""
+    def __init__(self, fail_times, exc):
+        self.calls = 0
+        self._fail_times = fail_times
+        self._exc = exc
+
+    def get(self, url, timeout=None):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise self._exc
+        return _Resp(200, body={"ok": True})
 
 
 class TestRetryGet404:
@@ -68,6 +83,41 @@ class TestRetryGet404:
         resp = retry_get(session, "https://api.weather.gov/points/47.6,-116.7")
         assert resp.status_code == 200
         assert session.calls == 1
+
+
+class TestRetryGetTransient:
+    def test_dns_blip_is_retried(self, monkeypatch):
+        import weather_radar.lib.connection as conn
+        import requests
+        # Don't actually sleep through the backoff.
+        monkeypatch.setattr(conn.time, "sleep", lambda s: None)
+        # Fail twice with a DNS/connection error, then succeed.
+        err = requests.exceptions.ConnectionError("name resolution failed")
+        session = _FlakySession(fail_times=2, exc=err)
+        resp = retry_get(session, "https://api.weather.gov/gridpoints/MSO/58,132")
+        assert resp.status_code == 200
+        assert session.calls == 3  # 2 failures + 1 success
+
+    def test_timeout_is_retried(self, monkeypatch):
+        import weather_radar.lib.connection as conn
+        import requests
+        monkeypatch.setattr(conn.time, "sleep", lambda s: None)
+        err = requests.exceptions.Timeout("read timed out")
+        session = _FlakySession(fail_times=1, exc=err)
+        resp = retry_get(session, "https://api.weather.gov/points/47.6,-116.7")
+        assert resp.status_code == 200
+        assert session.calls == 2
+
+    def test_persistent_connection_error_eventually_raises(self, monkeypatch):
+        import weather_radar.lib.connection as conn
+        import requests
+        monkeypatch.setattr(conn.time, "sleep", lambda s: None)
+        err = requests.exceptions.ConnectionError("down")
+        session = _FlakySession(fail_times=999, exc=err)
+        with pytest.raises(Exception):
+            retry_get(session, "https://api.weather.gov/points/47.6,-116.7")
+        # Exhausts the retry ladder (6 retries): bounded, doesn't loop forever.
+        assert session.calls <= 8
 
 
 class TestGridpointResolution:

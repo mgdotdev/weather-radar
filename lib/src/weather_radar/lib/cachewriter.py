@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # Max simultaneous NOAA requests the writer makes. We respect 429/Retry-After
 # (see _retry_get) so this can be generous — NOAA throttles us if we overdo it
 # and we back off automatically. Kept in sync with area.NOAA_MAX_CONCURRENCY.
-MAX_CONCURRENCY = int(os.environ.get("NOAA_MAX_CONCURRENCY", "8"))
+MAX_CONCURRENCY = int(os.environ.get("NOAA_MAX_CONCURRENCY", "48"))
 
 # Address + auth for the manager socket. A TCP loopback address keeps this
 # working across fork/spawn and is trivial to connect to from worker procs.
@@ -112,25 +112,45 @@ def _retry_get(session, url, retries=6, attempt=0):
     connection.retry_get but lives in the writer so all network writes share
     one implementation."""
     import time as _time
-    resp = session.get(url)
+    # Transient network failures (DNS hiccup, connection refused/reset, read
+    # timeout) raise before a response exists. Retry with backoff rather than
+    # letting a brief blip permanently drop a path from the cache.
+    try:
+        resp = session.get(url, timeout=30)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        if not retries:
+            raise RuntimeError(f"NWS unreachable: {url}") from e
+        logger.warning(
+            "cachewriter transient error (%s); backing off %ss: %s",
+            type(e).__name__, _retry_time(attempt), url,
+        )
+        _time.sleep(_retry_time(attempt))
+        return _retry_get(session, url, retries - 1, attempt + 1)
+
     if resp.status_code == 200:
         return resp
     # Permanent no-coverage (NOAA 404): never retry. Fail fast with a
     # recognizable exception so _fetch_one can treat it as an expected miss
-    # (no traceback) — the walk deliberately probes cells past the grid edge,
-    # so 404s here are normal, not errors.
+    # (no traceback) — points/cells outside NOAA coverage return 404 normally.
     if resp.status_code == 404:
         raise _NoCoverage(url)
     if not retries:
         resp.raise_for_status()
         raise RuntimeError(f"NWS unresponsive: {url}")
-    if resp.status_code == 429:
+    # Rate limiting. NOAA usually signals this with 429 (+ Retry-After), but
+    # under a sustained burst it may instead return 403 Forbidden — same cause,
+    # so treat it the same: honor Retry-After if present, else back off
+    # exponentially, rather than burning short retries against an active block.
+    if resp.status_code in (429, 403):
         ra = resp.headers.get("Retry-After")
         try:
             wait = float(ra)
         except (TypeError, ValueError):
             wait = _retry_time(attempt)
-        logger.warning("cachewriter 429; backing off %ss: %s", wait, url)
+        logger.warning(
+            "cachewriter %s throttled; backing off %ss: %s",
+            resp.status_code, wait, url,
+        )
         _time.sleep(wait)
     else:
         _time.sleep(_retry_time(attempt))

@@ -3,9 +3,19 @@ import concurrent.futures
 import multiprocessing
 import threading
 import math
+import logging
+import time
 from functools import cached_property
 
 from .connection import NOAAConnection, PathObj, get_and_write, NoCoverageError
+
+logger = logging.getLogger(__name__)
+
+# When set, log per-phase timing of an area's cold resolve+cache (points warm,
+# gridpoint resolution, gridpoints fetch) at WARNING, so we can measure where
+# large-area load time actually goes and tune NOAA_MAX_CONCURRENCY. Off by
+# default.
+_RESOLVE_TIMING = bool(os.environ.get("WR_RESOLVE_TIMING"))
 
 lock = multiprocessing.Lock()
 
@@ -13,7 +23,7 @@ lock = multiprocessing.Lock()
 # rate limits and returns HTTP 429 when overwhelmed; we respect 429/Retry-After
 # (see connection.retry_get) so this ceiling can be fairly generous — if we
 # push too hard NOAA throttles and we automatically back off. Env-overridable.
-NOAA_MAX_CONCURRENCY = int(os.environ.get("NOAA_MAX_CONCURRENCY", "8"))
+NOAA_MAX_CONCURRENCY = int(os.environ.get("NOAA_MAX_CONCURRENCY", "48"))
 
 # Spacing (km) between sample coordinates when resolving an area's gridpoints.
 # NOAA forecast gridpoints are ~2.5km cells, so sampling finer than this just
@@ -40,6 +50,110 @@ CACHE_SNAP_KM = 1.0
 # avoids repeating that work on every poll.
 _GRIDPOINTS_CACHE: dict[tuple, list] = {}
 _GRIDPOINTS_LOCK = threading.Lock()
+
+
+# --- Cached-polygon spatial index -------------------------------------------
+# Every /gridpoints doc we've already fetched carries the cell's polygon. Those
+# polygons tile space, so a map that moves slightly reveals sample coordinates
+# that often fall inside a gridpoint we ALREADY have cached. This index lets us
+# resolve such a sample locally (point-in-polygon) instead of issuing a /points
+# call. It only REUSES already-fetched docs — it never fetches extra data — so
+# it strictly reduces work.
+#
+# Structure: coarse lat/lon bucket -> list of (NOAAGridpoint, polygon_ring).
+# A sample is tested against its bucket (and the 8 neighbors, since a polygon
+# may straddle a bucket edge). Buckets are populated lazily from the on-disk
+# /gridpoints cache and augmented as new docs are read.
+_POLY_INDEX_BUCKET_DEG = 0.25  # ~25-28 km cells; a handful of gridpoints each
+_POLY_INDEX: dict[tuple, list] = {}
+_POLY_INDEX_LOCK = threading.Lock()
+# Gridpoints already registered in the index this process, so repeat resolves
+# don't re-read their (large) /gridpoints docs from disk just to re-index.
+_POLY_INDEXED_GPS: set = set()
+
+
+def _poly_bucket(lon, lat):
+    return (math.floor(lon / _POLY_INDEX_BUCKET_DEG),
+            math.floor(lat / _POLY_INDEX_BUCKET_DEG))
+
+
+def _ring_centroid(ring):
+    pts = ring[:-1] if len(ring) > 1 and ring[0] == ring[-1] else ring
+    n = len(pts)
+    return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
+
+
+def _point_in_ring(lon, lat, ring):
+    """Ray-casting point-in-polygon for a ring of [lon,lat] corners."""
+    pts = ring[:-1] if len(ring) > 1 and ring[0] == ring[-1] else ring
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        if (y1 > lat) != (y2 > lat):
+            xint = x1 + (lat - y1) * (x2 - x1) / (y2 - y1)
+            if lon < xint:
+                inside = not inside
+    return inside
+
+
+def register_gridpoint_polygon(gp, ring):
+    """Add a resolved (gridpoint, polygon) to the index, keyed by the polygon's
+    centroid bucket. No-op if already indexed."""
+    try:
+        clon, clat = _ring_centroid(ring)
+    except Exception:
+        return
+    b = _poly_bucket(clon, clat)
+    with _POLY_INDEX_LOCK:
+        if gp in _POLY_INDEXED_GPS:
+            return
+        _POLY_INDEX.setdefault(b, []).append((gp, ring))
+        _POLY_INDEXED_GPS.add(gp)
+
+
+def _ring_from_cached_gridpoint(gp):
+    """Read a cached /gridpoints doc's polygon ring from disk, or None if the
+    doc isn't cached / is unreadable. Reads the whole doc but only extracts the
+    geometry — cheap relative to a network fetch, and only done once per gp."""
+    try:
+        path = PathObj(f"/gridpoints/{gp}")
+        if not os.path.isfile(path.tempfile):
+            return None
+        with open(path.tempfile) as f:
+            doc = json.loads(f.read())
+        return doc["json"]["geometry"]["coordinates"][0]
+    except Exception:
+        return None
+
+
+def index_cached_gridpoints(gridpoints):
+    """Register each gridpoint's polygon (from its cached doc) into the spatial
+    index, so later nearby views can resolve samples locally. Best-effort:
+    gridpoints whose doc isn't cached are skipped. Gridpoints already indexed
+    this process are skipped WITHOUT a disk read (the expensive part), so a
+    repeat resolve doesn't re-parse thousands of large /gridpoints docs."""
+    for gp in gridpoints:
+        if gp in _POLY_INDEXED_GPS:
+            continue  # already indexed; don't re-read the doc
+        ring = _ring_from_cached_gridpoint(gp)
+        if ring is not None:
+            register_gridpoint_polygon(gp, ring)
+
+
+def lookup_gridpoint_in_index(lon, lat):
+    """Return a cached NOAAGridpoint whose polygon contains (lon,lat), or None.
+    Checks the point's bucket and its 8 neighbors (a polygon may straddle a
+    bucket boundary)."""
+    bx, by = _poly_bucket(lon, lat)
+    with _POLY_INDEX_LOCK:
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for gp, ring in _POLY_INDEX.get((bx + dx, by + dy), ()):
+                    if _point_in_ring(lon, lat, ring):
+                        return gp
+    return None
 
 
 class Coordinate:
@@ -215,36 +329,79 @@ class CoordinateArea:
 
         coordinates = self.coordinates_by_proximity
 
-        # Pre-warm ALL /points lookups in a single batched writer job, rather
-        # than letting each gridpoint_from_map_coordinate() trigger its own
-        # per-path writer round-trip. The writer fetches them concurrently;
-        # afterwards every /points read below is a fast local cache hit. This
-        # turns N blocking IPC round-trips into one.
-        try:
-            from .cachewriter import ensure as _ensure_cached
-            _ensure_cached([f"/points/{c}" for c in coordinates])
-        except Exception:
-            # Writer unavailable: fall back to resolving inline (each call
-            # fetches on miss via connection's inline fallback).
-            pass
-
         seen = set()
         ordered = []
-        # With /points warmed, resolve gridpoints. The thread pool keeps this
-        # fast even though each call is now just a cache read; dedupe since
-        # adjacent samples often map to the same gridpoint.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=NOAA_MAX_CONCURRENCY) as executor:
-            for gp in executor.map(gridpoint_from_map_coordinate, coordinates):
-                if gp is None:
-                    continue  # out-of-coverage sample (e.g. across the border)
-                if gp in seen:
-                    continue
+
+        def _emit(gp):
+            if gp not in seen:
                 seen.add(gp)
                 ordered.append(gp)
-                yield gp
+                return True
+            return False
+
+        # Pass 1: resolve what we can WITHOUT the network, in priority order:
+        #   (a) the on-disk /points cache — the AUTHORITATIVE, exact mapping for
+        #       this coordinate (NOAA's own answer), checked first;
+        #   (b) the cached-polygon index — an INFERENCE (point-in-polygon on an
+        #       already-fetched gridpoint), used only when (a) has no file. This
+        #       covers newly-revealed samples that sit inside a polygon from a
+        #       previous view, which is what makes a small pan/zoom cheap.
+        # Anything resolved by neither becomes a /points network miss (pass 2).
+        # Disable the polygon inference with WR_POLYGON_INDEX=0.
+        use_index = os.environ.get("WR_POLYGON_INDEX", "1") != "0"
+        misses = []
+        n_fs_hits = 0
+        n_index_hits = 0
+        for c in coordinates:
+            gp = gridpoint_from_cached_points(c)   # (a) authoritative FS hit
+            if gp is not None:
+                n_fs_hits += 1
+                if _emit(gp):
+                    yield gp
+                continue
+            gp = lookup_gridpoint_in_index(c.lon, c.lat) if use_index else None
+            if gp is not None:                      # (b) inferred from polygon
+                n_index_hits += 1
+                if _emit(gp):
+                    yield gp
+                continue
+            misses.append(c)
+
+        # Pass 2: resolve the misses via /points. Pre-warm ALL in a single
+        # batched writer job, then read concurrently.
+        if misses:
+            try:
+                from .cachewriter import ensure as _ensure_cached
+                _ensure_cached([f"/points/{c}" for c in misses])
+            except Exception:
+                # Writer unavailable: fall back to resolving inline (each call
+                # fetches on miss via connection's inline fallback).
+                pass
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=NOAA_MAX_CONCURRENCY) as executor:
+                for gp in executor.map(gridpoint_from_map_coordinate, misses):
+                    if gp is None:
+                        continue  # out-of-coverage sample (e.g. across border)
+                    if _emit(gp):
+                        yield gp
+
+        if _RESOLVE_TIMING:
+            logger.warning(
+                "  resolve breakdown: %d/%d from FS /points cache, %d from "
+                "polygon index, %d needed /points network -> %d unique gridpoints",
+                n_fs_hits, len(coordinates), n_index_hits, len(misses), len(ordered),
+            )
 
         with _GRIDPOINTS_LOCK:
             _GRIDPOINTS_CACHE[self.signature] = ordered
+
+        # Populate the index with this area's gridpoint polygons so subsequent
+        # nearby views can reuse them. Best-effort; reads cached docs only.
+        if use_index:
+            try:
+                index_cached_gridpoints(ordered)
+            except Exception:
+                pass
 
     @cached_property
     def gridpoints(self):
@@ -272,17 +429,103 @@ class CoordinateArea:
         """
         from .cachewriter import ensure_stream, not_fresh
 
+        if _RESOLVE_TIMING:
+            logger.warning(
+                "iter_cache ENTER: size=%.0fx%.0fkm NOAA_MAX_CONCURRENCY=%r",
+                self.width, self.height, os.environ.get("NOAA_MAX_CONCURRENCY"),
+            )
+        t0 = time.perf_counter()
+
+        # Throttled progress logger (every ~2s) so a long resolve streams live
+        # progress + rate to the log instead of going silent until the end.
+        def _progress(phase, done, total, phase_t0, state):
+            now = time.perf_counter()
+            if done < total and (now - state["last"]) < 2.0:
+                return
+            state["last"] = now
+            elapsed = now - phase_t0
+            rate = done / elapsed if elapsed > 0 else 0.0
+            remaining = (total - done) / rate if rate > 0 else float("inf")
+            logger.warning(
+                "  %s: %d/%d (%.0f%%) %.1f/s elapsed=%.1fs eta=%.0fs",
+                phase, done, total, (100.0 * done / total if total else 100.0),
+                rate, elapsed, remaining,
+            )
+
         # Phase 1: /points. Its total is the not-fresh point count.
-        point_paths = not_fresh([f"/points/{c}" for c in self.map_coordinates])
+        all_points = [f"/points/{c}" for c in self.map_coordinates]
+        point_paths = not_fresh(all_points)
+        n_points_total = len(all_points)
+        n_points_fetched = len(point_paths)
         yield {"phase": "points", "done": 0, "total": len(point_paths)}
+        _pstate = {"last": 0.0}
         for prog in ensure_stream(point_paths):
+            if _RESOLVE_TIMING:
+                _progress("points", prog["done"], len(point_paths), t0, _pstate)
             yield {"phase": "points", "done": prog["done"], "total": len(point_paths)}
+        t_points = time.perf_counter()
+
+        # Resolve the unique gridpoint set (reads the warmed /points files and
+        # dedupes). Timed separately from the fetch below.
+        if _RESOLVE_TIMING:
+            logger.warning("  resolving unique gridpoints from %d points...", n_points_total)
+        gridpoints = self.gridpoints
+        t_resolve = time.perf_counter()
 
         # Phase 2: /gridpoints (gridpoint set now known from phase 1).
-        grid_paths = not_fresh([f"/gridpoints/{gp}" for gp in self.gridpoints])
+        all_grid = [f"/gridpoints/{gp}" for gp in gridpoints]
+        grid_paths = not_fresh(all_grid)
+        n_grid_total = len(all_grid)
+        n_grid_fetched = len(grid_paths)
+        if _RESOLVE_TIMING:
+            logger.warning(
+                "  gridpoints phase: %d unique (%d need fetch) after %.1fs",
+                n_grid_total, n_grid_fetched, t_resolve - t0,
+            )
         yield {"phase": "gridpoints", "done": 0, "total": len(grid_paths)}
+        _gstate = {"last": 0.0}
         for prog in ensure_stream(grid_paths):
+            if _RESOLVE_TIMING:
+                _progress("gridpoints", prog["done"], len(grid_paths), t_resolve, _gstate)
             yield {"phase": "gridpoints", "done": prog["done"], "total": len(grid_paths)}
+        t_grid = time.perf_counter()
+
+        if _RESOLVE_TIMING:
+            ms = lambda a, b: round((b - a), 2)
+            try:
+                conc = int(os.environ.get("NOAA_MAX_CONCURRENCY", "8"))
+            except ValueError:
+                conc = 8
+            logger.warning(
+                "area resolve timing: center=(%.4f,%.4f) size=%.0fx%.0fkm conc=%d "
+                "| points: %d samples (%d fetched) in %ss "
+                "| resolve_gridpoints: %d unique in %ss "
+                "| gridpoints: %d (%d fetched) in %ss "
+                "| TOTAL %ss",
+                self.center.lat, self.center.lon, self.width, self.height, conc,
+                n_points_total, n_points_fetched, ms(t0, t_points),
+                len(gridpoints), ms(t_points, t_resolve),
+                n_grid_total, n_grid_fetched, ms(t_resolve, t_grid),
+                ms(t0, t_grid),
+            )
+
+
+def gridpoint_from_cached_points(coordinate: MapCoordinate):
+    """Resolve a sample to its NOAA gridpoint using ONLY the on-disk /points
+    cache — no network, no writer. Returns the NOAAGridpoint if the /points
+    file for this exact coordinate is already cached, else None. This is the
+    authoritative, exact answer (NOAA's own point->grid mapping), so it is
+    checked before the inferred polygon-index lookup."""
+    try:
+        path = PathObj(f"/points/{coordinate}")
+        if not os.path.isfile(path.tempfile):
+            return None
+        with open(path.tempfile) as f:
+            doc = json.loads(f.read())
+        props = doc["json"]["properties"]
+        return NOAAGridpoint(props["gridId"], props["gridX"], props["gridY"])
+    except Exception:
+        return None
 
 
 def gridpoint_from_map_coordinate(coordinate: MapCoordinate):

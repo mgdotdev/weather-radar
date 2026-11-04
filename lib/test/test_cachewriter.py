@@ -45,6 +45,16 @@ def cw(monkeypatch):
     # Fake requests: every GET returns 200 with a far-future Expires.
     fake_requests = types.ModuleType("requests")
 
+    # Provide a minimal `exceptions` namespace so _retry_get's
+    # `except (requests.exceptions.ConnectionError, requests.exceptions.Timeout)`
+    # resolves even though these are never raised here.
+    fake_exceptions = types.ModuleType("requests.exceptions")
+    class ConnectionError(Exception): ...
+    class Timeout(Exception): ...
+    fake_exceptions.ConnectionError = ConnectionError
+    fake_exceptions.Timeout = Timeout
+    fake_requests.exceptions = fake_exceptions
+
     class FakeResp:
         def __init__(self, url):
             self.status_code = 200
@@ -61,7 +71,7 @@ def cw(monkeypatch):
         def __init__(self):
             self.headers = {}
 
-        def get(self, url):
+        def get(self, url, timeout=None):
             return FakeResp(url)
 
     fake_requests.session = lambda: FakeSession()

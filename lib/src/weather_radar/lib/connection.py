@@ -56,7 +56,20 @@ def retry_get(session, path, retries=6, resp=None, attempt=0):
             resp.raise_for_status()
         raise RuntimeError("NWS unresponsive after multiple tries")
 
-    resp = session.get(path)
+    # Transient network failures (DNS hiccup, connection refused/reset, read
+    # timeout) raise BEFORE a response exists. These are retryable — a brief
+    # blip shouldn't permanently drop a path from the cache — so back off and
+    # retry rather than letting the exception escape.
+    try:
+        resp = session.get(path, timeout=30)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        logger.warning(
+            "HTTP transient error (%s); backing off %ss: %s",
+            type(e).__name__, _retry_time(attempt), path,
+        )
+        time.sleep(_retry_time(attempt))
+        return retry_get(session, path, retries - 1, None, attempt + 1)
+
     if resp.status_code == 200:
         return resp
 
@@ -68,15 +81,17 @@ def retry_get(session, path, retries=6, resp=None, attempt=0):
         raise NoCoverageError(path)
 
     # Rate limited: NOAA documents that throttling typically clears within a
-    # few seconds. Honor an explicit Retry-After header when present, else
-    # fall back to exponential backoff.
-    if resp.status_code == 429:
+    # few seconds. It usually signals this with 429 (+ Retry-After), but under
+    # a sustained burst it may instead return 403 Forbidden for the same
+    # reason, so treat both the same. Honor an explicit Retry-After header when
+    # present, else fall back to exponential backoff.
+    if resp.status_code in (429, 403):
         retry_after = resp.headers.get("Retry-After")
         try:
             wait = float(retry_after)
         except (TypeError, ValueError):
             wait = _retry_time(attempt)
-        logger.warning(f"HTTP 429 rate limited; backing off {wait}s: {path}")
+        logger.warning(f"HTTP {resp.status_code} throttled; backing off {wait}s: {path}")
         time.sleep(wait)
         return retry_get(session, path, retries - 1, resp, attempt + 1)
 
