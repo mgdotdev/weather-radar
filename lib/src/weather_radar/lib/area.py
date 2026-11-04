@@ -180,21 +180,24 @@ RECT_FLOOR = 4
 # exempted separately (see the cap computation in resolve_area_gridpoints).
 DECOMP_BUDGET_FRACTION = 0.9
 
-# Recursion levels that run their two halves on a thread pool (overlapping
-# their NOAA /points probes, the dominant cost). Capped independently of the
-# depth limit to bound concurrent threads: up to 2^DECOMP_PARALLEL_DEPTH nodes
-# run at once; deeper levels recurse serially (cheap now — the per-node fetch
-# goes through the writer's own global concurrency, and the memo is shared, so
-# a serial deep node adds little beyond its own network wait).
-DECOMP_PARALLEL_DEPTH = int(os.environ.get("WR_DECOMP_PARALLEL_DEPTH", "5"))
+# Shared recursion thread pool. Sub-rectangles are OFFLOADED to it (one half
+# per split; the other runs inline) so /points probes from across the whole
+# decomposition tree overlap and drain through the cache-writer's pool together
+# — instead of the old serial per-node waves that made complex cold areas
+# minutes-slow. The slot semaphore count EQUALS the worker count so every
+# offloaded task is guaranteed a worker (never queued behind a blocked
+# parent) — the invariant that keeps the recursive offload deadlock-free.
+# Recursion threads mostly block on ensure() (I/O wait), so this many is cheap;
+# real network concurrency stays bounded by the writer's own pool.
+DECOMP_POOL_WORKERS = int(os.environ.get("WR_DECOMP_POOL_WORKERS", "48"))
+_decomp_slots = threading.Semaphore(DECOMP_POOL_WORKERS)
 
 # Hard cap on split depth. A rectangle still multi-WFO after this many splits
 # is resolved by ONE concurrent bulk /points probe of all its cells, instead of
 # fragmenting further. Each recursion level peels off the single-WFO regions it
 # finds (big /points savings) and only the still-mixed remainder recurses, so a
 # deeper cap captures MORE single-WFO fills (fewer calls) at the cost of more
-# boundary probes on the fragmented parts. Tune via WR_DECOMP_MAX_DEPTH; the
-# wall-clock deadline is the backstop against true pathology (fractal borders).
+# boundary probes on the fragmented parts. Tune via WR_DECOMP_MAX_DEPTH.
 DECOMP_MAX_DEPTH = int(os.environ.get("WR_DECOMP_MAX_DEPTH", "8"))
 
 
@@ -324,22 +327,20 @@ def _resolve_indices(indices, memo, step, budget=None):
         memo[(i, j)] = resolved.get((c.lat, c.lon))
 
 
-def resolve_area_gridpoints(i0, i1, j0, j1, step=None, memo=None, budget=None,
-                            _depth=0):
+def resolve_area_gridpoints(i0, i1, j0, j1, step=None, budget=None):
     """Resolve the unique set of NOAA gridpoints covering the inclusive index
     rectangle [i0..i1] x [j0..j1], via recursive single-WFO decomposition.
     Returns a set of NOAAGridpoints (out-of-coverage samples contribute
     nothing).
 
-    `memo` caches resolved COORDINATES ({(i,j): gp|None}) across the recursion
-    so shared rectangle boundaries are never re-probed. `budget` caps total
-    probes; if exceeded (fractal border), _DecompBudgetExceeded propagates so
-    the caller falls back to a plain scan. Both are created at the top level.
+    Owns the shared recursion thread pool: sub-rectangles are offloaded to it
+    so /points probes across the whole tree overlap and drain through the
+    cache-writer's pool together (instead of serial per-node waves). `budget`
+    caps total probes; if exceeded (fractal border), _DecompBudgetExceeded
+    propagates so the caller falls back to a plain scan.
     """
     if step is None:
         step = LATTICE_STEP_DEG
-    if memo is None:
-        memo = {}
     if budget is None:
         total_cells = (i1 - i0 + 1) * (j1 - j0 + 1)
         if (i1 - i0 + 1) <= RECT_FLOOR or (j1 - j0 + 1) <= RECT_FLOOR:
@@ -347,7 +348,19 @@ def resolve_area_gridpoints(i0, i1, j0, j1, step=None, memo=None, budget=None,
         else:
             cap = int(total_cells * DECOMP_BUDGET_FRACTION)
         budget = _Budget(cap)
+    memo = {}
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=DECOMP_POOL_WORKERS, thread_name_prefix="decomp")
+    try:
+        return _resolve_rect(i0, i1, j0, j1, step, memo, budget, executor, 0)
+    finally:
+        executor.shutdown(wait=False)
 
+
+def _resolve_rect(i0, i1, j0, j1, step, memo, budget, executor, _depth):
+    """Recursive worker for resolve_area_gridpoints. See it for semantics.
+    `memo` caches resolved coordinates across the recursion; `executor` is the
+    shared pool offloaded sub-rectangles run on."""
     n_i = i1 - i0 + 1
     n_j = j1 - j0 + 1
 
@@ -396,7 +409,7 @@ def resolve_area_gridpoints(i0, i1, j0, j1, step=None, memo=None, budget=None,
         return gps
 
     # 3. Border crosses the rectangle (or a coverage gap touches it): bisect
-    #    the longer axis and recurse concurrently.
+    #    the longer axis and recurse, overlapping the two halves' probes.
     if n_i >= n_j:
         mid = (i0 + i1) // 2
         halves = ((i0, mid, j0, j1), (mid, i1, j0, j1))  # share row `mid`
@@ -416,28 +429,32 @@ def resolve_area_gridpoints(i0, i1, j0, j1, step=None, memo=None, budget=None,
     # cached and never re-probe it. (The outer boundary is already in `memo`.)
     _resolve_indices(split_line, memo, step, budget)
 
+    # Recurse into both halves. OFFLOAD one half to the shared executor when a
+    # slot is free, and run the other inline; if no slot is free, run BOTH
+    # inline. This overlaps the halves' /points probes (they drain through the
+    # writer's pool together instead of in serial per-node waves) while being
+    # DEADLOCK-FREE: a thread only blocks on a child future AFTER securing a
+    # slot, and the slot count equals the pool size, so every offloaded task is
+    # guaranteed a worker (never queued behind a blocked parent). The two
+    # halves write DISJOINT memo keys (GIL-safe).
     out = set()
-    # Parallelize only the shallow levels: deeper splits create many small
-    # rectangles, and spawning a thread pool per node (hundreds of them) costs
-    # more than it saves — the /points fetches inside each node are ALREADY
-    # internally concurrent (see _resolve_points), which is where the real
-    # parallelism matters. Recurse serially past DECOMP_PARALLEL_DEPTH.
-    if _depth < DECOMP_PARALLEL_DEPTH:
-        # Run the two halves on threads. They probe DISJOINT interior cells and
-        # share the split line/boundary already in `memo`, so concurrent writes
-        # touch different keys; a lock guards the dict against resize races.
-        # (Avoids copying the growing memo per node, which was O(nodes x memo)
-        # and dominated wall-clock on complex areas.)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            futures = [ex.submit(resolve_area_gridpoints, a, b, c, d, step,
-                                 memo, budget, _depth + 1)
-                       for (a, b, c, d) in halves]
-            for f in futures:
-                out |= f.result()
+    (a0, b0, c0, d0), (a1, b1, c1, d1) = halves
+    fut = None
+    if _decomp_slots.acquire(blocking=False):
+        def _offloaded():
+            try:
+                return _resolve_rect(a1, b1, c1, d1, step, memo, budget,
+                                     executor, _depth + 1)
+            finally:
+                _decomp_slots.release()
+        fut = executor.submit(_offloaded)
     else:
-        for (a, b, c, d) in halves:
-            out |= resolve_area_gridpoints(a, b, c, d, step, memo, budget,
-                                           _depth + 1)
+        out |= _resolve_rect(a1, b1, c1, d1, step, memo, budget,
+                             executor, _depth + 1)
+    out |= _resolve_rect(a0, b0, c0, d0, step, memo, budget,
+                         executor, _depth + 1)
+    if fut is not None:
+        out |= fut.result()
     return out
 
 

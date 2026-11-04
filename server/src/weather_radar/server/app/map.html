@@ -17,6 +17,13 @@
         text-align: center; font-size: 11px;
         font-variant-numeric: tabular-nums;
       }
+      /* Legend tab strip (Controls | Settings). */
+      .ctltab {
+        flex: 1 1 auto; cursor: pointer; padding: 3px 6px; font-size: 11px;
+        font-weight: 600; color: #555; background: transparent; border: none;
+        border-bottom: 2px solid transparent;
+      }
+      .ctltab.active { color: #1565c0; border-bottom-color: #1565c0; }
     </style>
   </head>
   <body style="margin: 0px; padding: 0px;">
@@ -44,47 +51,67 @@
         <span id="legendMid"></span>
         <span id="legendMax"></span>
       </div>
-      <!-- Playback controls. Rows share a grid so the −/+ buttons line up in
-           consistent columns regardless of label/value width. -->
+      <!-- Tabbed controls: "Controls" (playback/time/contour) and "Settings"
+           (pin size, and room for future options). The color scale above is
+           always visible; only these panels switch. -->
       <div style="margin-top:8px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12);">
-        <!-- Play/Pause sits beside a custom range scrubber: two bar handles
-             set the playback window [start, end] and a circle is the current
-             time (constrained between the bars). All three are draggable. -->
-        <div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
-          <button id="playPause" title="Pause / Play" style="cursor:pointer; flex:0 0 auto; height:24px; width:28px;
-            display:inline-flex; align-items:center; justify-content:center; box-sizing:border-box;
-            border:1px solid #bbb; border-radius:4px; background:#f5f5f5; font-size:12px; line-height:1; padding:0;">⏸</button>
-          <svg id="timeScrubber" width="100%" height="28" style="flex:1 1 auto; min-width:0; touch-action:none; overflow:visible;">
-            <!-- Full track -->
-            <line id="scTrack" x1="0" y1="14" x2="100%" y2="14" stroke="#ccc" stroke-width="4" stroke-linecap="round"/>
-            <!-- Active window segment (between start & end bars) -->
-            <line id="scActive" x1="0" y1="14" x2="0" y2="14" stroke="#1565c0" stroke-width="4" stroke-linecap="round"/>
-            <!-- Start / end bound handles -->
-            <rect id="scStart" x="0" y="4" width="6" height="20" rx="2" fill="#1565c0" stroke="#fff" stroke-width="1" style="cursor:ew-resize"/>
-            <rect id="scEnd" x="0" y="4" width="6" height="20" rx="2" fill="#1565c0" stroke="#fff" stroke-width="1" style="cursor:ew-resize"/>
-            <!-- Current-time playhead -->
-            <circle id="scPlayhead" cx="0" cy="14" r="7" fill="#fff" stroke="#1565c0" stroke-width="2.5" style="cursor:grab"/>
-          </svg>
+        <div style="display:flex; gap:4px; margin-bottom:6px;">
+          <button id="tabControls" class="ctltab active">Controls</button>
+          <button id="tabSettings" class="ctltab">Settings</button>
         </div>
-        <div id="timeSliderLabel" style="font-size:13px; color:#333; text-align:center;
-          margin-bottom:6px; font-variant-numeric:tabular-nums; font-weight:600;
-          white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">—</div>
-        <div style="display:grid; grid-template-columns:1fr 22px 52px 22px; align-items:center;
-            column-gap:6px; row-gap:6px;">
-          <span style="font-size:11px; color:#555;">Speed</span>
-          <button id="speedDown" title="Slower" class="ctlbtn">−</button>
-          <span id="speedLabel" class="ctlval">1.0×</span>
-          <button id="speedUp" title="Faster" class="ctlbtn">+</button>
 
-          <span style="font-size:11px; color:#555;">Time</span>
-          <button id="dtDown" title="Smaller time step" class="ctlbtn">−</button>
-          <span id="dtLabel" class="ctlval">1h</span>
-          <button id="dtUp" title="Larger time step" class="ctlbtn">+</button>
+        <!-- Controls panel -->
+        <div id="panelControls">
+          <!-- Play/Pause sits beside a custom range scrubber: two bar handles
+               set the playback window [start, end] and a circle is the current
+               time (constrained between the bars). All three are draggable. -->
+          <div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
+            <button id="playPause" title="Pause / Play" style="cursor:pointer; flex:0 0 auto; height:24px; width:28px;
+              display:inline-flex; align-items:center; justify-content:center; box-sizing:border-box;
+              border:1px solid #bbb; border-radius:4px; background:#f5f5f5; font-size:12px; line-height:1; padding:0;">⏸</button>
+            <svg id="timeScrubber" width="100%" height="28" style="flex:1 1 auto; min-width:0; touch-action:none; overflow:visible;">
+              <!-- Full track -->
+              <line id="scTrack" x1="0" y1="14" x2="100%" y2="14" stroke="#ccc" stroke-width="4" stroke-linecap="round"/>
+              <!-- Active window segment (between start & end bars) -->
+              <line id="scActive" x1="0" y1="14" x2="0" y2="14" stroke="#1565c0" stroke-width="4" stroke-linecap="round"/>
+              <!-- Start / end bound handles -->
+              <rect id="scStart" x="0" y="4" width="6" height="20" rx="2" fill="#1565c0" stroke="#fff" stroke-width="1" style="cursor:ew-resize"/>
+              <rect id="scEnd" x="0" y="4" width="6" height="20" rx="2" fill="#1565c0" stroke="#fff" stroke-width="1" style="cursor:ew-resize"/>
+              <!-- Current-time playhead -->
+              <circle id="scPlayhead" cx="0" cy="14" r="7" fill="#fff" stroke="#1565c0" stroke-width="2.5" style="cursor:grab"/>
+            </svg>
+          </div>
+          <div id="timeSliderLabel" style="font-size:13px; color:#333; text-align:center;
+            margin-bottom:6px; font-variant-numeric:tabular-nums; font-weight:600;
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">—</div>
+          <div style="display:grid; grid-template-columns:1fr 22px 52px 22px; align-items:center;
+              column-gap:6px; row-gap:6px;">
+            <span style="font-size:11px; color:#555;">Speed</span>
+            <button id="speedDown" title="Slower" class="ctlbtn">−</button>
+            <span id="speedLabel" class="ctlval">1.0×</span>
+            <button id="speedUp" title="Faster" class="ctlbtn">+</button>
 
-          <span id="contourRowLabel" style="font-size:11px; color:#555;">Contour</span>
-          <button id="stepDown" title="Finer contours" class="ctlbtn">−</button>
-          <span id="stepLabel" class="ctlval">1°</span>
-          <button id="stepUp" title="Coarser contours" class="ctlbtn">+</button>
+            <span style="font-size:11px; color:#555;">Time</span>
+            <button id="dtDown" title="Smaller time step" class="ctlbtn">−</button>
+            <span id="dtLabel" class="ctlval">1h</span>
+            <button id="dtUp" title="Larger time step" class="ctlbtn">+</button>
+
+            <span id="contourRowLabel" style="font-size:11px; color:#555;">Contour</span>
+            <button id="stepDown" title="Finer contours" class="ctlbtn">−</button>
+            <span id="stepLabel" class="ctlval">1°</span>
+            <button id="stepUp" title="Coarser contours" class="ctlbtn">+</button>
+          </div>
+        </div>
+
+        <!-- Settings panel (hidden until its tab is selected) -->
+        <div id="panelSettings" style="display:none;">
+          <div style="display:grid; grid-template-columns:1fr 22px 52px 22px; align-items:center;
+              column-gap:6px; row-gap:6px;">
+            <span style="font-size:11px; color:#555;">Pin size</span>
+            <button id="pinSizeDown" title="Smaller pins" class="ctlbtn">−</button>
+            <span id="pinSizeLabel" class="ctlval">1.0×</span>
+            <button id="pinSizeUp" title="Larger pins" class="ctlbtn">+</button>
+          </div>
         </div>
       </div>
     </div>
@@ -655,6 +682,37 @@
       const pinsContainer = document.getElementById("pins")
       let pins = [] // [{ lat, lon, el }]
 
+      // Pin size: a scale multiplier applied to the marker + info box, stepped
+      // via the legend +/- buttons and persisted in the URL (`pinSize=`) so it
+      // survives a refresh. Base sizes (1.0x) match the original fixed styling.
+      const PIN_MARKER_BASE_PX = 20   // marker glyph font-size at 1.0x
+      const PIN_INFO_BASE_PX = 12     // info box font-size at 1.0x
+      const PIN_SIZE_MIN = 0.5, PIN_SIZE_MAX = 3.0, PIN_SIZE_STEP = 0.25
+      let pinSize = (() => {
+        const v = parseFloat(new URL(window.location.href).searchParams.get("pinSize"))
+        return Number.isFinite(v) ? Math.max(PIN_SIZE_MIN, Math.min(v, PIN_SIZE_MAX)) : 1.0
+      })()
+
+      function applyPinSize() {
+        for (const p of pins) {
+          p.marker.style.fontSize = (PIN_MARKER_BASE_PX * pinSize) + "px"
+          p.info.style.fontSize = (PIN_INFO_BASE_PX * pinSize) + "px"
+        }
+        const lbl = document.getElementById("pinSizeLabel")
+        if (lbl) lbl.textContent = pinSize.toFixed(2).replace(/\.?0+$/, "") + "×"
+        // Reposition so the (pinSize-scaled) info-box offset updates immediately.
+        if (pins.length) refreshPins()
+      }
+
+      function setPinSize(scale) {
+        pinSize = Math.max(PIN_SIZE_MIN, Math.min(scale, PIN_SIZE_MAX))
+        const u = new URL(window.location.href)
+        if (Math.abs(pinSize - 1.0) < 1e-9) u.searchParams.delete("pinSize")
+        else u.searchParams.set("pinSize", String(pinSize))
+        history.replaceState(null, "", u.toString())
+        applyPinSize()
+      }
+
       function serializePins() {
         const u = new URL(window.location.href)
         if (pins.length) {
@@ -693,16 +751,20 @@
         pinsContainer.appendChild(marker)
         pinsContainer.appendChild(info)
         pins.push(pin)
+        applyPinSize()  // size the new marker/info to the current scale
         if (persist) serializePins()
         refreshPins()
       }
 
       // Reposition + re-read all pins (called on map move and each frame).
       // The marker sits on the point; the info box is offset to the
-      // upper-right so it doesn't cover the location.
+      // upper-right so it doesn't cover the location. The offset SCALES with
+      // pinSize so the box keeps clearing the (larger) marker glyph instead of
+      // crowding it as the pin grows.
       const INFO_DX = 14, INFO_DY = -14
       function refreshPins() {
         const rect = mapContainer.getBoundingClientRect()
+        const dx = INFO_DX * pinSize, dy = INFO_DY * pinSize
         for (const p of pins) {
           const pt = map.project([p.lon, p.lat])
           const x = rect.left + pt.x, y = rect.top + pt.y
@@ -712,8 +774,8 @@
           const v = sampleAt(p.lon, p.lat)
           const valueText = v === null ? "—" : `${v.toFixed(1)}${latestUnits ? " " + latestUnits : ""}`
           p.info.innerHTML = `${model}: ${valueText}<br>${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}`
-          p.info.style.left = (x + INFO_DX) + "px"
-          p.info.style.top = (y + INFO_DY) + "px"
+          p.info.style.left = (x + dx) + "px"
+          p.info.style.top = (y + dy) + "px"
         }
       }
 
@@ -1856,13 +1918,36 @@
         ["dtUp", () => stepDt(+1)],
         ["dtDown", () => stepDt(-1)],
         ["stepUp", () => stepContour(+1)],
-        ["stepDown", () => stepContour(-1)]].forEach(([id, fn]) => {
+        ["stepDown", () => stepContour(-1)],
+        ["pinSizeUp", () => setPinSize(pinSize + PIN_SIZE_STEP)],
+        ["pinSizeDown", () => setPinSize(pinSize - PIN_SIZE_STEP)]].forEach(([id, fn]) => {
         const btn = document.getElementById(id)
         btn.addEventListener("pointerdown", (e) => e.stopPropagation())
         btn.addEventListener("click", (e) => { e.stopPropagation(); fn() })
       })
       setPlaybackSpeed(playbackSpeed) // initialize the label
       setDt(dt) // initialize the dt label
+      applyPinSize() // initialize the pin-size label (and size any restored pins)
+
+      // Legend tabs: switch between the Controls and Settings panels.
+      ;(function setupLegendTabs() {
+        const tabs = {
+          tabControls: "panelControls",
+          tabSettings: "panelSettings",
+        }
+        const select = (activeTabId) => {
+          for (const [tabId, panelId] of Object.entries(tabs)) {
+            const on = tabId === activeTabId
+            document.getElementById(tabId).classList.toggle("active", on)
+            document.getElementById(panelId).style.display = on ? "" : "none"
+          }
+        }
+        for (const tabId of Object.keys(tabs)) {
+          const btn = document.getElementById(tabId)
+          btn.addEventListener("pointerdown", (e) => e.stopPropagation())
+          btn.addEventListener("click", (e) => { e.stopPropagation(); select(tabId) })
+        }
+      })()
       // Initialize the contour-interval label without disabling autoStep; the
       // real step is set by applyAutoStep() once the global range arrives.
       document.getElementById("stepLabel").textContent = formatStep(contourStep)
@@ -1963,8 +2048,12 @@
         if (!newModel || newModel === currentModel) return
         const cur = new URL(window.location.href)
         const next = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
-        // Carry over view/animation params; drop model-specific ones.
-        for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed"]) {
+        // Carry over everything that isn't model-specific: the view
+        // (lat/lon/width/height/zoom), playback (dt/speed and the scrubber
+        // window from/to/t), and session state (dropped pins, pin size). Only
+        // the model itself and its derived styling change.
+        for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
+                         "from", "to", "t", "pins", "pinSize"]) {
           const v = cur.searchParams.get(k)
           if (v !== null) next.searchParams.set(k, v)
         }
