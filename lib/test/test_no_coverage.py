@@ -154,6 +154,16 @@ class TestGridpointResolution:
         monkeypatch.setattr(
             "weather_radar.lib.cachewriter.ensure", lambda paths: None, raising=False
         )
+        # Isolate from the on-disk /points cache (the container's /tmp holds
+        # real cached NOAA points near these coordinates; the now-working disk
+        # reader would otherwise bypass `fake_resolve`). Force all resolution
+        # through the mock.
+        monkeypatch.setattr(
+            area_mod, "gridpoint_from_cached_points", lambda c: None, raising=True
+        )
+        # Disable the polygon-index inference too, so a prior test's indexed
+        # polygons can't resolve a sample locally and bypass the mock.
+        monkeypatch.setenv("WR_POLYGON_INDEX", "0")
         # Start from a clean resolved-gridpoint cache so a prior test's entry
         # can't satisfy this area via the nearby-reuse path.
         area_mod._GRIDPOINTS_CACHE.clear()

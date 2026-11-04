@@ -70,8 +70,19 @@ def fake(monkeypatch):
     _POLY_INDEX.clear()
     area_mod._POLY_INDEXED_GPS.clear()
     monkeypatch.setenv("WR_POLYGON_INDEX", "1")
+    # These tests exercise the polygon-index reuse in the per-sample SCAN path;
+    # the newer WFO decomposition resolves areas before that path runs, so pin
+    # these to the scan path they are testing.
+    monkeypatch.setenv("WR_WFO_DECOMP", "0")
     monkeypatch.setattr(
         "weather_radar.lib.cachewriter.ensure", lambda paths: None, raising=False
+    )
+    # Isolate from any on-disk /points cache (the container's /tmp holds real
+    # cached NOAA data near these test coordinates; now that the disk reader
+    # works, it would short-circuit the mock). Force all resolution through the
+    # mocked network get().
+    monkeypatch.setattr(
+        area_mod, "gridpoint_from_cached_points", lambda c: None, raising=True
     )
     return conn
 
