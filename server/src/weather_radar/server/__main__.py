@@ -61,7 +61,7 @@ def _start_background_processes():
     global _cache_writer_proc, _hotcache_proc
     if not _try_become_writer_spawner():
         logger.warning("background process spawn skipped (another worker owns it)")
-        return None
+        return False
 
     # 1. Cache writer (owns disk writes).
     if _port_open(cachewriter.CACHE_WRITER_HOST, cachewriter.CACHE_WRITER_PORT):
@@ -95,7 +95,9 @@ def _start_background_processes():
         sched_ready.wait(timeout=10)
         _hotcache_proc = sched
         logger.warning("hotcache scheduler process started (pid=%s)", sched.pid)
-    return _cache_writer_proc
+    # This worker won the leader lock (whether or not it had to spawn fresh
+    # processes vs. reuse existing ones).
+    return True
 
 
 def server():
@@ -114,13 +116,14 @@ def server():
     @server.on_event("startup")
     def _startup():
         # Each uvicorn worker runs this; the file lock ensures exactly one
-        # actually spawns the background processes (writer + scheduler).
-        _start_background_processes()
-        # Every worker starts its OWN spline warmer: the fitted splines live in
-        # per-worker memory, so each worker must warm its own _MODEL_CACHE for
-        # the watched URLs (unlike the shared on-disk NOAA cache).
-        from .warmer import start as _start_warmer
-        _start_warmer()
+        # (the "leader") actually spawns the background processes (writer +
+        # scheduler). The leader ALSO runs the single-instance bundle builder,
+        # which precomputes watched URLs' animation bundles to disk — built
+        # once, shared to all workers via the filesystem (no per-worker work).
+        is_leader = _start_background_processes()
+        if is_leader:
+            from .bundle import start_builder
+            start_builder()
 
     server.include_router(api.router)
     server.include_router(app.router)

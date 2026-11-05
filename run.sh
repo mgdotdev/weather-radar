@@ -39,8 +39,6 @@ server() {
           -e WR_STREAM_TIMING \
           -e WR_RESOLVE_TIMING \
           -e NOAA_MAX_CONCURRENCY \
-          -e WR_WARM_SPLINES \
-          -e WR_WARM_INTERVAL_SEC \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh server $workers"
     else
         local py="$VENV_PY"

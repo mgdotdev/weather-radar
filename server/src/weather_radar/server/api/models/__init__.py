@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 import json
 import logging
@@ -49,6 +49,44 @@ def prefetch(lat: float, lon: float, width: float|None=None, height: float|None=
     if width or height:
         area = CoordinateArea(coord, width, height)
         area.cache()
+
+
+@router.get("/{model}/bundle")
+def bundle(model: str, lat: float, lon: float, width: float, height: float,
+           dt: int, kind: str = "accumulation"):
+    """Stream the PRECOMPUTED animation bundle for a watched URL, if one exists
+    on disk, as gzipped NDJSON (first line = range header, then one frame
+    record per line — identical to /series/stream lines).
+
+    The client consumes this with the SAME incremental stream reader it uses
+    for the live fill, so the first frame renders immediately and the rest
+    populate the cache in the background — no 276MB blocking blob. The bundle
+    is precomputed by the background builder (watched URLs only), so there's
+    ZERO per-frame compute here; the endpoint just streams the file's bytes.
+
+    Served with Content-Encoding: gzip so the (coord-heavy, highly
+    compressible) payload goes over the wire ~10x smaller and the request path
+    never parses or re-serializes it. 404 when no bundle exists; the client
+    then falls back to the normal prefetch + live streaming fill."""
+    from weather_radar.server.bundle import bundle_file
+
+    path = bundle_file(model, lat, lon, width, height, dt, kind)
+    if path is None:
+        raise HTTPException(status_code=404, detail="no bundle for this area")
+
+    def _iter():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(
+        _iter(),
+        media_type="application/x-ndjson",
+        headers={"Content-Encoding": "gzip"},
+    )
 
 
 @router.get("/prefetch/stream")

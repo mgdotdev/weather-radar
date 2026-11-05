@@ -1609,6 +1609,82 @@
         }
       }
 
+      // Fast path for WATCHED urls: STREAM the precomputed animation bundle
+      // (gzipped NDJSON) and populate the frame cache incrementally — same
+      // wire format and incremental rendering as the live fill, but the frames
+      // are precomputed (no per-frame server compute). The first line is a
+      // {type:"range"} header; each subsequent line is a frame record. Returns
+      // true if a bundle streamed (caller skips the normal prefetch + fill),
+      // false (incl. 404 = not watched) to fall back to the cold path.
+      async function loadFromBundle() {
+        let resp
+        try {
+          resp = await fetch(
+            `/api/models/${model}/bundle?lat=${lat}&lon=${lon}&width=${width}` +
+            `&height=${height}&dt=${dt}&kind=${kind}`)
+        } catch (_) {
+          return false
+        }
+        if (!resp || !resp.ok || !resp.body) return false  // 404 -> cold path
+
+        const reader = resp.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ""
+        let gotHeader = false
+        let nFrames = 0
+
+        const applyHeader = (h) => {
+          const r = (h && h.range) || {}
+          if (Number.isFinite(r.min) && Number.isFinite(r.max) && r.max > r.min) {
+            globalMin = r.min; globalMax = r.max
+            if (autoStep) applyAutoStep()
+          }
+          mapTimeZone = r.timeZone || null
+          const s = r.start ? Math.floor(Date.parse(r.start) / 1000) : NaN
+          const e = r.end ? Math.floor(Date.parse(r.end) / 1000) : NaN
+          if (Number.isFinite(s) && Number.isFinite(e) && e > s) {
+            forecastStart = s; forecastEnd = e
+            windowStart = s; windowEnd = e
+            applyUrlWindow()
+            configureScrubber()
+          }
+        }
+
+        const handle = (line) => {
+          if (!line) return
+          let obj
+          try { obj = JSON.parse(line) } catch (_) { return }
+          if (!gotHeader && obj.type === "range") {
+            gotHeader = true
+            applyHeader(obj)
+            return
+          }
+          // Frame record {time,uom,coords,vals}: cache under the normal key so
+          // scrubbing/looping/loadFrame all hit it (identical to the live fill).
+          if (Number.isFinite(obj.time)) {
+            apiClient.put(frameCacheKey(obj.time), obj)
+            nFrames++
+          }
+        }
+
+        for (;;) {
+          let chunk
+          try { chunk = await reader.read() } catch (_) { break }
+          if (chunk.done) break
+          buffer += decoder.decode(chunk.value, { stream: true })
+          let nl
+          while ((nl = buffer.indexOf("\n")) >= 0) {
+            handle(buffer.slice(0, nl).trim())
+            buffer = buffer.slice(nl + 1)
+          }
+        }
+        handle(buffer.trim())
+
+        if (!gotHeader && nFrames === 0) return false  // empty/garbage -> cold
+        console.log("[bundle] streamed", nFrames, "frames; range", globalMin, "-", globalMax)
+        return true
+      }
+
       // Clamp a time (epoch seconds) into the active playback window if known,
       // so the first frame after a (re)load always falls on valid data.
       function clampToForecast(t) {
@@ -2039,19 +2115,25 @@
 
       showSpinner("Loading data…")
       loading = true
+      let fromBundle = false
       try {
-        // Cache all the area's NOAA data first, streaming progress to the
-        // spinner as each resource is fetched.
-        await prefetchWithProgress()
-        // Fix the color scale to the whole-lifecycle range before rendering.
-        await fetchGlobalRange()
+        // WATCHED-URL FAST PATH: if a precomputed bundle exists, load it and
+        // skip the cold prefetch + streaming fill entirely.
+        fromBundle = await loadFromBundle()
+        if (!fromBundle) {
+          // Cache all the area's NOAA data first, streaming progress to the
+          // spinner as each resource is fetched.
+          await prefetchWithProgress()
+          // Fix the color scale to the whole-lifecycle range before rendering.
+          await fetchGlobalRange()
+        }
         time = clampToForecast(time)
         // The first frame now comes from the streaming cache-fill (loadFrame
         // waits for it), which can take a moment on a large cold area. Swap the
         // spinner message off the prefetch "Fetching data…" label so it doesn't
         // look stuck while the first frame computes.
         showSpinner("Rendering…")
-        await loadFrame(time) // first frame (from the fill)
+        await loadFrame(time) // first frame (from the bundle cache or the fill)
       } catch (err) {
         console.error("failed to load initial frame:", err)
       } finally {
@@ -2059,9 +2141,9 @@
         hideSpinner()
       }
       // loadFrame above already kicked off the cache fill on its miss; this is
-      // a no-op if that fill already covers the window, or recomputes it if the
-      // window/time changed in between. Not awaited — the first frame rendered;
-      // the fill populates the rest in the background.
+      // a no-op if that fill already covers the window (e.g. a bundle filled
+      // it), or recomputes it if the window/time changed in between. Not
+      // awaited — the first frame rendered; the fill populates the rest.
       fillCache()
 
       async function tick() {
