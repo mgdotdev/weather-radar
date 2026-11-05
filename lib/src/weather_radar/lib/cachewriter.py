@@ -421,6 +421,71 @@ class _Writer:
         futures = [self._pool.submit(self._fetch_one, p) for p in paths]
         concurrent.futures.wait(futures)
 
+    def ensure_binary(self, url, path, force=False):
+        """Download an arbitrary BINARY resource (e.g. a NAQFC GRIB2 from
+        NOMADS) to `path`, atomically, stamping the file's mtime to the HTTP
+        `Expires` header so freshness is a cheap stat — the same model as the
+        JSON cache, but for a non-NOAA binary file.
+
+        This keeps ALL disk writes inside the single writer process (so there
+        are no cross-worker download races), while staying separate from the
+        NOAA JSON path (different host, binary body, no content-hash/tombstone
+        machinery). De-duped via the per-URL lock: concurrent callers for the
+        same url collapse to one download. Returns a JSON string
+        {"ok": bool, "path": path} (value crosses the manager boundary by
+        value). Skips the download when `path` is already fresh unless `force`.
+        """
+        def _fresh(p):
+            try:
+                return os.path.getmtime(p) >= time.time()
+            except OSError:
+                return False
+
+        if not force and _fresh(path):
+            return json.dumps({"ok": True, "path": path})
+
+        lk = self._lock_for(url)
+        with lk:
+            if not force and _fresh(path):   # re-check inside the lock
+                return json.dumps({"ok": True, "path": path})
+            d = os.path.dirname(path)
+            tmp = None
+            try:
+                os.makedirs(d, exist_ok=True)
+                with self._session.get(url, timeout=180, stream=True) as r:
+                    if not r.ok:
+                        logger.warning("cachewriter binary %s -> HTTP %s",
+                                       url, r.status_code)
+                        return json.dumps({"ok": os.path.exists(path), "path": path})
+                    expires = r.headers.get("Expires")
+                    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+                    with os.fdopen(fd, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1 << 20):
+                            f.write(chunk)
+                    os.replace(tmp, path)
+                    tmp = None
+                # mtime = Expires -> cheap freshness (same trick as _stamp_expiry).
+                if expires:
+                    try:
+                        exp = datetime.strptime(expires, "%a, %d %b %Y %H:%M:%S %Z")
+                        ts = exp.replace(tzinfo=timezone.utc).timestamp()
+                        os.utime(path, (ts, ts))
+                    except Exception:
+                        pass
+                logger.warning("cachewriter binary wrote %s (%d bytes, expires %s)",
+                               os.path.basename(path),
+                               os.path.getsize(path), expires)
+                return json.dumps({"ok": True, "path": path})
+            except Exception:
+                logger.warning("cachewriter binary failed for %s", url, exc_info=True)
+                return json.dumps({"ok": os.path.exists(path), "path": path})
+            finally:
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+
     # --- streaming jobs ---
     # Each streaming job keeps its progress queue ENTIRELY on the writer side
     # (a real queue.Queue, never a proxy). Clients drive it by id via
@@ -497,6 +562,7 @@ def run_writer(ready_event=None):
     writer = _Writer()
 
     _CacheManager.register("ensure", callable=writer.ensure)
+    _CacheManager.register("ensure_binary", callable=writer.ensure_binary)
     _CacheManager.register("start_job", callable=writer.start_job)
     _CacheManager.register("poll_job", callable=writer.poll_job)
 
@@ -525,6 +591,7 @@ class _CacheClient(BaseManager):
 
 
 _CacheClient.register("ensure")
+_CacheClient.register("ensure_binary")
 _CacheClient.register("start_job")
 _CacheClient.register("poll_job")
 
@@ -561,6 +628,15 @@ def _get_client():
         return _client
 
 
+def _value(proxy):
+    """Registered manager methods return an AutoProxy to the result; this
+    materializes the real (by-value) return, e.g. the JSON string."""
+    try:
+        return proxy._getvalue()
+    except AttributeError:
+        return proxy
+
+
 def ensure(paths):
     """Block until the writer has cached all `paths`. Paths already fresh on
     disk are NOT enqueued (they're just read by the caller); only missing or
@@ -573,6 +649,21 @@ def ensure(paths):
     client.ensure(todo)
 
 
+def ensure_binary(url, path, force=False):
+    """Have the WRITER process download a binary resource at `url` to `path`
+    (atomic, mtime stamped to HTTP Expires), so all disk writes stay in the one
+    writer. Used for NAQFC GRIB2 files. Returns True if the file is present
+    afterward. Raises WriterUnavailable if the writer can't be reached (caller
+    may then fall back to an inline download)."""
+    client = _get_client()
+    import json as _json
+    resp = client.ensure_binary(url, path, force)
+    try:
+        return _json.loads(_value(resp)).get("ok", False)
+    except Exception:
+        return False
+
+
 def ensure_stream(paths):
     """Generator yielding {"done","total"} progress as the writer caches the
     paths that actually need writing (missing/expired). Already-fresh paths
@@ -583,14 +674,6 @@ def ensure_stream(paths):
     if not todo:
         return  # nothing to write -> no progress events
     client = _get_client()
-
-    def _value(proxy):
-        # Registered methods return an AutoProxy to the result; materialize
-        # the real (JSON string) value.
-        try:
-            return proxy._getvalue()
-        except AttributeError:
-            return proxy
 
     started = json.loads(_value(client.start_job(todo)))
     job_id = started["job_id"]

@@ -109,6 +109,104 @@ def ensemble(
     return ensemble_class(area, model).predict(dtime, dt=dt, verbose=True)
 
 
+# --- Air Quality (NAQFC) ----------------------------------------------------
+# AQI is a separate data path from the NOAA weather layers: a gridded, hourly
+# NAQFC forecast sampled directly (no /points gridpoint resolution, no spline
+# fitting). It still emits the SAME wire shapes the client consumes — a range
+# payload and slim {time,uom,coords,vals} frame lines — so it reuses the
+# client's range/fill/scrubber machinery unchanged.
+
+# Fixed AQI scale: the EPA index is 0..500 with standard category thresholds,
+# so (unlike temperature) the color range is constant, not auto-scaled.
+AQI_MIN, AQI_MAX = 0, 300  # cap the displayed scale at 300 (Very Unhealthy);
+                           # values above still compute, color clamps at top.
+
+
+@router.get("/aqi/range", response_class=JSONResponse)
+def aqi_range(lat: float, lon: float, width: float = 1, height: float = 1,
+              pollutant: str = "pm25"):
+    """Fixed color range + forecast window for the AQI (NAQFC) layer. The AQI
+    scale is constant (0..300 displayed), so min/max are fixed; start/end are
+    the first/last forecast-hour epochs of the NAQFC series.
+
+    Prefers a precomputed bundle's stored range header (cheap, no fit) when one
+    exists for these params; else fits the area to derive the window."""
+    from datetime import datetime
+    from weather_radar.lib.aqi import fit_area
+    # Bundle header first (watched url) — the stored range incl. start/end.
+    try:
+        from weather_radar.server.bundle import read_bundle_range
+        rng = read_bundle_range(pollutant, lat, lon, width, height, 3600, "aqi")
+        if rng:
+            return rng
+    except Exception:
+        pass
+    coord = MapCoordinate(lat, lon)
+    area = CoordinateArea(coord, width, height)
+    fit = fit_area(area, pollutant)
+    if fit is None:
+        return JSONResponse({"min": AQI_MIN, "max": AQI_MAX, "uom": "AQI",
+                             "start": None, "end": None})
+    start = datetime.fromtimestamp(fit["start"]).isoformat()
+    end = datetime.fromtimestamp(fit["end"]).isoformat()
+    return {"min": AQI_MIN, "max": AQI_MAX, "uom": "AQI",
+            "start": start, "end": end}
+
+
+@router.get("/aqi/stream")
+def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
+               pollutant: str = "pm25", start: float = None, end: float = None,
+               dt: int = 0, times: str = None):
+    """Stream the AQI forecast as NDJSON frames —
+    {"time", "uom":"AQI", "coords":[[lon,lat],...], "vals":[aqi,...]} — one per
+    requested epoch, byte-compatible with the weather series stream so the
+    client's fill reader consumes it unchanged.
+
+    The area's hourly NAQFC series is fit to a per-gridpoint CubicSpline ONCE
+    (fit_area), then evaluated at the requested epochs — so, like the NOAA
+    layers, ANY `dt` scrubs smoothly (sub-hourly values are spline-interpolated
+    between the hourly NAQFC steps). Epochs come from start/end/dt (sequence)
+    and/or an explicit `times` batch, exactly like the weather series.
+
+    BUNDLE FAST PATH: if a precomputed AQI bundle exists for these params (a
+    watched url, built in the background), its frames are served straight from
+    disk — zero spline fit/eval — and only epochs the bundle lacks fall through
+    to the live spline path. Same mechanism as /series/stream."""
+    from weather_radar.lib.aqi import fit_area, predict_area
+    coord = MapCoordinate(lat, lon)
+    area = CoordinateArea(coord, width, height)
+    epochs = _frame_times(start, end, dt, times)
+
+    def generate():
+        if not epochs:
+            return
+        # Bundle first (keyed by kind="aqi", model=pollutant).
+        remaining = list(epochs)
+        try:
+            from weather_radar.server.bundle import serve_bundle_epochs
+            covered = set()
+            for line in serve_bundle_epochs(pollutant, lat, lon, width, height,
+                                            dt, "aqi", epochs, covered):
+                yield line
+            if covered:
+                remaining = [e for e in epochs if int(e) not in covered]
+                if not remaining:
+                    return  # entire request served from the bundle
+        except Exception:
+            remaining = list(epochs)
+
+        # Live spline path for whatever the bundle didn't cover.
+        fit = fit_area(area, pollutant)
+        if fit is None:
+            return
+        for fr in predict_area(fit, remaining):
+            yield json.dumps({"time": fr["epoch"], "uom": "AQI",
+                              "coords": fr["coords"], "vals": fr["vals"]}) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+
 @router.get("/{model}/type/range", response_class=JSONResponse)
 def ensemble_range(
     model: str,

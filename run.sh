@@ -117,4 +117,28 @@ test() {
     fi
 }
 
+# Install/refresh Python dependencies into the LIVE venv WITHOUT rebuilding the
+# image. Intended to be run INSIDE the running container, so the installed
+# packages persist in that container's venv (a throwaway `docker run` would
+# discard them). Reinstalls lib + server requirements (picks up newly-added
+# deps like eccodes/numpy for the AQI/GRIB2 layer).
+#
+# From the host, run it against your already-running dev/server container:
+#   docker exec -it <container> bash -c "cd $CODE_DIR && ./run.sh deps"
+# or open a shell in the container (./run.sh container) and run `./run.sh deps`.
+# The eccodes wheel bundles libeccodes, so no apt/root step is needed for a
+# live install; the Dockerfile still installs the system lib for clean builds.
+deps() {
+    local py="$VENV_PY"
+    command -v "$py" >/dev/null 2>&1 || py="python"
+    "$py" -m pip install --upgrade pip
+    "$py" -m pip install -r ./lib/requirements.txt
+    "$py" -m pip install -r ./server/requirements.txt
+    # Re-run the editable installs in case entry points / metadata changed.
+    "$py" -m pip install -e ./lib --no-cache-dir
+    "$py" -m pip install -e ./server --no-cache-dir
+    echo "deps installed into $py"
+    "$py" -c "import eccodes, scipy, numpy; print('eccodes', eccodes.__version__, '| scipy', scipy.__version__, '| numpy', numpy.__version__)"
+}
+
 "$@"

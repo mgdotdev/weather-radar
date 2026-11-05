@@ -191,6 +191,11 @@
     // whose opacity scales with value). Both consume the same IDW raster.
     const renderType = "{{render_type}}"
     const isHeatmap = renderType === "heatmap"
+    // AQI (NAQFC) is a separate data path: gridded hourly air-quality forecast
+    // sampled server-side (no NOAA /points prefetch, no bundle). When true the
+    // client fetches the /aqi/* endpoints instead of the NOAA ensemble ones;
+    // the frame wire format is identical, so rendering/scrubbing is unchanged.
+    const isAqi = kind === "aqi"
     // Contour interval: the value delta between adjacent contour lines
     // (e.g. 1.0, 0.5, 2.0 degrees). Configurable live in the legend.
     let contourStep = {{contour_step}}
@@ -1134,8 +1139,14 @@
         }
         showSpinner("Loading data…")
         try {
-          const bundled = await prefetchWithProgress()
-          if (!bundled) await fetchGlobalRange()
+          if (isAqi) {
+            // AQI has no NOAA prefetch (grid is sampled server-side); just get
+            // the fixed range + window, then stream frames.
+            await fetchGlobalRange()
+          } else {
+            const bundled = await prefetchWithProgress()
+            if (!bundled) await fetchGlobalRange()
+          }
           time = clampToForecast(time)
           showSpinner("Rendering…")
           await loadFrame(time)
@@ -1615,14 +1626,29 @@
         const ctrl = new AbortController()
         fillAbort = ctrl
 
-        const qs = [
-          `lat=${lat}`, `lon=${lon}`, `width=${width}`, `height=${height}`,
-          `kind=${kind}`, `dt=${step}`,
-          `start=${seqStart}`, `end=${seqHi}`,
-        ]
-        if (batch.length) qs.push(`times=${batch.join(",")}`)
-        const url = `/api/models/${model}/type/series/stream?${qs.join("&")}`
-        console.log(`[fill] seq=${seqStart}..${seqHi} batch=${batch.length} uncached=${uncached.length} pivot=${pivot}`)
+        let url
+        if (isAqi) {
+          // AQI now behaves like the NOAA series: the area's hourly NAQFC data
+          // is spline-fit server-side and evaluated at the requested epochs, so
+          // the SAME batch+sequence+dt request works and any dt scrubs smoothly.
+          const qs = [
+            `lat=${lat}`, `lon=${lon}`, `width=${width}`, `height=${height}`,
+            `pollutant=${encodeURIComponent(model)}`, `dt=${step}`,
+            `start=${seqStart}`, `end=${seqHi}`,
+          ]
+          if (batch.length) qs.push(`times=${batch.join(",")}`)
+          url = `/api/models/aqi/stream?${qs.join("&")}`
+          console.log(`[fill:aqi] seq=${seqStart}..${seqHi} batch=${batch.length} uncached=${uncached.length}`)
+        } else {
+          const qs = [
+            `lat=${lat}`, `lon=${lon}`, `width=${width}`, `height=${height}`,
+            `kind=${kind}`, `dt=${step}`,
+            `start=${seqStart}`, `end=${seqHi}`,
+          ]
+          if (batch.length) qs.push(`times=${batch.join(",")}`)
+          url = `/api/models/${model}/type/series/stream?${qs.join("&")}`
+          console.log(`[fill] seq=${seqStart}..${seqHi} batch=${batch.length} uncached=${uncached.length} pivot=${pivot}`)
+        }
 
         // Every uncached frame this request is responsible for (sequence run +
         // batch). On completion, any still-missing one is negative-cached as
@@ -1790,9 +1816,10 @@
       // Safe to call after /prefetch.
       async function fetchGlobalRange() {
         try {
-          const resp = await fetch(
-            `/api/models/${model}/type/range?lat=${lat}&lon=${lon}&width=${width}&height=${height}&kind=${kind}`
-          )
+          const url = isAqi
+            ? `/api/models/aqi/range?lat=${lat}&lon=${lon}&width=${width}&height=${height}&pollutant=${encodeURIComponent(model)}`
+            : `/api/models/${model}/type/range?lat=${lat}&lon=${lon}&width=${width}&height=${height}&kind=${kind}`
+          const resp = await fetch(url)
           applyRange(await resp.json())
         } catch (err) {
           console.warn("global range fetch failed; using per-frame range:", err)
@@ -2251,10 +2278,15 @@
         // bundle (range applied inline), so we skip fetchGlobalRange and the
         // frames below stream from the precomputed bundle — straight to
         // animation with no resolve/fetch/range round-trips.
-        const bundled = await prefetchWithProgress()
-        if (!bundled) {
-          // Fix the color scale to the whole-lifecycle range before rendering.
+        if (isAqi) {
+          // AQI: no NOAA prefetch/bundle — just fetch the fixed range + window.
           await fetchGlobalRange()
+        } else {
+          const bundled = await prefetchWithProgress()
+          if (!bundled) {
+            // Fix the color scale to the whole-lifecycle range before rendering.
+            await fetchGlobalRange()
+          }
         }
         time = clampToForecast(time)
         showSpinner("Rendering…")

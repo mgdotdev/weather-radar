@@ -7,7 +7,7 @@ WORKDIR /home/weather-radar
 ENV VENV=/home/weather-radar/venv
 
 RUN apt-get update \
- && apt-get install vim -y \
+ && apt-get install vim libeccodes0 libeccodes-dev -y \
  && python3 -m venv $VENV
 
 ENV PATH="$VENV/bin:$PATH"

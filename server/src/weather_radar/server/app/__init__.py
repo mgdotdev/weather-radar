@@ -95,6 +95,25 @@ _RAMP_NEUTRAL = [
     1.0, "rgb(63, 0, 125)",
 ]
 
+# EPA AQI category colors as a SMOOTH gradient over the 0..300 displayed AQI
+# range (the /aqi endpoints fix min=0, max=300). Blends continuously through
+# the category colors at their threshold positions (t/300) — a heatmap wash,
+# not hard category bands.
+#   Good            0   green  (0,228,0)
+#   Moderate       50   yellow (255,255,0)
+#   USG           100   orange (255,126,0)
+#   Unhealthy     150   red    (255,0,0)
+#   Very Unhealthy 200  purple (143,63,151)
+#   (300)               maroon (126,0,35)
+_RAMP_AQI = [
+    0.0,            "rgb(0, 228, 0)",
+    50.0 / 300.0,   "rgb(255, 255, 0)",
+    100.0 / 300.0,  "rgb(255, 126, 0)",
+    150.0 / 300.0,  "rgb(255, 0, 0)",
+    200.0 / 300.0,  "rgb(143, 63, 151)",
+    1.0,            "rgb(126, 0, 35)",
+]
+
 # (kind, label) for every contourable NOAA gridpoint layer we support, keyed
 # by the kebab-case name used in URLs. Cumulative layers use "accumulation".
 #
@@ -108,6 +127,8 @@ _RAMP_NEUTRAL = [
 #     often sparse, and poor as continuous contours.
 _ACCUMULATION = "accumulation"
 _OBSERVATION = "observation"
+_AQI = "aqi"  # NAQFC gridded air-quality forecast; a separate (non-NOAA) data
+              # path sampled directly from GRIB2 (see lib/aqi.py + /aqi endpoints).
 
 # Each entry is (kind, label, attribute):
 #   kind      - which ensemble fetches the data ("observation" for
@@ -149,6 +170,11 @@ MODEL_CATALOG = {
     # Other continuous fields
     "pressure": (_OBSERVATION, "Pressure", "pressure"),
     "visibility": (_OBSERVATION, "Visibility", "visibility"),
+    # Air quality (NAQFC gridded hourly forecast). `attribute` is the pollutant
+    # key passed to the /aqi endpoints (pm25 | ozone). kind=_AQI routes the
+    # client to the AQI data path instead of the NOAA ensemble path.
+    "air-quality-pm25": (_AQI, "Air Quality (PM2.5)", "pm25"),
+    "air-quality-ozone": (_AQI, "Air Quality (Ozone)", "ozone"),
 }
 
 # Optional bespoke styling per model (seed step + ramp). Anything omitted uses
@@ -188,6 +214,12 @@ _CUSTOM_STYLE = {
     # that imply hard cloud edges. Seed step of 10% ~= one okta; auto-scaling
     # refines it.
     "sky-cover": {"contour_step": 10.0, "color_ramp": _RAMP_CLOUD, "render": _RENDER_HEATMAP},
+    # Air quality: the stepwise EPA AQI category ramp as a heatmap wash (smooth
+    # field, category-colored). Rendered as heatmap because the IDW field reads
+    # like Apple-style AQI shading; the stepwise ramp keeps the category colors
+    # crisp. contour_step is unused for heatmaps (kept as a seed).
+    "air-quality-pm25": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP},
+    "air-quality-ozone": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP},
 }
 
 _DEFAULT_STYLE = {"contour_step": 1.0, "color_ramp": _RAMP_NEUTRAL}

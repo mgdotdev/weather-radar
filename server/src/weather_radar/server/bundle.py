@@ -87,17 +87,120 @@ def _area_source_mtime(area):
     return newest
 
 
+def _aqi_grib_mtime(pollutant):
+    """Freshness signal for an AQI bundle: the mtime of the NAQFC GRIB the
+    bundle was built from. A bundle is stale once a newer GRIB is downloaded
+    (new cycle). Returns 0.0 if unknown."""
+    try:
+        from weather_radar.lib import aqi
+        import os as _os
+        # The current grid path for this pollutant (set when ensure_grid ran).
+        with aqi._CURRENT_PATH_LOCK:
+            path = aqi._CURRENT_PATH.get(pollutant)
+        if path and _os.path.exists(path):
+            return _os.path.getmtime(path)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _build_bundle_aqi(model, lat, lon, width, height, dt, kind):
+    """Produce (header, frame_iterator, path) for an AQI bundle — the frames
+    come from the NAQFC per-gridpoint CubicSpline fit (aqi.fit_area), evaluated
+    over the whole forecast window at `dt`, IDENTICAL to what /aqi/stream emits
+    live. `model` is the pollutant (pm25|ozone)."""
+    from datetime import datetime
+    from weather_radar.lib.area import MapCoordinate, CoordinateArea
+    from weather_radar.lib import aqi as aqi_mod
+
+    area = CoordinateArea(MapCoordinate(lat, lon), width, height)
+    fit = aqi_mod.fit_area(area, model)
+    if fit is None:
+        return None
+    start, end = fit["start"], fit["end"]
+    step = int(dt) if dt and int(dt) > 0 else 3600
+    if end <= start:
+        return None
+
+    tz = None
+    try:
+        tz = area.time_zone
+    except Exception:
+        pass
+    # AQI range is the fixed display scale (mirrors the /aqi/range endpoint).
+    rng = {"min": 0, "max": 300, "uom": "AQI",
+           "start": datetime.fromtimestamp(start).isoformat(),
+           "end": datetime.fromtimestamp(end).isoformat(), "timeZone": tz}
+    header = {
+        "type": "range", "range": rng,
+        "meta": {"model": model, "kind": kind, "lat": lat, "lon": lon,
+                 "width": width, "height": height, "dt": int(dt),
+                 "source_mtime": _aqi_grib_mtime(model),
+                 "built": datetime.now().isoformat()},
+    }
+
+    epochs = list(range(start, end + 1, step))
+
+    def frames():
+        for fr in aqi_mod.predict_area(fit, epochs):
+            yield {"time": fr["epoch"], "uom": "AQI",
+                   "coords": fr["coords"], "vals": fr["vals"]}
+
+    return header, frames()
+
+
+def _write_bundle_ndjson(path, header, frame_iter):
+    """Write a gzipped-NDJSON bundle: header line, then one frame line per
+    item from `frame_iter` (streamed, bounded memory). Atomic publish. Returns
+    the frame count, or 0 (and no file) if there were none."""
+    tmp = path + ".tmp"
+    n = 0
+    try:
+        os.makedirs(BUNDLE_DIR, exist_ok=True)
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            f.write(json.dumps(header, separators=(",", ":")) + "\n")
+            for rec in frame_iter:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                n += 1
+        if n == 0:
+            os.unlink(tmp)
+            return 0
+        os.replace(tmp, path)
+    except OSError:
+        logger.warning("bundle write failed for %s", path, exc_info=True)
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        return 0
+    return n
+
+
 def build_bundle(model, lat, lon, width, height, dt, kind):
     """Compute the full animation for a watched URL and write it to disk as
-    gzipped NDJSON. Returns the bundle path on success, or None if there's no
-    data to bundle.
+    gzipped NDJSON (header line + one {time,uom,coords,vals} frame per line).
+    Returns the bundle path on success, or None.
 
-    Heavy: evaluates every gridpoint at every frame. Intended to run in the
-    background (the bundle builder), NOT on a request. Frames are written
-    INCREMENTALLY to the gzip stream as they're computed, so peak memory stays
-    bounded regardless of area size."""
-    # Imported here to avoid pulling the model/ensemble stack into modules that
-    # only read bundles.
+    Dispatches on `kind`: AQI uses the NAQFC spline path (bypassing NOAA
+    gridpoints); everything else uses the NOAA ensemble path. Both write the
+    SAME NDJSON format, so serving is identical. Heavy — run in the background
+    builder, not on a request; frames stream to disk (bounded memory)."""
+    path = _bundle_path(model, lat, lon, width, height, dt, kind)
+
+    if kind == "aqi":
+        built = _build_bundle_aqi(model, lat, lon, width, height, dt, kind)
+        if built is None:
+            return None
+        header, frames = built
+        n = _write_bundle_ndjson(path, header, frames)
+        if n == 0:
+            return None
+        logger.warning("bundle built (aqi): model=%s %dx%dkm dt=%d -> %d frames",
+                       model, int(width), int(height), int(dt), n)
+        return path
+
+    # --- NOAA ensemble path ---
     from datetime import datetime
     from weather_radar.lib.area import MapCoordinate, CoordinateArea
     from weather_radar.lib.models.utils import BoundsError
@@ -118,7 +221,6 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
         end = int(datetime.fromisoformat(rng["end"]).timestamp())
     except Exception:
         return None
-    # Mirror the client: timezone comes from the area center.
     try:
         rng = dict(rng)
         rng["timeZone"] = area.time_zone
@@ -129,8 +231,6 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
     if end <= start:
         return None
 
-    # Precompute each gridpoint's coord once (as the stream endpoint does:
-    # [center.lat, center.lon]). Skip models that fail to build.
     gridpoints = list(area.iter_gridpoints())
     models = []
     coords = []
@@ -147,62 +247,41 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
     if not models:
         return None
 
-    source_mtime = _area_source_mtime(area)
     header = {
         "type": "range",
         "range": rng,
         "meta": {
             "model": model, "kind": kind,
             "lat": lat, "lon": lon, "width": width, "height": height,
-            "dt": int(dt), "source_mtime": source_mtime,
+            "dt": int(dt), "source_mtime": _area_source_mtime(area),
             "built": datetime.now().isoformat(),
         },
     }
 
-    # Write gzipped NDJSON: header line, then one frame record per line,
-    # streamed as each frame is computed (bounded memory). Atomic publish via
-    # a temp file + os.replace so a reader never sees a partial bundle.
-    path = _bundle_path(model, lat, lon, width, height, dt, kind)
-    tmp = path + ".tmp"
-    n_frames = 0
-    try:
-        os.makedirs(BUNDLE_DIR, exist_ok=True)
-        with gzip.open(tmp, "wt", encoding="utf-8") as f:
-            f.write(json.dumps(header, separators=(",", ":")) + "\n")
-            t = start
-            n = 0
-            while t <= end + 1 and n < MAX_FRAMES:
-                dtime = datetime.fromtimestamp(t)
-                fcoords = []
-                vals = []
-                for m, c in zip(models, coords):
-                    try:
-                        y = m.predict(dtime, verbose=False)
-                    except BoundsError:
-                        continue
-                    except Exception:
-                        continue
-                    fcoords.append(c)
-                    vals.append(y)
-                if vals:
-                    rec = {"time": t, "uom": uom, "coords": fcoords, "vals": vals}
-                    f.write(json.dumps(rec, separators=(",", ":")) + "\n")
-                    n_frames += 1
-                t += step
-                n += 1
-        if n_frames == 0:
-            os.unlink(tmp)
-            return None
-        os.replace(tmp, path)
-    except OSError:
-        logger.warning("bundle write failed for %s", path, exc_info=True)
-        try:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-        except OSError:
-            pass
-        return None
+    def frames():
+        t = start
+        n = 0
+        while t <= end + 1 and n < MAX_FRAMES:
+            dtime = datetime.fromtimestamp(t)
+            fcoords = []
+            vals = []
+            for m, c in zip(models, coords):
+                try:
+                    y = m.predict(dtime, verbose=False)
+                except BoundsError:
+                    continue
+                except Exception:
+                    continue
+                fcoords.append(c)
+                vals.append(y)
+            if vals:
+                yield {"time": t, "uom": uom, "coords": fcoords, "vals": vals}
+            t += step
+            n += 1
 
+    n_frames = _write_bundle_ndjson(path, header, frames())
+    if n_frames == 0:
+        return None
     logger.warning(
         "bundle built: model=%s %dx%dkm dt=%d -> %d frames (%d gridpoints)",
         model, int(width), int(height), int(dt), n_frames, len(models),
@@ -341,9 +420,10 @@ def _params_for_url(url):
 
 
 def _bundle_is_fresh(model, lat, lon, width, height, dt, kind):
-    """Builder-side freshness check: True if an on-disk bundle exists AND no
-    gridpoint's data has changed since it was built. Resolves gridpoints (via
-    _area_source_mtime), so this is for the BACKGROUND builder only — never the
+    """Builder-side freshness check: True if an on-disk bundle exists AND its
+    source hasn't changed since it was built. For NOAA kinds the source signal
+    is the area's gridpoint change-markers; for AQI it's the NAQFC GRIB mtime.
+    Resolves data, so this is for the BACKGROUND builder only — never a
     request path."""
     path = _bundle_path(model, lat, lon, width, height, dt, kind)
     if not os.path.exists(path):
@@ -352,6 +432,9 @@ def _bundle_is_fresh(model, lat, lon, width, height, dt, kind):
     if built is None:
         return False  # unreadable/corrupt header -> rebuild
     try:
+        if kind == "aqi":
+            # AQI source = the NAQFC GRIB; stale once a newer cycle downloaded.
+            return _aqi_grib_mtime(model) <= built + 1e-6
         from weather_radar.lib.area import MapCoordinate, CoordinateArea
         area = CoordinateArea(MapCoordinate(lat, lon), width, height)
         return _area_source_mtime(area) <= built + 1e-6
