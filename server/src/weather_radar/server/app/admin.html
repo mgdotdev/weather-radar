@@ -4,8 +4,6 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>weather-radar · hot-cache admin</title>
-  <script src="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.js"></script>
-  <link href="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
   <style>
     :root { --fg:#222; --muted:#666; --border:#ddd; --accent:#1565c0; --bg:#fafafa; --danger:#c0392b; }
     * { box-sizing: border-box; }
@@ -48,8 +46,8 @@
     .badge-error { background:#fdecea; color:var(--danger); }
     .badge-unknown { background:#eee; color:#666; }
     .preview { width: 160px; height: 100px; border-radius: 6px; overflow: hidden;
-               border: 1px solid var(--border); background: #eee; }
-    .preview .maplibregl-ctrl-attrib, .preview .maplibregl-ctrl { display: none !important; }
+               border: 1px solid var(--border); background: #eee; display: block;
+               font-size: 11px; color: var(--muted); }
   </style>
 </head>
 <body>
@@ -102,13 +100,11 @@
     const tokenEl = $("token"), urlEl = $("url"), msgEl = $("msg"),
           rowsEl = $("rows"), statsEl = $("stats")
 
-    // Live preview map instances, torn down before each re-render to avoid
-    // leaking WebGL contexts as the list is refreshed.
-    let previewMaps = []
-    function destroyPreviews() {
-      for (const m of previewMaps) { try { m.remove() } catch (_) {} }
-      previewMaps = []
-    }
+    // Previews are static canvas images (OSM raster tiles with the area drawn
+    // on top) — NOT live maps. This avoids one WebGL context per row, which
+    // the browser caps (~8-16), silently blanking later previews. Nothing to
+    // tear down between renders now, but keep a no-op for call sites.
+    function destroyPreviews() {}
 
     // Persist the token locally so it survives reloads (convenience only).
     tokenEl.value = localStorage.getItem("wr_admin_token") || ""
@@ -150,6 +146,17 @@
     // Parse an app URL's area params into a [ [west,south],[east,north] ]
     // bounding box, mirroring the server geometry (km span -> degrees). Returns
     // null if the URL has no usable lat/lon (e.g. a graph URL).
+    //
+    // The box marks the AREA THE SERVER FETCHES, computed exactly as
+    // CoordinateArea.index_bounds does in area.py (the preview has no rendered
+    // field to measure, so the fetched-area boundary is the right thing to
+    // show). Two subtleties mirrored verbatim:
+    //   1. Axis/divisor assignment: the server uses width/110.574 for the
+    //      LONGITUDE span and height/(111.320·cos lat) for the LATITUDE span.
+    //   2. Lattice snap: the resolved area is expanded outward to whole lattice
+    //      cells (floor/ceil on LATTICE_STEP_DEG), so the box spans
+    //      [j0·step, j1·step] × [i0·step, i1·step].
+    const LATTICE_STEP_DEG = 2.5 / 110.574  // SAMPLE_STEP_KM / 110.574
     function areaBounds(urlStr) {
       let q
       try { q = new URL(urlStr).searchParams } catch (_) { return null }
@@ -160,39 +167,119 @@
       const lat = num("lat", NaN), lon = num("lon", NaN)
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null
       const width = num("width", 1), height = num("height", 1)  // km
-      // Server: dkm_to_dlat = km/110.574 ; dkm_to_dlon = km/(111.320*cos(lat)).
-      // width drives the lon span, height the lat span (see map.html geometry).
-      const dLon = width / (111.320 * Math.cos(lat * Math.PI / 180))
-      const dLat = height / 110.574
-      return [[lon - dLon / 2, lat - dLat / 2], [lon + dLon / 2, lat + dLat / 2]]
+      const dx = width / 110.574                                   // lon span
+      const dy = height / (111.320 * Math.cos(lat * Math.PI / 180)) // lat span
+      const x = lon - dx / 2, y = lat - dy / 2
+      const step = LATTICE_STEP_DEG
+      const i0 = Math.floor(y / step), i1 = Math.ceil((y + dy) / step)
+      const j0 = Math.floor(x / step), j1 = Math.ceil((x + dx) / step)
+      const s = i0 * step, n = i1 * step   // latitude bounds
+      const w = j0 * step, e = j1 * step   // longitude bounds
+      return [[w, s], [e, n]]
     }
 
-    // Render a small static basemap (no contours) fit to the given bounds.
-    function makePreview(container, bounds) {
-      try {
-        const m = new maplibregl.Map({
-          container,
-          style: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-          bounds, fitBoundsOptions: { padding: 6, animate: false },
-          interactive: false, attributionControl: false,
-        })
-        previewMaps.push(m)
-        // Draw the area rectangle once the style is ready.
-        m.on("load", () => {
-          const [[w, s], [e, n]] = bounds
-          m.addSource("area", {
-            type: "geojson",
-            data: { type: "Feature", geometry: { type: "Polygon",
-              coordinates: [[[w, s], [e, s], [e, n], [w, n], [w, s]]] } },
-          })
-          m.addLayer({ id: "area-line", type: "line", source: "area",
-            paint: { "line-color": "#1565c0", "line-width": 1.5 } })
-          m.addLayer({ id: "area-fill", type: "fill", source: "area",
-            paint: { "fill-color": "#1565c0", "fill-opacity": 0.08 } })
-        })
-      } catch (e) {
-        container.textContent = "(preview unavailable)"
+    // --- Static tile preview ----------------------------------------------
+    // Render a small STATIC thumbnail: OSM raster tiles covering the area,
+    // with the watched rectangle drawn on top, painted to a <canvas>. No
+    // maplibre / WebGL — so an arbitrarily long watch-list never exhausts the
+    // browser's WebGL context budget.
+
+    const PREVIEW_W = 160, PREVIEW_H = 100
+    const TILE = 256
+    // Keyless OSM raster tiles. (Fine for a low-traffic internal admin page.)
+    const TILE_URL = (z, x, y) =>
+      `https://tile.openstreetmap.org/${z}/${x}/${y}.png`
+
+    // Web-Mercator helpers (lon/lat <-> fractional tile coords at zoom z).
+    const lon2tile = (lon, z) => (lon + 180) / 360 * Math.pow(2, z)
+    const lat2tile = (lat, z) => {
+      const r = lat * Math.PI / 180
+      return (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * Math.pow(2, z)
+    }
+
+    // Largest zoom whose pixel span for `bounds` still fits in the thumbnail
+    // (with a little padding), clamped to OSM's 0..19.
+    function fitZoom(bounds) {
+      const [[w, s], [e, n]] = bounds
+      for (let z = 19; z >= 0; z--) {
+        const px = Math.abs(lon2tile(e, z) - lon2tile(w, z)) * TILE
+        const py = Math.abs(lat2tile(s, z) - lat2tile(n, z)) * TILE
+        if (px <= PREVIEW_W - 12 && py <= PREVIEW_H - 12) return z
       }
+      return 0
+    }
+
+    function makePreview(container, bounds) {
+      const [[w, s], [e, n]] = bounds
+      const z = fitZoom(bounds)
+      const scale = Math.pow(2, z)
+
+      // Center of the area in fractional tile space, then in pixels.
+      const cxTile = (lon2tile(w, z) + lon2tile(e, z)) / 2
+      const cyTile = (lat2tile(n, z) + lat2tile(s, z)) / 2
+      const cxPx = cxTile * TILE, cyPx = cyTile * TILE
+
+      const canvas = document.createElement("canvas")
+      // Render at device pixel ratio for crispness, but lay out at CSS size.
+      const dpr = window.devicePixelRatio || 1
+      canvas.width = PREVIEW_W * dpr
+      canvas.height = PREVIEW_H * dpr
+      canvas.style.width = PREVIEW_W + "px"
+      canvas.style.height = PREVIEW_H + "px"
+      container.appendChild(canvas)
+      const ctx = canvas.getContext("2d")
+      ctx.scale(dpr, dpr)
+
+      // Top-left pixel of the thumbnail in world-pixel space.
+      const originX = cxPx - PREVIEW_W / 2
+      const originY = cyPx - PREVIEW_H / 2
+
+      // Which tiles intersect the thumbnail viewport.
+      const minTX = Math.floor(originX / TILE)
+      const maxTX = Math.floor((originX + PREVIEW_W) / TILE)
+      const minTY = Math.floor(originY / TILE)
+      const maxTY = Math.floor((originY + PREVIEW_H) / TILE)
+
+      let pending = 0
+      const drawOverlay = () => {
+        // Area rectangle, converted from lon/lat to thumbnail pixels.
+        const x0 = lon2tile(w, z) * TILE - originX
+        const x1 = lon2tile(e, z) * TILE - originX
+        const y0 = lat2tile(n, z) * TILE - originY
+        const y1 = lat2tile(s, z) * TILE - originY
+        ctx.fillStyle = "rgba(21,101,192,0.12)"
+        ctx.strokeStyle = "#1565c0"
+        ctx.lineWidth = 1.5
+        ctx.fillRect(x0, y0, x1 - x0, y1 - y0)
+        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0)
+      }
+
+      let drewAny = false
+      for (let tx = minTX; tx <= maxTX; tx++) {
+        for (let ty = minTY; ty <= maxTY; ty++) {
+          // Wrap X; clamp Y to valid range (no tiles beyond the poles).
+          const wrappedX = ((tx % scale) + scale) % scale
+          if (ty < 0 || ty >= scale) continue
+          pending++
+          const img = new Image()
+          img.crossOrigin = "anonymous"
+          img.onload = () => {
+            ctx.drawImage(img, tx * TILE - originX, ty * TILE - originY, TILE, TILE)
+            drewAny = true
+            if (--pending === 0) drawOverlay()
+          }
+          img.onerror = () => {
+            if (--pending === 0) {
+              if (drewAny) drawOverlay()
+              else container.replaceChildren(
+                Object.assign(document.createElement("span"),
+                  { textContent: "(preview unavailable)" }))
+            }
+          }
+          img.src = TILE_URL(z, wrappedX, ty)
+        }
+      }
+      if (pending === 0) drawOverlay()
     }
 
     function render(list) {
@@ -231,7 +318,7 @@
           tr.appendChild(tdPrev); tr.appendChild(tdUrl); tr.appendChild(tdAct)
           rowsEl.appendChild(tr)
 
-          // Build the mini-map after the row is in the DOM (needs layout).
+          // Static thumbnail: OSM tiles + the area rectangle on a canvas.
           const bounds = areaBounds(u)
           if (bounds) makePreview(prev, bounds)
           else prev.textContent = ""

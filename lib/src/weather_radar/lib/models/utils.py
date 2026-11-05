@@ -54,3 +54,35 @@ def clamp_value(attribute, value):
 
 
 class BoundsError(Exception): ...
+
+
+def source_mtime(path):
+    """Return the content-change timestamp for NOAA `path` (e.g.
+    "/gridpoints/WFO/x,y"), or None if it isn't cached.
+
+    This is the change-signal for fitted derived artifacts (splines). It reads
+    the cache-writer's change-MARKER sidecar (``data.json.changed``), whose
+    mtime the writer bumps ONLY when a refetch returns genuinely different
+    content — unchanged refreshes (which still extend freshness) leave it
+    alone. So a spline is stale IFF this marker's mtime has advanced past the
+    value observed at fit time. Falls back to the data.json mtime for legacy
+    caches with no marker yet. A single os.stat — cheap enough for a
+    per-request freshness gate (no JSON parse of the large doc).
+
+    Imported lazily so this module (pure helpers) has no hard dependency on
+    the cache layer.
+    """
+    import os
+    from ..connection import PathObj
+    data_file = PathObj(path).tempfile
+    marker = data_file + ".changed"
+    try:
+        return os.path.getmtime(marker)
+    except OSError:
+        pass
+    # Legacy (pre-marker) cache: fall back to the data file's mtime. Less
+    # precise (bumps on every refresh) but never misses a real change.
+    try:
+        return os.path.getmtime(data_file)
+    except OSError:
+        return None

@@ -512,7 +512,8 @@
       // full-extent polygons for thresholds at/below the constant value.
       const FLAT_EPS = 1e-9
       if (!(vMax - vMin > FLAT_EPS)) {
-        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax, units: lastUnits || "" }
+        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax,
+                 units: lastUnits || "", extent: { w: minLon, e: maxLon, s: minLat, n: maxLat } }
       }
 
       // Color scale: use the FIXED global range (whole forecast lifecycle)
@@ -534,7 +535,8 @@
         if (tv > vMin + 1e-9 && tv < vMax - 1e-9) thresholds.push(tv)
       }
       if (!thresholds.length) {
-        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax, units: lastUnits || "" }
+        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax,
+                 units: lastUnits || "", extent: { w: minLon, e: maxLon, s: minLat, n: maxLat } }
       }
 
       const polys = d3.contours().size([GRID, GRID]).thresholds(thresholds)(values)
@@ -557,9 +559,23 @@
       })
 
       const units = lastUnits || ""
-      // Report the color-scale range (global when fixed) so the legend matches
-      // the colors and stays stable across frames.
-      return { fc: { type: "FeatureCollection", features: outFeatures }, vMin: cMin, vMax: cMax, units }
+      // `extent` = where the drawn contours ACTUALLY reach, derived empirically
+      // (painted − box measured to zero): the field's west/south edges sit at
+      // the raw grid min (minLon/minLat), while the east/north edges overhang
+      // by one full cell. This is d3-contour's grid-space span ([-0.5, GRID-0.5]
+      // GRID cells wide) combined with toLngLat's /(GRID-1) scaling, which puts
+      // the min edge at the grid origin and the max edge a full cell beyond.
+      // Grid-only, so the box is STABLE across frames.
+      const cellLon = (maxLon - minLon) / (GRID - 1)
+      const cellLat = (maxLat - minLat) / (GRID - 1)
+      return {
+        fc: { type: "FeatureCollection", features: outFeatures },
+        vMin: cMin, vMax: cMax, units,
+        extent: {
+          w: minLon, e: maxLon + cellLon,
+          s: minLat, n: maxLat + cellLat,
+        },
+      }
     }
 
     // ---- Heatmap construction ----------------------------------------------
@@ -638,6 +654,36 @@
       return num / den
     }
 
+    function boxPolygon(ext) {
+      const { w, e, s, n } = ext
+      return {
+        type: "Feature",
+        geometry: {
+          type: "Polygon",
+          coordinates: [[[w, s], [e, s], [e, n], [w, n], [w, s]]],
+        },
+      }
+    }
+    // The extent actually painted this frame, stashed by renderFeatures so the
+    // box fits the real geometry (not a reproduced formula). {w,e,s,n} or null.
+    let lastFieldExtent = null
+    function areaBoxGeoJSON() {
+      if (lastFieldExtent) return boxPolygon(lastFieldExtent)
+      // Fallback before anything is drawn: approximate from width/height.
+      const dx = width / 110.574
+      const dy = height / (111.320 * Math.cos(lat * Math.PI / 180))
+      return boxPolygon({
+        w: lon - dx / 2, e: lon + dx / 2, s: lat - dy / 2, n: lat + dy / 2,
+      })
+    }
+
+    // Refresh the area-box layer to the current area. Safe to call before the
+    // source exists (e.g. very early) — it no-ops until the map is ready.
+    function updateAreaBox() {
+      const src = map.getSource && map.getSource("area")
+      if (src) src.setData(areaBoxGeoJSON())
+    }
+
     map.on("load", async () => {
       // Overlay sources + layers. The isoband overlay uses the `contours`
       // source (faint fill + strong lines). The heatmap overlay uses a raster
@@ -654,6 +700,19 @@
         id: 'contour-lines', type: 'line', source: 'contours',
         layout: { 'line-join': 'round', visibility: isHeatmap ? 'none' : 'visible' },
         paint: { 'line-color': ['get', 'fillColor'], 'line-width': 1.6, 'line-opacity': 0.9 }
+      })
+
+      // Outline of the currently-loaded area (the width×height region the
+      // contour/heatmap field covers). A thin solid rectangle so it reads as
+      // a boundary marker without competing with the data overlay. Updated
+      // whenever the area changes (loadArea) via updateAreaBox().
+      map.addSource("area", { type: "geojson", data: areaBoxGeoJSON() })
+      map.addLayer({
+        id: "area-box", type: "line", source: "area",
+        paint: {
+          "line-color": "#1565c0", "line-width": 1.5,
+          "line-opacity": 0.8,
+        },
       })
 
       const mapContainer = document.getElementById("weatherRadar")
@@ -854,6 +913,9 @@
         width = Math.abs(b.getEast() - b.getWest()) * 110.574
         height = Math.abs(b.getNorth() - b.getSouth()) * (111.320 * Math.cos(lat * Math.PI / 180))
 
+        // Move the area-outline box to the newly-sized area.
+        updateAreaBox()
+
         // Pan to the new center when recentering (keep current zoom); "Capture
         // area" keeps the current view. Either way, sync the URL in place — no
         // page reload.
@@ -1011,14 +1073,27 @@
           if (info) {
             showHeatmap(info)
             updateLegend(info.vMin, info.vMax, info.units)
+            // Image corner quad [TL,TR,BR,BL] -> exact painted extent.
+            if (info.coordinates) {
+              const co = info.coordinates
+              lastFieldExtent = {
+                w: Math.min(co[0][0], co[3][0]), e: Math.max(co[1][0], co[2][0]),
+                s: Math.min(co[2][1], co[3][1]), n: Math.max(co[0][1], co[1][1]),
+              }
+            }
           }
         } else {
           const info = buildContours(points)
           if (info) {
             map.getSource("contours").setData(info.fc)
             updateLegend(info.vMin, info.vMax, info.units)
+            // Use the FIELD GRID extent (stable across frames), NOT the contour
+            // polygons' bounds — the latter shrink/grow as thresholds change.
+            if (info.extent) lastFieldExtent = info.extent
           }
         }
+        // The painted geometry is now current, so fit the area-outline box.
+        updateAreaBox()
         // Keep the cursor readout and dropped pins in sync with the new
         // frame's data.
         refreshReadout()

@@ -9,7 +9,7 @@ from ..connection import NOAAConnection
 
 from scipy import interpolate
 
-from .utils import BoundsError, to_camel_case
+from .utils import BoundsError, to_camel_case, source_mtime
 
 
 logger = logging.getLogger(__name__)
@@ -62,17 +62,27 @@ class AccumulationModel:
 
     @property
     def is_expired(self) -> bool:
-        """True if the fitted model is missing or its source data has
-        expired and should be refit."""
+        """True if the fitted model is missing or its underlying NOAA data has
+        been UPDATED on disk since the fit. See ObservationModel.is_expired —
+        invalidation is keyed on the source cache file's mtime (a republish
+        signal), not wall-clock Expires, so unchanged data isn't needlessly
+        refit (×every worker)."""
         if "model" not in self.__dict__:
             return True
-        expiry = self.__dict__["model"][-1]
-        return expiry < datetime.now()
+        current = source_mtime(f"/gridpoints/{self.coordinate}")
+        if current is None:
+            expiry = self.__dict__["model"][-1]
+            return expiry < datetime.now()
+        return current != self._source_mtime
 
     @cached_property
     def model(self):
         """Spline of a cumulative model, derivative is accumulator at a
         given time"""
+
+        # Capture the source file's mtime before reading (see
+        # ObservationModel.model) so is_expired can detect a later republish.
+        self._source_mtime = source_mtime(f"/gridpoints/{self.coordinate}")
 
         conn = NOAAConnection()
         expiry, data = conn.get_with_expiry(f"/gridpoints/{self.coordinate}")

@@ -131,3 +131,83 @@ class TestCacheWriter:
         time.sleep(0.05)
         cw.ensure(["/points/1,1"])  # still fresh -> should be skipped
         assert os.path.getmtime(cache_file) == m1
+
+
+class TestContentChangeMarker:
+    """The change-marker sidecar (`data.json.changed`) tracks when CONTENT
+    last changed, so derived artifacts (splines) refit only on a real change —
+    NOT on every refresh. These unit-test the helpers directly (no writer
+    process needed), mirroring how _fetch_one uses them."""
+
+    def _load_cw(self, monkeypatch, cache_dir):
+        monkeypatch.setenv("CACHE_DIR", cache_dir)
+        # A minimal fake requests so the module imports (helpers don't use it).
+        fake = types.ModuleType("requests")
+        exc = types.ModuleType("requests.exceptions")
+        exc.ConnectionError = type("ConnectionError", (Exception,), {})
+        exc.Timeout = type("Timeout", (Exception,), {})
+        fake.exceptions = exc
+        fake.session = lambda: None
+        monkeypatch.setitem(sys.modules, "requests", fake)
+        here = os.path.dirname(__file__)
+        src = os.path.abspath(os.path.join(
+            here, "..", "src", "weather_radar", "lib", "cachewriter.py"))
+        spec = importlib.util.spec_from_file_location("cw_marker_under_test", src)
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, "cw_marker_under_test", mod)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_identical_content_leaves_marker_mtime(self, monkeypatch):
+        cache_dir = tempfile.mkdtemp()
+        cw = self._load_cw(monkeypatch, cache_dir)
+        cache_file = os.path.join(cache_dir, "data.json")
+
+        payload = {"headers": {"Expires": "x"}, "json": {"values": [1, 2, 3]}}
+        h = cw._content_hash(payload)
+        with open(cache_file, "w") as f:
+            json.dump(payload, f)
+        cw._write_change_marker(cache_file, h)
+        marker = cw._change_marker(cache_file)
+        m0 = os.path.getmtime(marker)
+
+        # Refetch returns identical content: hash matches -> DON'T touch marker.
+        time.sleep(0.02)
+        assert cw._read_existing_hash(cache_file) == h
+        # (identical path in _fetch_one performs no _write_change_marker)
+        assert os.path.getmtime(marker) == m0
+
+    def test_changed_content_advances_marker_mtime(self, monkeypatch):
+        cache_dir = tempfile.mkdtemp()
+        cw = self._load_cw(monkeypatch, cache_dir)
+        cache_file = os.path.join(cache_dir, "data.json")
+
+        p1 = {"headers": {"Expires": "x"}, "json": {"values": [1, 2, 3]}}
+        cw._write_change_marker(cache_file, cw._content_hash(p1))
+        marker = cw._change_marker(cache_file)
+        m0 = os.path.getmtime(marker)
+
+        time.sleep(0.02)
+        p2 = {"headers": {"Expires": "x"}, "json": {"values": [1, 2, 4]}}
+        assert cw._content_hash(p2) != cw._content_hash(p1)
+        cw._write_change_marker(cache_file, cw._content_hash(p2))
+        assert os.path.getmtime(marker) > m0
+
+    def test_content_hash_ignores_headers_and_key_order(self, monkeypatch):
+        cw = self._load_cw(monkeypatch, tempfile.mkdtemp())
+        a = {"headers": {"Expires": "A", "Date": "1"}, "json": {"b": 2, "a": 1}}
+        b = {"headers": {"Expires": "B", "Date": "2"}, "json": {"a": 1, "b": 2}}
+        assert cw._content_hash(a) == cw._content_hash(b)
+
+    def test_read_existing_hash_falls_back_to_body(self, monkeypatch):
+        """A legacy cache file with no marker: the stored body is hashed so an
+        unchanged refetch is still recognised as unchanged."""
+        cache_dir = tempfile.mkdtemp()
+        cw = self._load_cw(monkeypatch, cache_dir)
+        cache_file = os.path.join(cache_dir, "data.json")
+        payload = {"headers": {"Expires": "x"}, "json": {"values": [9]}}
+        with open(cache_file, "w") as f:
+            json.dump(payload, f)
+        # No marker written. Fallback must hash the body and match.
+        assert not os.path.exists(cw._change_marker(cache_file))
+        assert cw._read_existing_hash(cache_file) == cw._content_hash(payload)

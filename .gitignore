@@ -1,5 +1,6 @@
 .venv/
 .local/
+.kiro/
 __pycache__/
 
 *.egg-info/

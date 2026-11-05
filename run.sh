@@ -24,11 +24,11 @@ container() {
 
 # Run the webserver. On the host this launches a container (publishing :8000
 # and mounting the repo so edits are live); inside the container it runs
-# uvicorn directly. An optional first arg sets the worker count (default 16).
-#   ./run.sh server        # 16 workers
-#   ./run.sh server 4      # 4 workers
+# uvicorn directly. An optional first arg sets the worker count (default 4).
+#   ./run.sh server        # 4 workers
+#   ./run.sh server 8      # 8 workers
 server() {
-    local workers="${1:-16}"
+    local workers="${1:-4}"
     if command -v docker >/dev/null 2>&1; then
         docker run --rm -it \
           -p 8000:8000 \
@@ -39,6 +39,8 @@ server() {
           -e WR_STREAM_TIMING \
           -e WR_RESOLVE_TIMING \
           -e NOAA_MAX_CONCURRENCY \
+          -e WR_WARM_SPLINES \
+          -e WR_WARM_INTERVAL_SEC \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh server $workers"
     else
         local py="$VENV_PY"

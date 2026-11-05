@@ -13,7 +13,7 @@ from . import api, app
 
 logger = logging.getLogger()
 
-# Guards against 16 uvicorn workers each spawning background processes: only
+# Guards against the uvicorn workers each spawning background processes: only
 # the worker that wins this file lock spawns the single cache-writer and
 # hot-cache scheduler. The lock fd is kept open for the life of the process
 # (releasing it on exit lets a future restart re-elect a spawner).
@@ -114,8 +114,13 @@ def server():
     @server.on_event("startup")
     def _startup():
         # Each uvicorn worker runs this; the file lock ensures exactly one
-        # actually spawns the background processes.
+        # actually spawns the background processes (writer + scheduler).
         _start_background_processes()
+        # Every worker starts its OWN spline warmer: the fitted splines live in
+        # per-worker memory, so each worker must warm its own _MODEL_CACHE for
+        # the watched URLs (unlike the shared on-disk NOAA cache).
+        from .warmer import start as _start_warmer
+        _start_warmer()
 
     server.include_router(api.router)
     server.include_router(app.router)

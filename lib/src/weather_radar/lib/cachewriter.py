@@ -85,6 +85,63 @@ def _stamp_expiry(cache_file, expires_header):
         pass
 
 
+# Sidecar that marks when a path's CONTENT last changed (as opposed to when it
+# was last refreshed). The data.json mtime is overloaded for freshness (it's
+# stamped to Expires), so it advances on EVERY refetch — even when NOAA returns
+# identical data. Derived artifacts (fitted splines) must refit only on a real
+# content change, so they key on THIS marker's mtime instead: the writer only
+# touches it when the content hash actually differs. A tiny file -> cheap stat.
+def _change_marker(cache_file):
+    return cache_file + ".changed"
+
+
+def _content_hash(payload):
+    """Stable hash of a response's CONTENT (the NOAA `json` body only), so
+    volatile headers (Expires/Date/Age) don't count as a change. Returns a hex
+    digest string."""
+    import hashlib
+    body = payload.get("json") if isinstance(payload, dict) else payload
+    # sort_keys + compact separators => canonical, order-independent bytes.
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_existing_hash(cache_file):
+    """Return the stored content hash for `cache_file`, or None. Prefers the
+    cheap marker sidecar (which holds the hash); falls back to hashing the
+    on-disk body for files written before markers existed."""
+    marker = _change_marker(cache_file)
+    try:
+        with open(marker, "r") as f:
+            h = f.read().strip()
+            if h:
+                return h
+    except OSError:
+        pass
+    # Legacy file with no marker: hash its stored body so an unchanged refetch
+    # is still recognised as unchanged (and gets a marker written this time).
+    try:
+        with open(cache_file, "r") as f:
+            return _content_hash(json.load(f))
+    except Exception:
+        return None
+
+
+def _write_change_marker(cache_file, content_hash):
+    """Record `content_hash` in the change marker and bump its mtime to NOW
+    (the moment content changed). Best-effort."""
+    marker = _change_marker(cache_file)
+    try:
+        # Atomic: write temp + replace so a reader never sees a partial hash.
+        d = os.path.dirname(marker)
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            f.write(content_hash)
+        os.replace(tmp, marker)
+    except OSError:
+        pass
+
+
 def _is_fresh(cache_file):
     """True if the cache file exists and is unexpired.
 
@@ -292,8 +349,30 @@ class _Writer:
                 resp = _retry_get(self._session, url)
                 payload = {"headers": dict(resp.headers), "json": resp.json()}
                 os.makedirs(d, exist_ok=True)
-                # Atomic publish: write to a temp file in the same dir, then
-                # os.replace() so readers only ever see a complete file.
+
+                # Content-change check: if NOAA returned the SAME content we
+                # already have, skip the rewrite entirely and only refresh the
+                # freshness stamp (mtime = new Expires). This leaves the change
+                # marker untouched, so derived artifacts (splines) keyed on the
+                # marker's mtime do NOT needlessly refit on a no-op refresh.
+                new_hash = _content_hash(payload)
+                old_hash = _read_existing_hash(cache_file)
+                if old_hash == new_hash and os.path.exists(cache_file):
+                    # Unchanged: extend freshness only.
+                    _stamp_expiry(cache_file, payload["headers"].get("Expires"))
+                    # Ensure the marker exists (legacy files may lack one) but
+                    # DON'T bump its mtime — content didn't change.
+                    if not os.path.exists(_change_marker(cache_file)):
+                        _write_change_marker(cache_file, new_hash)
+                    try:
+                        os.unlink(_tombstone_file(cache_file))
+                    except OSError:
+                        pass
+                    return True
+
+                # Changed (or new): atomic publish — write to a temp file in
+                # the same dir, then os.replace() so readers only ever see a
+                # complete file.
                 fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
                 try:
                     with os.fdopen(fd, "w") as f:
@@ -302,6 +381,9 @@ class _Writer:
                 finally:
                     if os.path.exists(tmp):
                         os.unlink(tmp)
+                # Record the new content hash + bump the change marker's mtime
+                # (content changed NOW) so derived artifacts know to refit.
+                _write_change_marker(cache_file, new_hash)
                 # Stamp the file's mtime with its NOAA Expires time so the
                 # freshness check (_is_fresh) is a cheap os.stat instead of a
                 # JSON parse of this (large) doc. Best-effort.
