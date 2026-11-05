@@ -962,8 +962,8 @@
         }
         showSpinner("Loading data…")
         try {
-          await prefetchWithProgress()
-          await fetchGlobalRange()
+          const bundled = await prefetchWithProgress()
+          if (!bundled) await fetchGlobalRange()
           time = clampToForecast(time)
           showSpinner("Rendering…")
           await loadFrame(time)
@@ -1536,8 +1536,16 @@
       // completed/total fraction per phase (resolving grid, then fetching
       // data). Resolves once the area is fully cached. Falls back to the plain
       // (blocking, no-progress) prefetch if streaming isn't available.
+      //
+      // WATCHED-URL FAST PATH: the server emits a {"phase":"bundle","range":…}
+      // line instead of resolve/fetch progress when a precomputed bundle
+      // matches this url. We apply that range and return true — the caller
+      // then SKIPS fetchGlobalRange (range already set) and the frames stream
+      // from the same bundle. Returns true iff a bundle short-circuited.
       async function prefetchWithProgress() {
-        const url = `/api/models/prefetch/stream?lat=${lat}&lon=${lon}&width=${width}&height=${height}`
+        const url = `/api/models/prefetch/stream?lat=${lat}&lon=${lon}` +
+          `&width=${width}&height=${height}` +
+          `&model=${encodeURIComponent(model)}&dt=${dt}&kind=${kind}`
         let resp
         try {
           resp = await fetch(url)
@@ -1548,15 +1556,23 @@
           // Fallback: blocking prefetch with a generic message.
           showSpinner("Loading data…")
           await fetch(`/api/models/prefetch?lat=${lat}&lon=${lon}&width=${width}&height=${height}`)
-          return
+          return false
         }
         const reader = resp.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ""
+        let bundled = false
         const handle = (line) => {
           if (!line) return
           try {
             const p = JSON.parse(line)
+            if (p.phase === "bundle") {
+              // Watched url: no resolve/fetch happened; apply the bundle's
+              // range and signal the caller to skip fetchGlobalRange.
+              bundled = true
+              applyRange(p.range)
+              return
+            }
             setSpinnerProgress(p.phase, p.done, p.total)
           } catch (_) {}
         }
@@ -1571,6 +1587,30 @@
           }
         }
         handle(buffer.trim())
+        return bundled
+      }
+
+      // Fetch the fixed global value range for the current area (whole
+      // forecast lifecycle) so colors/legend stay stable across frames.
+      // Apply a range payload ({min,max,uom,timeZone,start,end}) to the color
+      // scale + playback window. Shared by fetchGlobalRange and the prefetch
+      // bundle short-circuit so both set up identically.
+      function applyRange(r) {
+        if (r && Number.isFinite(r.min) && Number.isFinite(r.max) && r.max > r.min) {
+          globalMin = r.min; globalMax = r.max
+          console.log("[field] global range:", globalMin.toFixed(1), "-", globalMax.toFixed(1), r.uom)
+          if (autoStep) applyAutoStep()
+        }
+        mapTimeZone = (r && r.timeZone) || null
+        const s = r && r.start ? Math.floor(Date.parse(r.start) / 1000) : NaN
+        const e = r && r.end ? Math.floor(Date.parse(r.end) / 1000) : NaN
+        if (Number.isFinite(s) && Number.isFinite(e) && e > s) {
+          forecastStart = s; forecastEnd = e
+          windowStart = s; windowEnd = e
+          applyUrlWindow()
+          console.log("[field] forecast window:", new Date(s * 1000).toISOString(), "->", new Date(e * 1000).toISOString())
+          configureScrubber()
+        }
       }
 
       // Fetch the fixed global value range for the current area (whole
@@ -1581,108 +1621,10 @@
           const resp = await fetch(
             `/api/models/${model}/type/range?lat=${lat}&lon=${lon}&width=${width}&height=${height}&kind=${kind}`
           )
-          const r = await resp.json()
-          if (r && Number.isFinite(r.min) && Number.isFinite(r.max) && r.max > r.min) {
-            globalMin = r.min; globalMax = r.max
-            console.log("[field] global range:", globalMin.toFixed(1), "-", globalMax.toFixed(1), r.uom)
-            // Auto-scale the contour interval to the range (unless the user
-            // has pinned a step manually / via URL).
-            if (autoStep) applyAutoStep()
-          }
-          // The map center's IANA timezone, so times display in the location's
-          // local zone rather than the browser's. Falls back to browser-local.
-          mapTimeZone = (r && r.timeZone) || null
-          // Capture the forecast window; default the playback window to it,
-          // then apply any persisted window/time from the URL (clamped into
-          // the available forecast range).
-          const s = r && r.start ? Math.floor(Date.parse(r.start) / 1000) : NaN
-          const e = r && r.end ? Math.floor(Date.parse(r.end) / 1000) : NaN
-          if (Number.isFinite(s) && Number.isFinite(e) && e > s) {
-            forecastStart = s; forecastEnd = e
-            windowStart = s; windowEnd = e
-            applyUrlWindow()
-            console.log("[field] forecast window:", new Date(s * 1000).toISOString(), "->", new Date(e * 1000).toISOString())
-            configureScrubber()
-          }
+          applyRange(await resp.json())
         } catch (err) {
           console.warn("global range fetch failed; using per-frame range:", err)
         }
-      }
-
-      // Fast path for WATCHED urls: STREAM the precomputed animation bundle
-      // (gzipped NDJSON) and populate the frame cache incrementally — same
-      // wire format and incremental rendering as the live fill, but the frames
-      // are precomputed (no per-frame server compute). The first line is a
-      // {type:"range"} header; each subsequent line is a frame record. Returns
-      // true if a bundle streamed (caller skips the normal prefetch + fill),
-      // false (incl. 404 = not watched) to fall back to the cold path.
-      async function loadFromBundle() {
-        let resp
-        try {
-          resp = await fetch(
-            `/api/models/${model}/bundle?lat=${lat}&lon=${lon}&width=${width}` +
-            `&height=${height}&dt=${dt}&kind=${kind}`)
-        } catch (_) {
-          return false
-        }
-        if (!resp || !resp.ok || !resp.body) return false  // 404 -> cold path
-
-        const reader = resp.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ""
-        let gotHeader = false
-        let nFrames = 0
-
-        const applyHeader = (h) => {
-          const r = (h && h.range) || {}
-          if (Number.isFinite(r.min) && Number.isFinite(r.max) && r.max > r.min) {
-            globalMin = r.min; globalMax = r.max
-            if (autoStep) applyAutoStep()
-          }
-          mapTimeZone = r.timeZone || null
-          const s = r.start ? Math.floor(Date.parse(r.start) / 1000) : NaN
-          const e = r.end ? Math.floor(Date.parse(r.end) / 1000) : NaN
-          if (Number.isFinite(s) && Number.isFinite(e) && e > s) {
-            forecastStart = s; forecastEnd = e
-            windowStart = s; windowEnd = e
-            applyUrlWindow()
-            configureScrubber()
-          }
-        }
-
-        const handle = (line) => {
-          if (!line) return
-          let obj
-          try { obj = JSON.parse(line) } catch (_) { return }
-          if (!gotHeader && obj.type === "range") {
-            gotHeader = true
-            applyHeader(obj)
-            return
-          }
-          // Frame record {time,uom,coords,vals}: cache under the normal key so
-          // scrubbing/looping/loadFrame all hit it (identical to the live fill).
-          if (Number.isFinite(obj.time)) {
-            apiClient.put(frameCacheKey(obj.time), obj)
-            nFrames++
-          }
-        }
-
-        for (;;) {
-          let chunk
-          try { chunk = await reader.read() } catch (_) { break }
-          if (chunk.done) break
-          buffer += decoder.decode(chunk.value, { stream: true })
-          let nl
-          while ((nl = buffer.indexOf("\n")) >= 0) {
-            handle(buffer.slice(0, nl).trim())
-            buffer = buffer.slice(nl + 1)
-          }
-        }
-        handle(buffer.trim())
-
-        if (!gotHeader && nFrames === 0) return false  // empty/garbage -> cold
-        console.log("[bundle] streamed", nFrames, "frames; range", globalMin, "-", globalMax)
-        return true
       }
 
       // Clamp a time (epoch seconds) into the active playback window if known,
@@ -2115,25 +2057,20 @@
 
       showSpinner("Loading data…")
       loading = true
-      let fromBundle = false
       try {
-        // WATCHED-URL FAST PATH: if a precomputed bundle exists, load it and
-        // skip the cold prefetch + streaming fill entirely.
-        fromBundle = await loadFromBundle()
-        if (!fromBundle) {
-          // Cache all the area's NOAA data first, streaming progress to the
-          // spinner as each resource is fetched.
-          await prefetchWithProgress()
+        // Cache all the area's NOAA data first, streaming progress to the
+        // spinner. For a WATCHED url this short-circuits: prefetch returns a
+        // bundle (range applied inline), so we skip fetchGlobalRange and the
+        // frames below stream from the precomputed bundle — straight to
+        // animation with no resolve/fetch/range round-trips.
+        const bundled = await prefetchWithProgress()
+        if (!bundled) {
           // Fix the color scale to the whole-lifecycle range before rendering.
           await fetchGlobalRange()
         }
         time = clampToForecast(time)
-        // The first frame now comes from the streaming cache-fill (loadFrame
-        // waits for it), which can take a moment on a large cold area. Swap the
-        // spinner message off the prefetch "Fetching data…" label so it doesn't
-        // look stuck while the first frame computes.
         showSpinner("Rendering…")
-        await loadFrame(time) // first frame (from the bundle cache or the fill)
+        await loadFrame(time) // first frame (from the bundle or the live fill)
       } catch (err) {
         console.error("failed to load initial frame:", err)
       } finally {
@@ -2141,9 +2078,9 @@
         hideSpinner()
       }
       // loadFrame above already kicked off the cache fill on its miss; this is
-      // a no-op if that fill already covers the window (e.g. a bundle filled
-      // it), or recomputes it if the window/time changed in between. Not
-      // awaited — the first frame rendered; the fill populates the rest.
+      // a no-op if that fill already covers the window, or recomputes it if the
+      // window/time changed in between. Not awaited — the first frame rendered;
+      // the fill populates the rest in the background.
       fillCache()
 
       async function tick() {

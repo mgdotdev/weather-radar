@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 import json
 import logging
@@ -51,55 +51,37 @@ def prefetch(lat: float, lon: float, width: float|None=None, height: float|None=
         area.cache()
 
 
-@router.get("/{model}/bundle")
-def bundle(model: str, lat: float, lon: float, width: float, height: float,
-           dt: int, kind: str = "accumulation"):
-    """Stream the PRECOMPUTED animation bundle for a watched URL, if one exists
-    on disk, as gzipped NDJSON (first line = range header, then one frame
-    record per line — identical to /series/stream lines).
-
-    The client consumes this with the SAME incremental stream reader it uses
-    for the live fill, so the first frame renders immediately and the rest
-    populate the cache in the background — no 276MB blocking blob. The bundle
-    is precomputed by the background builder (watched URLs only), so there's
-    ZERO per-frame compute here; the endpoint just streams the file's bytes.
-
-    Served with Content-Encoding: gzip so the (coord-heavy, highly
-    compressible) payload goes over the wire ~10x smaller and the request path
-    never parses or re-serializes it. 404 when no bundle exists; the client
-    then falls back to the normal prefetch + live streaming fill."""
-    from weather_radar.server.bundle import bundle_file
-
-    path = bundle_file(model, lat, lon, width, height, dt, kind)
-    if path is None:
-        raise HTTPException(status_code=404, detail="no bundle for this area")
-
-    def _iter():
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(64 * 1024)
-                if not chunk:
-                    break
-                yield chunk
-
-    return StreamingResponse(
-        _iter(),
-        media_type="application/x-ndjson",
-        headers={"Content-Encoding": "gzip"},
-    )
-
-
 @router.get("/prefetch/stream")
-def prefetch_stream(lat: float, lon: float, width: float=1, height: float=1):
+def prefetch_stream(lat: float, lon: float, width: float=1, height: float=1,
+                    model: str=None, dt: int=0, kind: str="accumulation"):
     """Stream prefetch progress as NDJSON (one JSON object per line) while the
     area's data is fetched from NOAA. Each line is
     {"phase": "points"|"gridpoints", "done": N, "total": M} so the client can
     show a live completed/total fraction. Phases run in order; the final line
-    of each phase has done == total."""
+    of each phase has done == total.
+
+    BUNDLE SHORT-CIRCUIT: if a precomputed bundle exists for (model, area, dt,
+    kind) — a WATCHED url — the area's NOAA data need not be resolved/fetched
+    at all (every frame is already computed in the bundle). In that case we
+    emit a single {"phase":"bundle","range":{...}} line carrying the bundle's
+    color range + forecast window and return immediately — the client then
+    skips /type/range and streams the precomputed frames. This is what makes a
+    watched url jump straight to animation (no resolve, no fetch, no range
+    round-trip)."""
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
 
     def generate():
+        # Watched-url fast path: a matching bundle means no resolve/fetch.
+        if model is not None:
+            try:
+                from weather_radar.server.bundle import read_bundle_range
+                rng = read_bundle_range(model, lat, lon, width, height, dt, kind)
+                if rng is not None:
+                    yield json.dumps({"phase": "bundle", "range": rng}) + "\n"
+                    return
+            except Exception:
+                pass  # fall through to the normal resolve/fetch
         for progress in area.iter_cache():
             yield json.dumps(progress) + "\n"
 
@@ -240,7 +222,7 @@ def ensemble_series_stream(
     kind: str = "accumulation",
 ):
     """Stream many frames as NDJSON — one line per frame,
-    {"time": <epoch>, "fc": <FeatureCollection>}.
+    {"time": <epoch>, "uom", "coords", "vals"}.
 
     Two modes, combinable in a single request (see _frame_times):
       * BATCH    : `times=5,15,25,...` — an explicit set of epochs, streamed
@@ -252,9 +234,17 @@ def ensemble_series_stream(
     `times=5,15,25,35,45&start=55&end=<window end>&dt=300` — the gap frames
     arrive as a batch, then 55,60,65,... stream in sequence.
 
-    Each frame is computed from the (NOAA-cached) gridpoint data; results are
-    not cached server-side (the browser caches them). Repeat requests recompute
-    cheaply from warm NOAA data."""
+    BUNDLE FAST PATH: a WATCHED url may have a precomputed bundle (the whole
+    window at its dt, built in the background), keyed by these exact request
+    params. On a pure SEQUENCE request we serve that bundle's frame lines
+    straight from disk — zero gridpoint resolution / fit / per-frame compute —
+    then stop. A MISS (no matching bundle / batch request) falls through to
+    live compute. (The range/window for a bundled url is delivered by the
+    prefetch endpoint, which also matches the bundle, so no header is needed
+    here — the frame lines are identical to the live-computed ones.)
+
+    Each live-computed frame is derived from the (NOAA-cached) gridpoint data;
+    results aren't cached server-side (the browser caches them)."""
     from datetime import datetime
 
     epochs = _frame_times(start, end, dt, times)
@@ -266,6 +256,29 @@ def ensemble_series_stream(
     def generate():
         if not epochs:
             return
+
+        # Bundle fast path: serve whatever requested epochs the precomputed
+        # bundle contains (both the sequence AND any `times` batch), straight
+        # from disk with zero compute. For a watched url the bundle holds the
+        # whole window, so this typically satisfies the ENTIRE request; only
+        # epochs the bundle lacks fall through to live compute below. (A
+        # previous version only short-circuited pure-sequence requests, so the
+        # common case — a fill with a gap `times` batch — bypassed the bundle
+        # and recomputed everything live. Serving by epoch fixes that.)
+        remaining = list(epochs)
+        try:
+            from weather_radar.server.bundle import serve_bundle_epochs
+            covered = set()
+            for line in serve_bundle_epochs(model, lat, lon, width, height,
+                                            dt, kind, epochs, covered):
+                yield line
+            if covered:
+                remaining = [e for e in epochs if int(e) not in covered]
+                if not remaining:
+                    return  # entire request served from the bundle
+        except Exception:
+            # Bundle error: fall back to computing the full request live.
+            remaining = list(epochs)
 
         # --- Phase timing (to locate first-frame latency: NOAA warm vs spline
         # fit vs evaluation). Logged once per request at WARNING so it surfaces
@@ -349,7 +362,7 @@ def ensemble_series_stream(
         t_eval_start = time.perf_counter()
         t_first_frame = None
         frames_emitted = 0
-        for epoch in epochs:
+        for epoch in remaining:
             t = datetime.fromtimestamp(epoch)
             fcoords = []
             vals = []

@@ -210,20 +210,6 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
     return path
 
 
-def bundle_file(model, lat, lon, width, height, dt, kind):
-    """Return the gzipped-NDJSON bundle file PATH if it exists, else None.
-
-    CHEAP by design: a single os.path.exists — NO read, NO gridpoint
-    resolution. The endpoint streams this file's bytes directly (with
-    Content-Encoding: gzip), so the request path never parses or re-serializes
-    the payload. Freshness is the background builder's job (it rewrites stale
-    bundles on its schedule), so a served bundle may be up to one builder
-    interval stale — fine for a forecast animation.
-    """
-    path = _bundle_path(model, lat, lon, width, height, dt, kind)
-    return path if os.path.exists(path) else None
-
-
 def _built_source_mtime(path):
     """Read just the header line of a gzipped bundle and return its stored
     source_mtime (the freshness stamp), or None. Used by the builder's
@@ -234,6 +220,67 @@ def _built_source_mtime(path):
         return header.get("meta", {}).get("source_mtime", 0.0)
     except Exception:
         return None
+
+
+def read_bundle_range(model, lat, lon, width, height, dt, kind):
+    """Return the precomputed bundle's stored `range` (min/max/uom/start/end/
+    timeZone) if a bundle keyed by these exact params exists, else None. Reads
+    only the header line — cheap, no gridpoint resolution. Used by the prefetch
+    endpoint so a watched url's color range + forecast window come WITHOUT the
+    usual resolve/fetch (the frames then stream from the same bundle)."""
+    path = _bundle_path(model, lat, lon, width, height, dt, kind)
+    if not os.path.exists(path):
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            header = json.loads(f.readline())
+    except Exception:
+        return None
+    if header.get("type") != "range":
+        return None
+    return header.get("range")
+
+
+def serve_bundle_epochs(model, lat, lon, width, height, dt, kind, epochs, covered):
+    """Yield the bundle's frame lines for exactly the requested `epochs` (an
+    iterable of int epochs), skipping the range header. Each epoch actually
+    found is added to the `covered` set (so the caller can live-compute only
+    the remainder). Yields nothing if no bundle exists for these params.
+
+    This serves BOTH the sequence and the batch of a /series/stream request —
+    the bundle has the whole window, so a watched url is satisfied almost
+    entirely from disk; only epochs the bundle happens to lack fall through to
+    live compute. Lines are newline-terminated and byte-compatible with
+    live-computed frames.
+
+    CHEAP + bounded memory: decompresses line-by-line; never loads the whole
+    bundle; NO gridpoint resolution.
+    """
+    path = _bundle_path(model, lat, lon, width, height, dt, kind)
+    if not os.path.exists(path):
+        return
+    wanted = {int(e) for e in epochs}
+    if not wanted:
+        return
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        first = True
+        for line in f:
+            if not line.strip():
+                continue
+            if first:
+                first = False
+                try:
+                    if json.loads(line).get("type") == "range":
+                        continue  # skip header
+                except Exception:
+                    pass
+            try:
+                t = int(json.loads(line).get("time"))
+            except Exception:
+                continue
+            if t in wanted:
+                covered.add(t)
+                yield line if line.endswith("\n") else line + "\n"
 
 
 # --- URL -> bundle params, and the single-instance background builder --------
