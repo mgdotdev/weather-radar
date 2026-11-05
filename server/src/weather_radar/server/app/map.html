@@ -109,9 +109,15 @@
               column-gap:6px; row-gap:6px;">
             <span style="font-size:11px; color:#555;">Pin size</span>
             <button id="pinSizeDown" title="Smaller pins" class="ctlbtn">−</button>
-            <span id="pinSizeLabel" class="ctlval">1.0×</span>
+            <span id="pinSizeLabel" class="ctlval">1.00×</span>
             <button id="pinSizeUp" title="Larger pins" class="ctlbtn">+</button>
           </div>
+          <label style="display:flex; align-items:center; margin-top:8px;
+              font-size:11px; color:#555; cursor:pointer;">
+            <span>Show area box</span>
+            <input type="checkbox" id="showAreaBox" checked
+              style="cursor:pointer; margin:0 0 0 auto; width:22px; height:22px;">
+          </label>
         </div>
       </div>
     </div>
@@ -131,6 +137,7 @@
         font-size: 13px; color: #222; overflow: hidden; min-width: 160px;">
       <div id="ctxCenterHere" style="padding: 8px 12px; cursor: pointer;">Center map here</div>
       <div id="ctxCaptureArea" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Capture area</div>
+      <div id="ctxDrawArea" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Draw observed area</div>
       <div id="ctxDropPin" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Drop pin here</div>
       <div id="ctxSeeGraph" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">See graph</div>
       <div id="ctxCoords" style="padding: 6px 12px; font-size: 11px;
@@ -139,6 +146,19 @@
 
     <!-- Container for dropped pin labels (positioned over the map in JS). -->
     <div id="pins"></div>
+
+    <!-- Rubber-band rectangle for "Draw observed area" (shown only while
+         drawing; positioned/sized in JS). -->
+    <div id="drawRect" style="position:fixed; z-index:103; display:none;
+      border:2px dashed #1565c0; background:rgba(21,101,192,0.12);
+      pointer-events:none;"></div>
+    <!-- Hint banner shown while in draw mode. -->
+    <div id="drawHint" style="position:fixed; z-index:104; display:none;
+      top:12px; left:50%; transform:translateX(-50%);
+      background:rgba(21,101,192,0.95); color:#fff; font-family:sans-serif;
+      font-size:13px; padding:6px 14px; border-radius:16px;
+      box-shadow:0 2px 8px rgba(0,0,0,0.3); pointer-events:none;
+      white-space:nowrap;">Drag to draw the observed area · Esc to cancel</div>
 
     <!-- Loading spinner, shown while data is being cached/fetched. -->
     <style>@keyframes wrspin { to { transform: rotate(360deg); } }</style>
@@ -684,6 +704,26 @@
       if (src) src.setData(areaBoxGeoJSON())
     }
 
+    // Whether the area-outline box is shown. Persisted in the URL
+    // (`areaBox=0` to hide; shown by default). Applied to the layer once it
+    // exists and whenever the checkbox toggles.
+    let showAreaBox =
+      new URL(window.location.href).searchParams.get("areaBox") !== "0"
+    function applyAreaBoxVisibility() {
+      if (map.getLayer && map.getLayer("area-box")) {
+        map.setLayoutProperty("area-box", "visibility",
+          showAreaBox ? "visible" : "none")
+      }
+    }
+    function setShowAreaBox(on) {
+      showAreaBox = !!on
+      const u = new URL(window.location.href)
+      if (showAreaBox) u.searchParams.delete("areaBox")
+      else u.searchParams.set("areaBox", "0")
+      history.replaceState(null, "", u.toString())
+      applyAreaBoxVisibility()
+    }
+
     map.on("load", async () => {
       // Overlay sources + layers. The isoband overlay uses the `contours`
       // source (faint fill + strong lines). The heatmap overlay uses a raster
@@ -709,6 +749,7 @@
       map.addSource("area", { type: "geojson", data: areaBoxGeoJSON() })
       map.addLayer({
         id: "area-box", type: "line", source: "area",
+        layout: { visibility: showAreaBox ? "visible" : "none" },
         paint: {
           "line-color": "#1565c0", "line-width": 1.5,
           "line-opacity": 0.8,
@@ -720,6 +761,11 @@
       let cursorPx = null
 
       function refreshReadout() {
+        // Hide the hover readout while drawing an observed-area box (the draw
+        // rectangle + hint are the only overlay that should show then).
+        if (typeof drawing !== "undefined" && drawing) {
+          readoutEl.style.display = "none"; return
+        }
         if (!cursorPx) { readoutEl.style.display = "none"; return }
         const rect = mapContainer.getBoundingClientRect()
         const ll = map.unproject([cursorPx.x - rect.left, cursorPx.y - rect.top])
@@ -741,11 +787,12 @@
       const pinsContainer = document.getElementById("pins")
       let pins = [] // [{ lat, lon, el }]
 
-      // Pin size: a scale multiplier applied to the marker + info box, stepped
-      // via the legend +/- buttons and persisted in the URL (`pinSize=`) so it
-      // survives a refresh. Base sizes (1.0x) match the original fixed styling.
-      const PIN_MARKER_BASE_PX = 20   // marker glyph font-size at 1.0x
-      const PIN_INFO_BASE_PX = 12     // info box font-size at 1.0x
+      // Pin size: a scale multiplier applied (as a CSS transform:scale) to the
+      // whole marker + info box, stepped via the legend +/- buttons and
+      // persisted in the URL (`pinSize=`) so it survives a refresh. Base (1x)
+      // sizes are the elements' fixed CSS (see addPin); the transform scales
+      // everything — text, padding, border, shadow — uniformly, so the info
+      // box stays proportional and never crowds.
       const PIN_SIZE_MIN = 0.5, PIN_SIZE_MAX = 3.0, PIN_SIZE_STEP = 0.25
       let pinSize = (() => {
         const v = parseFloat(new URL(window.location.href).searchParams.get("pinSize"))
@@ -754,17 +801,35 @@
 
       function applyPinSize() {
         for (const p of pins) {
-          p.marker.style.fontSize = (PIN_MARKER_BASE_PX * pinSize) + "px"
-          p.info.style.fontSize = (PIN_INFO_BASE_PX * pinSize) + "px"
+          // Scale each pin element as a WHOLE via CSS transform:scale — this
+          // scales text, padding, border-radius and shadow by the exact same
+          // factor, so the info box can never get "crowded" (text outgrowing
+          // its box). Base (1x) sizes live in the elements' own styles; only
+          // the transform changes here. The translate() keeps the anchor fixed
+          // (marker tip on the point; info box at its offset) and scale()
+          // grows the element from that anchor via transform-origin (set in
+          // addPin). refreshPins re-applies the same transform with the live
+          // offset, so this stays correct across map moves too.
+          p.marker.style.transform = `translate(-50%,-100%) scale(${pinSize})`
         }
         const lbl = document.getElementById("pinSizeLabel")
-        if (lbl) lbl.textContent = pinSize.toFixed(2).replace(/\.?0+$/, "") + "×"
-        // Reposition so the (pinSize-scaled) info-box offset updates immediately.
+        if (lbl) lbl.textContent = formatPinSize(pinSize)
+        // Reposition so the info box's (pinSize-scaled) offset + transform
+        // update immediately.
         if (pins.length) refreshPins()
       }
 
+      // Always two decimals so the label is uniform across the 0.25 step grid
+      // (0.50×, 0.75×, 1.00×, 1.25× …) and aligns with the other controls.
+      function formatPinSize(v) {
+        return v.toFixed(2) + "×"
+      }
+
       function setPinSize(scale) {
-        pinSize = Math.max(PIN_SIZE_MIN, Math.min(scale, PIN_SIZE_MAX))
+        // Snap to the step grid so repeated +/- can't accumulate float drift
+        // (e.g. 0.7500000001), and clamp to range.
+        const snapped = Math.round(scale / PIN_SIZE_STEP) * PIN_SIZE_STEP
+        pinSize = Math.max(PIN_SIZE_MIN, Math.min(snapped, PIN_SIZE_MAX))
         const u = new URL(window.location.href)
         if (Math.abs(pinSize - 1.0) < 1e-9) u.searchParams.delete("pinSize")
         else u.searchParams.set("pinSize", String(pinSize))
@@ -784,14 +849,22 @@
 
       function addPin(plat, plon, persist = true) {
         // Marker: a pin icon anchored exactly at the point (tip at the spot).
+        // Base (1x) size + shadow; scaled as a whole via transform (see
+        // applyPinSize). transform-origin at the tip (bottom-center) so
+        // scaling grows the glyph up/out from the pinned point.
         const marker = document.createElement("div")
         marker.textContent = "📍"
-        marker.style.cssText = "position:fixed; z-index:101; transform:translate(-50%,-100%);" +
+        marker.style.cssText = "position:fixed; z-index:101;" +
+          "transform-origin:50% 100%; transform:translate(-50%,-100%);" +
           "font-size:20px; line-height:1; cursor:pointer; user-select:none;" +
           "filter:drop-shadow(0 1px 1px rgba(0,0,0,0.5));"
-        // Info box: offset to the upper-right of the marker.
+        // Info box: offset to the upper-right of the marker. Base (1x) styling;
+        // scaled as a whole via transform (see refreshPins). transform-origin
+        // at its anchored bottom-left corner so text, padding, border and
+        // shadow all scale together — the box can't get crowded.
         const info = document.createElement("div")
-        info.style.cssText = "position:fixed; z-index:101; transform:translate(0,-100%);" +
+        info.style.cssText = "position:fixed; z-index:101;" +
+          "transform-origin:0% 100%; transform:translate(0,-100%);" +
           "background:rgba(30,30,30,0.85); color:#fff; font-family:sans-serif; font-size:12px;" +
           "padding:3px 7px; border-radius:4px; white-space:nowrap; cursor:pointer;" +
           "box-shadow:0 1px 4px rgba(0,0,0,0.4);"
@@ -819,7 +892,10 @@
       // The marker sits on the point; the info box is offset to the
       // upper-right so it doesn't cover the location. The offset SCALES with
       // pinSize so the box keeps clearing the (larger) marker glyph instead of
-      // crowding it as the pin grows.
+      // crowding it as the pin grows. The info box is also scaled as a whole
+      // via transform:scale (see applyPinSize) — so its translate + scale are
+      // combined here, scaling from its anchored corner (transform-origin set
+      // in addPin).
       const INFO_DX = 14, INFO_DY = -14
       function refreshPins() {
         const rect = mapContainer.getBoundingClientRect()
@@ -835,6 +911,7 @@
           p.info.innerHTML = `${model}: ${valueText}<br>${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}`
           p.info.style.left = (x + dx) + "px"
           p.info.style.top = (y + dy) + "px"
+          p.info.style.transform = `translate(0,-100%) scale(${pinSize})`
         }
       }
 
@@ -886,13 +963,105 @@
         hideMenu()
         window.open(u.toString(), "_blank")
       })
-      // Shared reload for both "Center map here" and "Capture area". It sizes
-      // the measured area to the current viewport and reloads the data, color
-      // range, and playback window for it. When `recenter` is a {lat, lon} the
-      // map pans there first and that point becomes the new area center;
-      // otherwise ("Capture area") the current map center/view is used as-is.
-      async function loadArea({ recenter = null } = {}) {
-        if (recenter) {
+
+      // "Draw observed area": enter a drag-to-draw mode. The user drags a
+      // rectangle on the map; on release its corners are unprojected to
+      // lng/lat and loaded as the observed area (bypassing viewport sizing).
+      // A DOM rubber-band rect (not a map layer) tracks the drag; map panning
+      // is suspended so the drag draws instead of moving the map.
+      const drawRectEl = document.getElementById("drawRect")
+      const drawHintEl = document.getElementById("drawHint")
+      let drawing = false       // armed (mode on), may or may not be dragging
+      let dragStart = null      // {x, y} client px of the drag origin
+
+      function enterDrawMode() {
+        drawing = true
+        dragStart = null
+        drawHintEl.style.display = "block"
+        drawRectEl.style.display = "none"
+        mapContainer.style.cursor = "crosshair"
+        // Suspend map drag-pan so the pointer draws the box instead.
+        map.dragPan.disable()
+        map.doubleClickZoom.disable()
+      }
+      function exitDrawMode() {
+        drawing = false
+        dragStart = null
+        drawHintEl.style.display = "none"
+        drawRectEl.style.display = "none"
+        mapContainer.style.cursor = ""
+        map.dragPan.enable()
+        map.doubleClickZoom.enable()
+      }
+      function rectFromPoints(a, b) {
+        const left = Math.min(a.x, b.x), top = Math.min(a.y, b.y)
+        const w = Math.abs(a.x - b.x), h = Math.abs(a.y - b.y)
+        return { left, top, w, h }
+      }
+
+      document.getElementById("ctxDrawArea").addEventListener("click", () => {
+        hideMenu()
+        enterDrawMode()
+      })
+
+      // Esc cancels draw mode.
+      window.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && drawing) exitDrawMode()
+      })
+
+      // Drag lifecycle on the map container (client-pixel coords; the overlay
+      // and unproject both work in viewport space via the container rect).
+      mapContainer.addEventListener("pointerdown", (e) => {
+        if (!drawing || e.button !== 0) return
+        e.preventDefault()
+        dragStart = { x: e.clientX, y: e.clientY }
+        const r = rectFromPoints(dragStart, dragStart)
+        Object.assign(drawRectEl.style, {
+          display: "block", left: r.left + "px", top: r.top + "px",
+          width: "0px", height: "0px",
+        })
+      })
+      mapContainer.addEventListener("pointermove", (e) => {
+        if (!drawing || !dragStart) return
+        const r = rectFromPoints(dragStart, { x: e.clientX, y: e.clientY })
+        Object.assign(drawRectEl.style, {
+          left: r.left + "px", top: r.top + "px",
+          width: r.w + "px", height: r.h + "px",
+        })
+      })
+      mapContainer.addEventListener("pointerup", (e) => {
+        if (!drawing || !dragStart) return
+        const end = { x: e.clientX, y: e.clientY }
+        const r = rectFromPoints(dragStart, end)
+        exitDrawMode()
+        // Ignore a trivially tiny box (a stray click, not a drag).
+        if (r.w < 8 || r.h < 8) return
+        // Convert the two pixel corners to lng/lat. unproject expects
+        // container-relative pixels, so subtract the container's offset.
+        const cr = mapContainer.getBoundingClientRect()
+        const p1 = map.unproject([r.left - cr.left, r.top - cr.top])
+        const p2 = map.unproject([r.left + r.w - cr.left, r.top + r.h - cr.top])
+        const boundsObj = {
+          west: Math.min(p1.lng, p2.lng), east: Math.max(p1.lng, p2.lng),
+          south: Math.min(p1.lat, p2.lat), north: Math.max(p1.lat, p2.lat),
+        }
+        loadArea({ bounds: boundsObj })
+      })
+
+      // Shared reload for "Center map here", "Capture area", and "Draw
+      // observed area". Sizes the measured area and reloads data, color range,
+      // and playback window for it.
+      //   • recenter={lat,lon} : pan there; that point becomes the new center;
+      //     area sized to the current viewport.
+      //   • bounds={west,south,east,north} : use this EXACT rectangle (from a
+      //     drawn box) as the observed area — center + span come from it, not
+      //     the viewport.
+      //   • neither ("Capture area") : use the current viewport as-is.
+      async function loadArea({ recenter = null, bounds = null } = {}) {
+        if (bounds) {
+          lat = (bounds.south + bounds.north) / 2
+          lon = (bounds.west + bounds.east) / 2
+        } else if (recenter) {
           lat = recenter.lat
           lon = recenter.lon
         } else {
@@ -904,22 +1073,25 @@
         // Moving to a new area invalidates existing pins.
         clearPins()
 
-        // Size the fetched area to the current viewport so the contour field
-        // covers the whole window. The map's lat/lon span (in degrees) is
-        // converted to km mirroring the server geometry: width drives the
-        // lon-span, height the lat-span. (Pan doesn't change the span, only
-        // the center, so reading bounds now is correct for the new view.)
-        const b = map.getBounds()
-        width = Math.abs(b.getEast() - b.getWest()) * 110.574
-        height = Math.abs(b.getNorth() - b.getSouth()) * (111.320 * Math.cos(lat * Math.PI / 180))
+        // Size the fetched area. From a drawn box: the box's own lon/lat span.
+        // Otherwise: the current viewport span. The km conversion mirrors the
+        // server geometry (width drives lon-span, height the lat-span).
+        if (bounds) {
+          width = Math.abs(bounds.east - bounds.west) * 110.574
+          height = Math.abs(bounds.north - bounds.south) * (111.320 * Math.cos(lat * Math.PI / 180))
+        } else {
+          const b = map.getBounds()
+          width = Math.abs(b.getEast() - b.getWest()) * 110.574
+          height = Math.abs(b.getNorth() - b.getSouth()) * (111.320 * Math.cos(lat * Math.PI / 180))
+        }
 
         // Move the area-outline box to the newly-sized area.
         updateAreaBox()
 
-        // Pan to the new center when recentering (keep current zoom); "Capture
-        // area" keeps the current view. Either way, sync the URL in place — no
-        // page reload.
+        // Pan to the new center when recentering OR when a box was drawn (so
+        // the drawn area is framed); "Capture area" keeps the current view.
         if (recenter) map.easeTo({ center: [lon, lat], duration: 500 })
+        else if (bounds) map.easeTo({ center: [lon, lat], duration: 300 })
         const u = new URL(window.location.href)
         u.searchParams.set("lat", lat.toFixed(6))
         u.searchParams.set("lon", lon.toFixed(6))
@@ -2022,6 +2194,22 @@
       setDt(dt) // initialize the dt label
       applyPinSize() // initialize the pin-size label (and size any restored pins)
 
+      // "Show area box" checkbox: reflects/controls the area-outline layer's
+      // visibility (persisted via ?areaBox=0). Initialize from state, apply to
+      // the layer, and wire the toggle. stopPropagation so interacting with it
+      // doesn't start a legend drag.
+      ;(function setupAreaBoxToggle() {
+        const cb = document.getElementById("showAreaBox")
+        if (!cb) return
+        cb.checked = showAreaBox
+        applyAreaBoxVisibility()
+        cb.addEventListener("pointerdown", (e) => e.stopPropagation())
+        cb.addEventListener("change", (e) => {
+          e.stopPropagation()
+          setShowAreaBox(cb.checked)
+        })
+      })()
+
       // Legend tabs: switch between the Controls and Settings panels.
       ;(function setupLegendTabs() {
         const tabs = {
@@ -2147,7 +2335,7 @@
         // window from/to/t), and session state (dropped pins, pin size). Only
         // the model itself and its derived styling change.
         for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
-                         "from", "to", "t", "pins", "pinSize"]) {
+                         "from", "to", "t", "pins", "pinSize", "areaBox"]) {
           const v = cur.searchParams.get(k)
           if (v !== null) next.searchParams.set(k, v)
         }
