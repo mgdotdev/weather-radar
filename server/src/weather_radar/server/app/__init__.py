@@ -10,6 +10,7 @@ from jinja2 import Template
 HERE = os.path.abspath(os.path.dirname(__file__))
 MAP_HTML = os.path.join(HERE, "map.html")
 GRAPH_HTML = os.path.join(HERE, "graph.html")
+FORECAST_HTML = os.path.join(HERE, "forecast.html")
 ADMIN_HTML = os.path.join(HERE, "admin.html")
 
 router = APIRouter()
@@ -62,16 +63,16 @@ _RAMP_DIVERGING_TEMP = [
     1.0,   "rgb(222, 119, 86)",
 ]
 _RAMP_BLUES = [
-    0.0, "rgb(247, 251, 255)",
-    0.25, "rgb(198, 219, 239)",
-    0.5, "rgb(107, 174, 214)",
+    0.0, "rgb(158, 202, 225)",
+    0.25, "rgb(107, 174, 214)",
+    0.5, "rgb(66, 146, 198)",
     0.75, "rgb(33, 113, 181)",
     1.0, "rgb(8, 48, 107)",
 ]
 _RAMP_TEAL = [
-    0.0, "rgb(247, 252, 253)",
-    0.25, "rgb(204, 236, 230)",
-    0.5, "rgb(102, 194, 164)",
+    0.0, "rgb(153, 216, 201)",
+    0.25, "rgb(102, 194, 164)",
+    0.5, "rgb(65, 174, 118)",
     0.75, "rgb(44, 127, 184)",
     1.0, "rgb(8, 64, 129)",
 ]
@@ -180,25 +181,27 @@ MODEL_CATALOG = {
 # Optional bespoke styling per model (seed step + ramp). Anything omitted uses
 # the neutral ramp and a generic seed step (auto-scaling handles the rest).
 #
-# `render` selects the client overlay type:
-#   "isoband" (default) - filled d3-contour isobands + lines; right for
-#                         smoothly-varying continuous scalars (temperature,
-#                         pressure, humidity, accumulation totals).
-#   "heatmap"           - a continuous intensity wash (per-cell fill whose
-#                         opacity scales with value, transparent at the low
-#                         end) over the SAME IDW raster; suits per-interval
-#                         precip/snow/ice rate, which reads like radar imagery
-#                         rather than discrete bands.
+# NOTE: isoband (contour) rendering was removed — every model now renders as a
+# heatmap wash. The `render` key / _RENDER_* constants are retained only so an
+# explicit `?render=` override and the client's render dispatch keep working;
+# the profile default is always heatmap (see _profile).
 _RENDER_ISOBAND = "isoband"
 _RENDER_HEATMAP = "heatmap"
+# Per-model heatmap opacity multiplier (applied on top of the value-driven
+# alpha, client-side). DENSE/continuous fields (temperature, humidity, sky,
+# AQI) cover essentially the WHOLE area, so at full alpha they completely
+# occlude the basemap — they read better as a lighter wash you can see the map
+# through. SPARSE fields (snow/precip/ice amounts + rates) are mostly empty with
+# isolated features, so they stay fully opaque where present. Omitted => 1.0.
+_OPACITY_DENSE = 0.6
 _CUSTOM_STYLE = {
-    "temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP},
-    "apparent-temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP},
-    "max-temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP},
-    "min-temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP},
-    "heat-index": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP},
-    "wind-chill": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP},
-    "dewpoint": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP},
+    "temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP, "opacity": _OPACITY_DENSE},
+    "apparent-temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP, "opacity": _OPACITY_DENSE},
+    "max-temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP, "opacity": _OPACITY_DENSE},
+    "min-temperature": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP, "opacity": _OPACITY_DENSE},
+    "heat-index": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP, "opacity": _OPACITY_DENSE},
+    "wind-chill": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP, "opacity": _OPACITY_DENSE},
+    "dewpoint": {"contour_step": 1.0, "color_ramp": _RAMP_DIVERGING_TEMP, "opacity": _OPACITY_DENSE},
     "snowfall-amount": {"contour_step": 2.0, "color_ramp": _RAMP_BLUES},
     "quantitative-precipitation": {"contour_step": 0.5, "color_ramp": _RAMP_TEAL},
     "ice-accumulation": {"contour_step": 0.25, "color_ramp": _RAMP_BLUES},
@@ -213,13 +216,14 @@ _CUSTOM_STYLE = {
     # cover reads like cloud shadow over the basemap, rather than contour bands
     # that imply hard cloud edges. Seed step of 10% ~= one okta; auto-scaling
     # refines it.
-    "sky-cover": {"contour_step": 10.0, "color_ramp": _RAMP_CLOUD, "render": _RENDER_HEATMAP},
+    "sky-cover": {"contour_step": 10.0, "color_ramp": _RAMP_CLOUD, "render": _RENDER_HEATMAP, "opacity": _OPACITY_DENSE},
     # Air quality: the stepwise EPA AQI category ramp as a heatmap wash (smooth
     # field, category-colored). Rendered as heatmap because the IDW field reads
     # like Apple-style AQI shading; the stepwise ramp keeps the category colors
-    # crisp. contour_step is unused for heatmaps (kept as a seed).
-    "air-quality-pm25": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP},
-    "air-quality-ozone": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP},
+    # crisp. contour_step is unused for heatmaps (kept as a seed). Dense field
+    # (covers the whole area), so dimmed so the basemap shows through.
+    "air-quality-pm25": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP, "opacity": _OPACITY_DENSE},
+    "air-quality-ozone": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP, "opacity": _OPACITY_DENSE},
 }
 
 _DEFAULT_STYLE = {"contour_step": 1.0, "color_ramp": _RAMP_NEUTRAL}
@@ -235,12 +239,14 @@ def _profile(model):
         return None
     kind, label, attribute = entry
     style = _CUSTOM_STYLE.get(model, _DEFAULT_STYLE)
-    # `render` defaults to isobands unless the style opts into another overlay.
+    # All models render as a heatmap wash (isobands were dropped). The `render`
+    # query param can still override per-request, but the profile default — and
+    # any per-model style `render` — is heatmap.
     return {
         "kind": kind,
         "label": label,
         "attribute": attribute,
-        "render": _RENDER_ISOBAND,
+        "render": _RENDER_HEATMAP,
         **style,
     }
 
@@ -248,7 +254,7 @@ def _profile(model):
 # Fallback profile for an unknown attribute: render as an observation with the
 # neutral ramp so the map still shows something sensible. `attribute` is filled
 # in by the caller (it defaults to the requested model name).
-DEFAULT_PROFILE = {"kind": _OBSERVATION, "label": "Value", "render": _RENDER_ISOBAND, **_DEFAULT_STYLE}
+DEFAULT_PROFILE = {"kind": _OBSERVATION, "label": "Value", "render": _RENDER_HEATMAP, **_DEFAULT_STYLE}
 
 
 
@@ -307,6 +313,7 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
         "auto_step": "true" if auto_step else "false",
         "playback_speed": speed,
         "contour_color_ramp": json.dumps(profile["color_ramp"]),
+        "heatmap_opacity": profile.get("opacity", 1.0),
         "model_options": json.dumps(model_options),
         "current_model": model,
         "render_type": render_type,
@@ -335,6 +342,33 @@ def graph(models: str, lat: float, lon: float, dark_mode: bool = True, dt: int =
         "counts": counts,
         "dark_mode": DARK_MODE if dark_mode else "",
         "is_ha": "true" if ha else "false"
+    })
+    return html
+
+
+@router.get("/forecast/", response_class=HTMLResponse)
+def forecast(model: str, lat: float, lon: float, days: int = 7, name: str = None):
+    """A standard N-day (default 7) forecast view for one model at a point.
+
+    The page fetches the model's hourly series (/api/models/{kind}/params/
+    {attribute}) and aggregates it into per-day summaries client-side. `model`
+    is the dropdown key; its profile supplies the kind/attribute/label/ramp.
+    `name` is an optional location label (e.g. a pin name) for the header."""
+    profile = _profile(model) or {**DEFAULT_PROFILE, "attribute": model}
+    kind = profile["kind"]
+    attribute = profile["attribute"]
+    with open(FORECAST_HTML) as f:
+        template = Template(f.read())
+    html = template.render({
+        "starting_latitude": lat,
+        "starting_longitude": lon,
+        "kind": kind,
+        "attribute": attribute,
+        "model_key": model,
+        "label": profile.get("label", model),
+        "color_ramp": json.dumps(profile["color_ramp"]),
+        "days": max(1, min(int(days), 16)),
+        "location_name": json.dumps(name or ""),
     })
     return html
 

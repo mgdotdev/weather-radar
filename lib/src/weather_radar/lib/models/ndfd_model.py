@@ -52,6 +52,7 @@ class _NDFDPointModel:
         self._nonneg = nonneg
         self.attribute = attribute
         self._source_mtime = source_mtime
+        self._model_cache = None   # memoized `model` tuple (see below)
 
     @property
     def is_expired(self):
@@ -66,6 +67,16 @@ class _NDFDPointModel:
         # Build tz-AWARE bounds (local zone), matching the JSON model whose
         # start/end come from ISO-8601 strings with offsets. predict() compares
         # against time.astimezone() (aware), so naive bounds would raise.
+        #
+        # MEMOIZED: this tuple is invariant for the life of the point (the
+        # spline/bounds/units don't change), but it is read once per point PER
+        # FRAME in the hot series_stream loop. Rebuilding it there (two
+        # astimezone() calls, a datetime.now(), a timedelta, and a fresh
+        # closure) every (point × epoch) time dominated large-area sweeps.
+        # Compute it once and hand back the cached tuple.
+        if self._model_cache is not None:
+            return self._model_cache
+
         start_dt = datetime.fromtimestamp(self._start_epoch).astimezone()
         end_dt = datetime.fromtimestamp(self._end_epoch).astimezone()
         # Far-future expiry: freshness is grid-mtime driven, enforced upstream.
@@ -82,7 +93,25 @@ class _NDFDPointModel:
                 y = 0.0
             return _Scalar(y)
 
-        return start_dt, end_dt, self._center, f, self._units, expiry
+        self._model_cache = (start_dt, end_dt, self._center, f, self._units, expiry)
+        return self._model_cache
+
+    def predict_epoch(self, epoch_seconds):
+        """Fast per-frame evaluation keyed on an ABSOLUTE epoch (int/float
+        seconds). Skips the datetime/timezone churn of `predict(datetime)`:
+        the NDFD spline is itself keyed on absolute epoch, so bounds are a
+        plain numeric compare and the value is a single spline eval + clamp.
+        Raises BoundsError when the epoch is outside this point's horizon.
+
+        Equivalent to predict(datetime.fromtimestamp(epoch)) but ~constant-time
+        with no allocation — used by the hot series_stream sweep where this is
+        called once per point per frame."""
+        if epoch_seconds < self._start_epoch or epoch_seconds > self._end_epoch:
+            raise BoundsError
+        y = float(self._spline(epoch_seconds))
+        if self._nonneg and y < 0:
+            y = 0.0
+        return clamp_value(self.attribute, y)
 
     def predict(self, time, verbose=False):
         if type(time) is not datetime:
@@ -134,6 +163,10 @@ class NDFDObservationEnsemble:
     the wrapped point. Gridpoints are the area's lattice points (its
     map_coordinates)."""
 
+    # Observation mode: spline the raw per-interval values. The accumulation
+    # subclass overrides this to integrate into a cumulative total.
+    _accumulate = False
+
     def __init__(self, area, attribute):
         self.area = area
         self.attribute = attribute
@@ -146,7 +179,8 @@ class NDFDObservationEnsemble:
             return
         self._fit_done = True
         from .. import ndfd
-        fit = ndfd.fit_area(self.area, self.attribute)
+        fit = ndfd.fit_area(self.area, self.attribute,
+                            accumulate=self._accumulate)
         self._fit = fit
         self._models = {}
         if fit is None:
@@ -223,12 +257,12 @@ class NDFDAccumulationEnsemble(NDFDObservationEnsemble):
     """NDFD accumulation ensemble.
 
     NDFD accumulation elements (qpf/snow/ice) are published as PER-INTERVAL
-    totals per message, same as the raw observation series. The JSON
-    AccumulationEnsemble renders a cumulative running total; to match that
-    semantic for NDFD we'd integrate the per-interval series. For the initial
-    drop-in we treat accumulation identically to observation (per-interval
-    value), which matches the app's per-interval "rate" variants. A future
-    enhancement can add running-total integration here without touching the
-    endpoints. See docs/ndfd-roadmap.md Phase 2.
+    totals per message (the fall during each forecast period). To match the
+    JSON AccumulationEnsemble's cumulative "storm total" semantic, this
+    ensemble integrates each point's per-interval series into a RUNNING TOTAL
+    from the forecast window start and fits it with a monotone interpolator
+    (see ndfd.fit_area(accumulate=True)). The result is non-decreasing over
+    time — a value at t+dt is always >= the value at t — so "Snowfall (total)"
+    reads as an accumulation, not a per-interval rate.
     """
-    pass
+    _accumulate = True

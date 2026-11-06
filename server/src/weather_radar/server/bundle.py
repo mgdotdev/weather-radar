@@ -40,6 +40,8 @@ import hashlib
 import logging
 from datetime import datetime
 
+from weather_radar.lib import framing
+
 logger = logging.getLogger(__name__)
 
 CACHE_ROOT = os.environ.get("CACHE_DIR", "/tmp")
@@ -163,18 +165,39 @@ def _build_bundle_aqi(model, lat, lon, width, height, dt, kind):
     return header, frames()
 
 
-def _write_bundle_ndjson(path, header, frame_iter):
-    """Write a gzipped-NDJSON bundle: header line, then one frame line per
-    item from `frame_iter` (streamed, bounded memory). Atomic publish. Returns
-    the frame count, or 0 (and no file) if there were none."""
+def _write_bundle(path, header, frame_iter):
+    """Write a gzipped BINARY-SIDECAR bundle (see weather_radar.lib.framing):
+    a gzipped stream of length-prefixed records —
+      * record 0 : JSON meta (bytes). A superset of the stream grid header —
+                   it carries `range`/`meta` (for read_bundle_range + the
+                   freshness check) AND the grid fields (uom, coords, enc,
+                   scale, offset, sentinel) so serve_bundle_epochs can
+                   reconstruct the stream's binary header from it.
+      * record k : one binary frame [epoch][N × int16], from encode_frame.
+    Atomic publish. Returns the frame count, or 0 (and no file) if none.
+
+    `header` must contain `uom` and `coords`; `frame_iter` yields
+    {"time", "vals"} dicts (vals aligned to coords, None for missing)."""
+    uom = header.get("uom", "")
+    coords = header.get("coords", [])
+    scale, offset = framing.choose_scale(uom)
+    meta_obj = dict(header)
+    meta_obj.setdefault("type", "range")
+    meta_obj["enc"] = framing.ENC_I16
+    meta_obj["scale"] = scale
+    meta_obj["offset"] = offset
+    meta_obj["sentinel"] = framing.SENTINEL
+    meta_bytes = json.dumps(meta_obj, separators=(",", ":")).encode("utf-8")
+
     tmp = path + ".tmp"
     n = 0
     try:
         os.makedirs(BUNDLE_DIR, exist_ok=True)
-        with gzip.open(tmp, "wt", encoding="utf-8") as f:
-            f.write(json.dumps(header, separators=(",", ":")) + "\n")
+        with gzip.open(tmp, "wb") as f:
+            f.write(framing.record(meta_bytes))
             for rec in frame_iter:
-                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                f.write(framing.record(
+                    framing.encode_frame(rec["time"], rec["vals"], scale, offset)))
                 n += 1
         if n == 0:
             os.unlink(tmp)
@@ -189,6 +212,10 @@ def _write_bundle_ndjson(path, header, frame_iter):
             pass
         return 0
     return n
+
+
+# Back-compat alias (callers still use the old name).
+_write_bundle_ndjson = _write_bundle
 
 
 def build_bundle(model, lat, lon, width, height, dt, kind):
@@ -335,54 +362,84 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
     return path
 
 
-def _built_source_mtime(path):
-    """Read just the header line of a gzipped bundle and return its stored
-    source_mtime (the freshness stamp), or None. Used by the builder's
-    freshness check — reads one line, not the whole file."""
+def _read_bundle_meta(path):
+    """Return the bundle's record-0 JSON meta dict (range/meta/uom/coords/
+    enc/scale/offset/...), or None. Reads only the first length-prefixed record
+    — cheap, no frame decode."""
     try:
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            header = json.loads(f.readline())
-        return header.get("meta", {}).get("source_mtime", 0.0)
+        with gzip.open(path, "rb") as f:
+            prefix = f.read(4)
+            if len(prefix) < 4:
+                return None
+            (ln,) = framing._LEN.unpack(prefix)
+            meta_bytes = f.read(ln)
+            if len(meta_bytes) < ln:
+                return None
+            return json.loads(meta_bytes.decode("utf-8"))
     except Exception:
         return None
+
+
+def _built_source_mtime(path):
+    """Read the bundle's meta record and return its stored source_mtime (the
+    freshness stamp), or None. Used by the builder's freshness check."""
+    meta = _read_bundle_meta(path)
+    if meta is None:
+        return None
+    return meta.get("meta", {}).get("source_mtime", 0.0)
 
 
 def read_bundle_range(model, lat, lon, width, height, dt, kind):
     """Return the precomputed bundle's stored `range` (min/max/uom/start/end/
     timeZone) if a bundle keyed by these exact params exists, else None. Reads
-    only the header line — cheap, no gridpoint resolution. Used by the prefetch
+    only the meta record — cheap, no gridpoint resolution. Used by the prefetch
     endpoint so a watched url's color range + forecast window come WITHOUT the
     usual resolve/fetch (the frames then stream from the same bundle)."""
     path = _bundle_path(model, lat, lon, width, height, dt, kind)
     if not os.path.exists(path):
         return None
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            header = json.loads(f.readline())
-    except Exception:
+    meta = _read_bundle_meta(path)
+    if meta is None or meta.get("type") != "range":
         return None
-    if header.get("type") != "range":
-        return None
-    return header.get("range")
+    rng = meta.get("range")
+    # Derive the painted-field extent from the stored lattice coords (same 5%
+    # pad the client IDW raster uses), so the watched-url fast path sizes the
+    # area box correctly from the first render too (the /type/range endpoint
+    # adds the same `extent` on the non-bundle path). coords are [lon, lat].
+    if isinstance(rng, dict) and rng.get("extent") is None:
+        coords = meta.get("coords") or []
+        if coords:
+            lons = [c[0] for c in coords]
+            lats = [c[1] for c in coords]
+            min_lon, max_lon = min(lons), max(lons)
+            min_lat, max_lat = min(lats), max(lats)
+            pad_lon = (max_lon - min_lon) * 0.05 or 0.01
+            pad_lat = (max_lat - min_lat) * 0.05 or 0.01
+            rng = dict(rng)
+            rng["extent"] = {
+                "w": min_lon - pad_lon, "e": max_lon + pad_lon,
+                "s": min_lat - pad_lat, "n": max_lat + pad_lat,
+            }
+    return rng
 
 
 def serve_bundle_epochs(model, lat, lon, width, height, dt, kind, epochs,
                         covered, emit_header=False):
-    """Yield the bundle's frame lines for exactly the requested `epochs` (an
+    """Yield the bundle's BINARY records for exactly the requested `epochs` (an
     iterable of int epochs). Each epoch found is added to `covered`. Yields
     nothing if no bundle exists for these params.
 
-    GRID FORMAT: when `emit_header=True`, the FIRST yielded line is the grid
-    header {"type":"grid","uom",...,"coords":[...]} reconstructed from the
-    bundle's stored header (so the stream's values-only frames can be keyed to
-    it by the client). Frames themselves are the stored values-only
-    {"time","vals"} lines, filtered to the wanted epochs. The header is emitted
-    only if the bundle exists AND at least one line will follow — we emit it
-    lazily, right before the first matching frame, so a totally-missed request
-    yields nothing (letting the live path emit its own header).
+    BINARY SIDECAR (see weather_radar.lib.framing): when `emit_header=True`, the
+    FIRST yielded record is the grid header (reconstructed from the bundle's
+    meta — uom/coords/enc/scale/offset), so the client can key the stream's
+    binary frames to it. Frames are the stored binary frame records, filtered
+    to the wanted epochs; their encoding (scale/offset) is IDENTICAL to what the
+    live path would emit (choose_scale is a pure function of uom), so a mixed
+    bundle+live stream is self-consistent. The header is emitted lazily, right
+    before the first matching frame, so a totally-missed request yields nothing
+    (letting the live path emit its own header).
 
-    This serves BOTH the sequence and the batch of a /series/stream request.
-    CHEAP + bounded memory: decompresses line-by-line; NO gridpoint resolution.
+    CHEAP + bounded memory: de-frames record-by-record; NO gridpoint resolution.
     """
     path = _bundle_path(model, lat, lon, width, height, dt, kind)
     if not os.path.exists(path):
@@ -390,37 +447,45 @@ def serve_bundle_epochs(model, lat, lon, width, height, dt, kind, epochs,
     wanted = {int(e) for e in epochs}
     if not wanted:
         return
-    with gzip.open(path, "rt", encoding="utf-8") as f:
-        first = True
-        grid_header_line = None
-        for line in f:
-            if not line.strip():
-                continue
-            if first:
-                first = False
-                # The bundle's header line carries uom + coords. Convert it to
-                # a grid header line to emit lazily before the first frame.
+    try:
+        with gzip.open(path, "rb") as f:
+            # Record 0: meta. Build the binary grid header to emit lazily.
+            prefix = f.read(4)
+            if len(prefix) < 4:
+                return
+            (ln,) = framing._LEN.unpack(prefix)
+            meta = json.loads(f.read(ln).decode("utf-8"))
+            grid_header_rec = None
+            if emit_header:
+                grid_header_rec = framing.record(framing.encode_header(
+                    meta.get("uom", ""), meta.get("coords", []),
+                    meta.get("scale", 10.0), meta.get("offset", 0.0),
+                    meta.get("sentinel", framing.SENTINEL)))
+
+            # Records 1..N: binary frames. Peek the epoch (first 8 bytes) to
+            # decide if this frame is wanted; yield the WHOLE record unchanged
+            # (same encoding the live path uses).
+            while True:
+                prefix = f.read(4)
+                if len(prefix) < 4:
+                    break
+                (ln,) = framing._LEN.unpack(prefix)
+                payload = f.read(ln)
+                if len(payload) < ln:
+                    break
                 try:
-                    hdr = json.loads(line)
-                    if hdr.get("type") == "range":
-                        grid_header_line = json.dumps(
-                            {"type": "grid",
-                             "uom": hdr.get("uom", ""),
-                             "coords": hdr.get("coords", [])},
-                            separators=(",", ":")) + "\n"
-                        continue  # don't emit the range header as a frame
+                    t = int(framing.decode_frame_epoch(payload))
                 except Exception:
-                    pass
-            try:
-                t = int(json.loads(line).get("time"))
-            except Exception:
-                continue
-            if t in wanted:
-                covered.add(t)
-                if emit_header and grid_header_line is not None:
-                    yield grid_header_line
-                    grid_header_line = None  # once
-                yield line if line.endswith("\n") else line + "\n"
+                    continue
+                if t in wanted:
+                    covered.add(t)
+                    if grid_header_rec is not None:
+                        yield grid_header_rec
+                        grid_header_rec = None  # once
+                    yield framing.record(payload)
+    except Exception:
+        logger.warning("serve_bundle_epochs failed for %s", path, exc_info=True)
+        return
 
 
 # --- URL -> bundle params, and the single-instance background builder --------

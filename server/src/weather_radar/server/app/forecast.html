@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{label}} — Forecast</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: -apple-system, system-ui, sans-serif;
+      background: #f3f4f6; color: #1f2430;
+    }
+    header {
+      padding: 20px 24px 12px; max-width: 1100px; margin: 0 auto;
+    }
+    header h1 { margin: 0 0 2px; font-size: 22px; font-weight: 700; }
+    header .sub { color: #6b7280; font-size: 13px; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 8px 24px 32px; }
+    .cards {
+      display: grid; gap: 12px;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    }
+    .card {
+      background: #fff; border-radius: 14px; padding: 14px 14px 16px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08); border: 1px solid #eceef2;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .card .dow { font-weight: 700; font-size: 15px; }
+    .card .date { color: #6b7280; font-size: 12px; margin-top: -4px; }
+    .swatch {
+      height: 6px; border-radius: 3px; width: 100%;
+    }
+    .primary { font-size: 26px; font-weight: 700; line-height: 1.1; }
+    .primary .unit { font-size: 14px; font-weight: 600; color: #6b7280; }
+    .secondary { font-size: 13px; color: #6b7280; }
+    .hl { display: flex; gap: 10px; align-items: baseline; }
+    .hl .hi { font-size: 26px; font-weight: 700; }
+    .hl .lo { font-size: 18px; font-weight: 600; color: #6b7280; }
+    .msg { color: #6b7280; font-size: 14px; padding: 24px 0; }
+    .spark {
+      display: flex; align-items: flex-end; gap: 2px; height: 34px; margin-top: 2px;
+    }
+    .spark span { flex: 1 1 auto; background: #c7d2fe; border-radius: 2px 2px 0 0; min-height: 2px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">{{label}}</h1>
+    <div class="sub" id="subtitle"></div>
+  </header>
+  <div class="wrap">
+    <div id="msg" class="msg">Loading forecast…</div>
+    <div id="cards" class="cards"></div>
+  </div>
+
+  <script>
+    const LAT = {{starting_latitude}};
+    const LON = {{starting_longitude}};
+    const KIND = "{{kind}}";
+    const ATTRIBUTE = "{{attribute}}";
+    const LABEL = "{{label}}";
+    const COLOR_RAMP = {{color_ramp}};
+    const DAYS = {{days}};
+    const LOCATION_NAME = {{location_name}};
+
+    // Interpolate the ramp ([pos, "rgb(...)", ...]) at t in [0,1] -> "rgb()".
+    const rampStops = (() => {
+      const s = [];
+      for (let i = 0; i < COLOR_RAMP.length; i += 2) {
+        const m = String(COLOR_RAMP[i + 1]).match(/rgba?\(([^)]+)\)/);
+        const p = m[1].split(",").map(x => parseFloat(x.trim()));
+        s.push({ pos: COLOR_RAMP[i], r: p[0], g: p[1], b: p[2] });
+      }
+      return s;
+    })();
+    function rampAt(t) {
+      t = Math.max(0, Math.min(1, t));
+      let a = rampStops[0], b = rampStops[rampStops.length - 1];
+      for (let i = 0; i < rampStops.length - 1; i++) {
+        if (t >= rampStops[i].pos && t <= rampStops[i + 1].pos) { a = rampStops[i]; b = rampStops[i + 1]; break; }
+      }
+      const span = (b.pos - a.pos) || 1, f = (t - a.pos) / span;
+      return `rgb(${Math.round(a.r + (b.r - a.r) * f)},${Math.round(a.g + (b.g - a.g) * f)},${Math.round(a.b + (b.b - a.b) * f)})`;
+    }
+
+    // Accumulation attributes are cumulative storm totals; the daily figure is
+    // the INCREMENT gained that day. Temperature-like fields show a daily
+    // HIGH/LOW. Everything else shows the daily MEAN (and peak).
+    const ACCUM_ATTRS = new Set(["quantitative-precipitation", "snowfall-amount", "ice-accumulation"]);
+    const TEMP_ATTRS = new Set(["temperature", "dewpoint", "apparent-temperature",
+      "max-temperature", "min-temperature", "heat-index", "wind-chill"]);
+    const isAccum = KIND === "accumulation" || ACCUM_ATTRS.has(ATTRIBUTE);
+    const isTemp = TEMP_ATTRS.has(ATTRIBUTE);
+
+    const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    function dayKey(d) { return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; }
+
+    function fmt(v) {
+      if (v === null || v === undefined || !isFinite(v)) return "—";
+      const a = Math.abs(v);
+      return (a >= 100 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(2)).replace(/\.0+$/, "");
+    }
+
+    async function load() {
+      const subtitle = document.getElementById("subtitle");
+      const locPart = LOCATION_NAME ? `${LOCATION_NAME} · ` : "";
+      subtitle.textContent = `${locPart}${LAT.toFixed(4)}, ${LON.toFixed(4)}`;
+
+      const url = `/api/models/${KIND}/params/${encodeURIComponent(ATTRIBUTE)}`
+        + `?lat=${LAT}&lon=${LON}&dt=3600&counts=-1`;
+      let data;
+      try {
+        const res = await fetch(url);
+        data = await res.json();
+      } catch (e) {
+        document.getElementById("msg").textContent = "Failed to load forecast.";
+        return;
+      }
+      const feats = (data && data.features) || [];
+      if (!feats.length) {
+        document.getElementById("msg").textContent = "No forecast data for this location.";
+        return;
+      }
+      const unit = feats[0].properties.uom || "";
+
+      // Group hourly samples by local day, in order.
+      const byDay = new Map();
+      const order = [];
+      for (const f of feats) {
+        const v = f.properties[ATTRIBUTE];
+        if (v === null || v === undefined || !isFinite(v)) continue;
+        const t = new Date(f.properties.time);
+        const k = dayKey(t);
+        if (!byDay.has(k)) { byDay.set(k, { date: t, vals: [] }); order.push(k); }
+        byDay.get(k).vals.push({ t, v });
+      }
+
+      const days = order.slice(0, DAYS).map(k => byDay.get(k));
+      if (!days.length) {
+        document.getElementById("msg").textContent = "No forecast data for this location.";
+        return;
+      }
+
+      // Global value range (for the color swatch scaling) across shown days.
+      let gMin = Infinity, gMax = -Infinity;
+      for (const d of days) for (const s of d.vals) { if (s.v < gMin) gMin = s.v; if (s.v > gMax) gMax = s.v; }
+      const span = (gMax - gMin) || 1;
+
+      document.getElementById("msg").style.display = "none";
+      const cards = document.getElementById("cards");
+
+      for (const d of days) {
+        const vals = d.vals.map(s => s.v);
+        const hi = Math.max(...vals), lo = Math.min(...vals);
+        const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+        // Accumulation: increment over the day = last - first of the cumulative.
+        const delta = vals[vals.length - 1] - vals[0];
+
+        const card = document.createElement("div");
+        card.className = "card";
+
+        const dow = document.createElement("div"); dow.className = "dow";
+        dow.textContent = DOW[d.date.getDay()];
+        const date = document.createElement("div"); date.className = "date";
+        date.textContent = `${MON[d.date.getMonth()]} ${d.date.getDate()}`;
+
+        const swatch = document.createElement("div"); swatch.className = "swatch";
+        const sv = isAccum ? delta : (isTemp ? hi : mean);
+        swatch.style.background = rampAt((sv - gMin) / span);
+
+        card.appendChild(dow);
+        card.appendChild(date);
+        card.appendChild(swatch);
+
+        if (isTemp) {
+          const hl = document.createElement("div"); hl.className = "hl";
+          const h = document.createElement("span"); h.className = "hi"; h.textContent = fmt(hi) + "°";
+          const l = document.createElement("span"); l.className = "lo"; l.textContent = fmt(lo) + "°";
+          hl.appendChild(h); hl.appendChild(l);
+          card.appendChild(hl);
+          const su = document.createElement("div"); su.className = "secondary";
+          su.textContent = `avg ${fmt(mean)}°${unit ? " " + unit : ""}`;
+          card.appendChild(su);
+        } else if (isAccum) {
+          const p = document.createElement("div"); p.className = "primary";
+          p.innerHTML = `${fmt(Math.max(0, delta))} <span class="unit">${unit}</span>`;
+          card.appendChild(p);
+          const su = document.createElement("div"); su.className = "secondary";
+          su.textContent = `total ${fmt(vals[vals.length - 1])}${unit ? " " + unit : ""}`;
+          card.appendChild(su);
+        } else {
+          const p = document.createElement("div"); p.className = "primary";
+          p.innerHTML = `${fmt(mean)} <span class="unit">${unit}</span>`;
+          card.appendChild(p);
+          const su = document.createElement("div"); su.className = "secondary";
+          su.textContent = `${fmt(lo)}–${fmt(hi)}${unit ? " " + unit : ""}`;
+          card.appendChild(su);
+        }
+
+        cards.appendChild(card);
+      }
+    }
+    load();
+  </script>
+</body>
+</html>

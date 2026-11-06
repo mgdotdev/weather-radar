@@ -197,7 +197,8 @@ def _fake_fit(monkeypatch, units="degF", nonneg=False):
         "splines": [sa, sb],
         "units": units, "nonneg": nonneg,
     }
-    monkeypatch.setattr(ndfd, "fit_area", lambda area, attr: fit)
+    monkeypatch.setattr(ndfd, "fit_area",
+                        lambda area, attr, accumulate=False: fit)
     monkeypatch.setattr(ndfd, "grid_mtime", lambda attr: 123.0)
     return start, end
 
@@ -283,7 +284,7 @@ class TestNDFDEnsemble:
         fit = {"start": start, "end": start + 6 * 3600,
                "points": [MapCoordinate(lat=45.6, lon=-118.8)],
                "splines": [neg], "units": "mph", "nonneg": True}
-        monkeypatch.setattr(ndfd, "fit_area", lambda a, at: fit)
+        monkeypatch.setattr(ndfd, "fit_area", lambda a, at, accumulate=False: fit)
         monkeypatch.setattr(ndfd, "grid_mtime", lambda at: 1.0)
         ens = NDFDObservationEnsemble(_StubArea(), "wind-speed")
         m = next(iter(ens.iter_points()))
@@ -292,7 +293,85 @@ class TestNDFDEnsemble:
 
     def test_no_data_returns_none_range(self, monkeypatch):
         from weather_radar.lib.models.ndfd_model import NDFDObservationEnsemble
-        monkeypatch.setattr(ndfd, "fit_area", lambda a, at: None)
+        monkeypatch.setattr(ndfd, "fit_area", lambda a, at, accumulate=False: None)
         ens = NDFDObservationEnsemble(_StubArea(), "pressure")
         assert ens.value_range() is None
         assert list(ens.iter_points()) == []
+
+
+# --- Accumulation integration (cumulative storm total, monotone) ------------
+# NDFD publishes qpf/snow/ice as PER-INTERVAL amounts. fit_area(accumulate=True)
+# must integrate them into a running total from the window start, fit with a
+# monotone interpolator so the total never decreases. These stub _load_grid
+# (a real cKDTree + synthetic per-interval frames) to drive fit_area directly.
+
+class TestAccumulationFit:
+    def _stub_grid(self, monkeypatch, per_interval_m):
+        """Install a _load_grid stub: a single lattice point whose per-interval
+        snowfall (metres) over N hourly frames is `per_interval_m`."""
+        import numpy as np
+        from scipy.spatial import cKDTree
+        start = int(datetime(2026, 11, 5, 0, 0).timestamp())
+        # One grid cell at the StubArea's first lattice point (45.6, -118.8).
+        tree = cKDTree(np.array([[45.6, -118.8]]))
+        frames = [(float(start + h * 3600), np.array([per_interval_m[h]],
+                                                     dtype=float))
+                  for h in range(len(per_interval_m))]
+        monkeypatch.setattr(ndfd, "_load_grid",
+                            lambda attr: {"tree": tree, "frames": frames})
+        return start
+
+    def test_accumulation_is_monotonic_nondecreasing(self, monkeypatch):
+        # Per-interval snow (m): rises and falls hour to hour.
+        per = [0.0, 0.01, 0.03, 0.0, 0.02, 0.05, 0.0, 0.0]
+        start = self._stub_grid(monkeypatch, per)
+        area = _StubArea(n=1)
+        fit = ndfd.fit_area(area, "snowfall-amount", accumulate=True)
+        assert fit is not None
+        spline = fit["splines"][0]
+        # Sample at 5-min resolution across the window; never decreases.
+        import numpy as np
+        ts = np.arange(fit["start"], fit["end"], 300, dtype=float)
+        ys = spline(ts)
+        assert np.all(np.diff(ys) >= -1e-9), "cumulative total must not decrease"
+
+    def test_accumulation_starts_at_zero_and_totals_sum(self, monkeypatch):
+        per = [0.0, 0.01, 0.03, 0.0, 0.02, 0.05, 0.0, 0.0]
+        start = self._stub_grid(monkeypatch, per)
+        fit = ndfd.fit_area(_StubArea(n=1), "snowfall-amount", accumulate=True)
+        spline = fit["splines"][0]
+        conv = ndfd.ELEMENTS["snowfall-amount"]["convert"]  # m -> in
+        # Starts at ~0 at the window start.
+        assert float(spline(fit["start"])) == pytest.approx(0.0, abs=1e-6)
+        # Ends at the full sum of per-interval amounts (converted to inches).
+        expected_total = conv(sum(per))
+        assert float(spline(fit["end"])) == pytest.approx(expected_total, abs=1e-4)
+
+    def test_observation_mode_is_per_interval_not_cumulative(self, monkeypatch):
+        # Default (accumulate=False) splines the raw per-interval values, so a
+        # falling interval DOES produce a lower value (the old behavior, correct
+        # for a "rate"/observation layer).
+        per = [0.0, 0.05, 0.0, 0.0]
+        self._stub_grid(monkeypatch, per)
+        fit = ndfd.fit_area(_StubArea(n=1), "snowfall-amount", accumulate=False)
+        spline = fit["splines"][0]
+        conv = ndfd.ELEMENTS["snowfall-amount"]["convert"]
+        # At the 2nd hour the per-interval value is the peak; by the 3rd it
+        # drops back toward 0 — i.e. NOT monotonic.
+        assert float(spline(fit["start"] + 3600)) == pytest.approx(conv(0.05), abs=1e-4)
+        assert float(spline(fit["start"] + 2 * 3600)) < float(spline(fit["start"] + 3600))
+
+    def test_accumulation_ensemble_requests_accumulate(self, monkeypatch):
+        # NDFDAccumulationEnsemble must drive fit_area with accumulate=True.
+        from weather_radar.lib.models.ndfd_model import NDFDAccumulationEnsemble
+        captured = {}
+
+        def fake_fit(area, attr, accumulate=False):
+            captured["accumulate"] = accumulate
+            return None  # no data -> ensemble stays empty; we only check the flag
+
+        monkeypatch.setattr(ndfd, "fit_area", fake_fit)
+        monkeypatch.setattr(ndfd, "grid_mtime", lambda attr: 1.0)
+        ens = NDFDAccumulationEnsemble(_StubArea(n=1), "snowfall-amount")
+        list(ens.iter_points())  # triggers _ensure_fit
+        assert captured.get("accumulate") is True

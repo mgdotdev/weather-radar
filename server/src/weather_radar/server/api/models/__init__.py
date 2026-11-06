@@ -12,38 +12,38 @@ from weather_radar.lib.models import model_from_type, ensemble_kinds, weather_so
 from weather_radar.lib.models.accumulation import AccumulationEnsemble
 from weather_radar.lib.models.observation import ObservationEnsemble
 from weather_radar.lib.area import MapCoordinate, CoordinateArea
-from weather_radar.lib.models.utils import BoundsError
+from weather_radar.lib.models.utils import BoundsError, clamp_value
+from weather_radar.lib import framing
 
 
-def _gzip_stream(line_iter):
-    """Wrap a text-line generator in a streaming gzip compressor.
+def _gzip_stream(chunk_iter):
+    """Wrap a byte-chunk generator in a streaming gzip compressor.
 
     Yields gzip-compressed bytes incrementally: each source chunk is compressed
     with Z_SYNC_FLUSH so the client receives (and can decode) data as it
-    arrives — preserving the per-frame streaming / first-frame latency that the
-    whole animation pipeline depends on. The grid wire format repeats small
-    integers and (for the header) a coord lattice, both of which gzip heavily;
-    combined with coords-sent-once this cuts a large sweep from ~hundreds of MB
-    to tens of MB on the wire.
+    arrives — preserving the per-frame streaming / first-frame latency the
+    animation pipeline depends on.
 
-    The browser's fetch() transparently inflates `Content-Encoding: gzip`, so
-    the client's NDJSON line reader is UNCHANGED."""
+    `chunk_iter` yields `bytes` (the binary-sidecar length-prefixed records; see
+    weather_radar.lib.framing). The browser's fetch() transparently inflates
+    `Content-Encoding: gzip`, so the client only has to de-frame the records."""
     # wbits=31 -> gzip wrapper (not raw deflate / zlib).
     compressor = zlib.compressobj(6, zlib.DEFLATED, 31)
-    for line in line_iter:
-        if not line:
+    for chunk in chunk_iter:
+        if not chunk:
             continue
-        chunk = compressor.compress(line.encode("utf-8"))
-        chunk += compressor.flush(zlib.Z_SYNC_FLUSH)
-        if chunk:
-            yield chunk
+        out = compressor.compress(chunk)
+        out += compressor.flush(zlib.Z_SYNC_FLUSH)
+        if out:
+            yield out
     tail = compressor.flush(zlib.Z_FINISH)
     if tail:
         yield tail
 
 
-# Standard headers for a gzipped NDJSON stream.
-_GZIP_NDJSON_HEADERS = {"Content-Encoding": "gzip"}
+# Standard headers for a gzipped binary frame stream (binary sidecar framing).
+_GZIP_STREAM_HEADERS = {"Content-Encoding": "gzip"}
+_STREAM_MEDIA_TYPE = "application/octet-stream"
 
 
 logger = logging.getLogger(__name__)
@@ -80,11 +80,113 @@ def _is_ndfd():
 
 @router.get("/{model}/params/{param}", response_class=JSONResponse)
 def models(model: str, param: str, lat: float, lon: float, time: time_t=None, dt:int=0, counts: int=-1):
+    """Single-point time series for the forecast graph. `model` here is the
+    KIND ("observation"/"accumulation"); `param` is the attribute. Returns a
+    GeoJSON FeatureCollection (verbose predict) so the graph can plot value vs.
+    time.
+
+    SOURCE-AWARE: this must use the SAME data source as the map, else the graph
+    disagrees with the map (e.g. under WR_WEATHER_SOURCE=ndfd the map shows
+    NDFD snowfall while the JSON single-point model reads a different —
+    possibly empty — /gridpoints series). For NDFD we fit a minimal area at the
+    point through the source's ensemble (so accumulation gets the cumulative
+    integration too) and evaluate its nearest lattice point."""
     dtime = datetime_from_time(time, dt=dt, counts=counts)
     coord = MapCoordinate(lat, lon)
+    from datetime import timedelta
+
+    if weather_source() == "ndfd":
+        # NDFD is area/ensemble-based. Sample the point the SAME way the map
+        # does: an inverse-distance-weighted blend of the area's lattice points
+        # (mirroring the client's buildField IDW), NOT just the single nearest
+        # lattice point — the nearest cell may be a no-data (fill) cell that the
+        # map's IDW skips, which is why a single-cell graph read 0 while the map
+        # showed the blended neighbors' snow. Graph the WHOLE forecast window.
+        ensemble_class = ENSEMBLE_KINDS().get(model, AccumulationEnsemble)
+        area = CoordinateArea(coord, 1, 1)
+        ensemble = ensemble_class(area, param)
+        return _ndfd_point_series(ensemble, coord, param, dt)
+
     model_class = model_from_type(model)
-    model = model_class.from_map_coordinate(coord, param)
-    return model.predict(dtime, verbose=True)
+    m = model_class.from_map_coordinate(coord, param)
+    return m.predict(dtime, verbose=True)
+
+
+# IDW params mirrored from the client raster (map.html buildField), so the
+# graph's blended point value matches what the heatmap paints there.
+_IDW_K = 12
+_IDW_EPS = 0.015 * 0.015
+
+
+def _ndfd_point_series(ensemble, coord, param, dt):
+    """A verbose FeatureCollection time series at `coord`, IDW-blended from the
+    NDFD ensemble's lattice points over the forecast window (stepped by dt,
+    fallback 1h). Matches the map's interpolation so the graph agrees with the
+    heatmap at the pinned point."""
+    from datetime import datetime, timedelta
+
+    pts = []  # [(center, f, start_dt, end_dt, units)]
+    units = ""
+    start_dt = end_dt = None
+    try:
+        models = list(ensemble.iter_points())
+    except Exception:
+        models = []
+    for m in models:
+        try:
+            st, et, center, f, uom, _x = m.model
+        except Exception:
+            continue
+        pts.append((center, f, st, et))
+        units = units or uom
+        # The lattice shares one window; take the widest seen.
+        if start_dt is None or st < start_dt:
+            start_dt = st
+        if end_dt is None or et > end_dt:
+            end_dt = et
+    if not pts or start_dt is None:
+        return {"type": "FeatureCollection", "features": []}
+
+    # Nearest-K points to the pin by squared degree distance (lon/lat), with
+    # their normalized inverse-distance (power 2) weights — constant across the
+    # whole window (positions don't move), so compute once.
+    scored = sorted(
+        ((((c.lat - coord.lat) ** 2 + (c.lon - coord.lon) ** 2), c, f, st, et)
+         for (c, f, st, et) in pts),
+        key=lambda t: t[0],
+    )[:_IDW_K]
+
+    step = int(dt) if dt and int(dt) > 0 else 3600
+    features = []
+    t = start_dt
+    guard = 0
+    while t <= end_dt and guard < 100000:
+        num = 0.0
+        den = 0.0
+        for d2, c, f, st, et in scored:
+            if t < st or t > et:
+                continue  # this point out of its window at t
+            secs = (t - st).total_seconds()
+            try:
+                y = f(secs).item()
+            except Exception:
+                continue
+            if y < 0:
+                y = 0.0
+            w = 1.0 / (d2 + _IDW_EPS)
+            num += w * y
+            den += w
+        if den > 0:
+            val = clamp_value(param, num / den)
+            features.append({
+                "type": "Feature",
+                "properties": {param: val, "time": t.isoformat(), "uom": units},
+                "geometry": {"type": "Point",
+                             "coordinates": [coord.lon, coord.lat]},
+            })
+        t = t + timedelta(seconds=step)
+        guard += 1
+    return {"type": "FeatureCollection", "features": features}
 
 
 @router.get("/prefetch", status_code=204)
@@ -240,17 +342,18 @@ def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
         if not epochs:
             return
         # Bundle first (keyed by kind="aqi", model=pollutant). The bundle emits
-        # the grid header; the live path emits one only if the bundle didn't.
+        # the (binary) header record; the live path emits one only if the
+        # bundle didn't. serve_bundle_epochs yields raw binary records.
         remaining = list(epochs)
         header_sent = False
         try:
             from weather_radar.server.bundle import serve_bundle_epochs
             covered = set()
-            for line in serve_bundle_epochs(pollutant, lat, lon, width, height,
-                                            dt, "aqi", epochs, covered,
-                                            emit_header=True):
+            for rec in serve_bundle_epochs(pollutant, lat, lon, width, height,
+                                           dt, "aqi", epochs, covered,
+                                           emit_header=True):
                 header_sent = True
-                yield line
+                yield rec
             if covered:
                 remaining = [e for e in epochs if int(e) not in covered]
                 if not remaining:
@@ -262,18 +365,20 @@ def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
         fit = fit_area(area, pollutant)
         if fit is None:
             return
-        # GRID FORMAT: coords once, then values-only frames aligned to them.
+        # BINARY SIDECAR: header (coords + enc/scale) once, then binary frames.
+        # AQI is an integer index; scale=10/offset=0 (from choose_scale("AQI"))
+        # is lossless for whole-number AQI and matches the bundle's encoding.
+        scale, offset = framing.choose_scale("AQI")
         if not header_sent:
-            yield json.dumps({"type": "grid", "uom": "AQI",
-                              "coords": grid_points(fit)},
-                             separators=(",", ":")) + "\n"
+            yield framing.record(
+                framing.encode_header("AQI", grid_points(fit), scale, offset))
         for fr in predict_area(fit, remaining, fixed_grid=True):
-            yield json.dumps({"time": fr["epoch"], "vals": fr["vals"]},
-                             separators=(",", ":")) + "\n"
+            yield framing.record(
+                framing.encode_frame(fr["epoch"], fr["vals"], scale, offset))
 
     return StreamingResponse(_gzip_stream(generate()),
-                             media_type="application/x-ndjson",
-                             headers=_GZIP_NDJSON_HEADERS)
+                             media_type=_STREAM_MEDIA_TYPE,
+                             headers=_GZIP_STREAM_HEADERS)
 
 
 
@@ -300,7 +405,55 @@ def ensemble_range(
     # Include the center's IANA timezone so the client can display times in
     # the map location's local zone rather than the browser's.
     result["timeZone"] = area.time_zone
+    # Painted-field extent: the bounding box of the sampled lattice points plus
+    # the SAME 5% pad the client's IDW raster applies (see buildField). The
+    # client uses this to size the area-outline box correctly from the FIRST
+    # render, instead of first drawing the nominal width×height rectangle and
+    # then snapping to the data extent when the first frame paints (a visible
+    # resize when the animation starts). Cheap: the points are already resolved
+    # by value_range() above.
+    try:
+        result["extent"] = _field_extent(ensemble, area)
+    except Exception:
+        result["extent"] = None
     return result
+
+
+def _field_extent(ensemble, area):
+    """Bounding box (w/e/s/n lon/lat) of the area's sampled lattice points,
+    padded 5% per side to MATCH the client IDW raster's padding (buildField).
+    Returns None if no points resolve. Source-agnostic: NDFD ensembles expose
+    iter_points(); the JSON ensembles iterate resolved gridpoints."""
+    lons = []
+    lats = []
+    if hasattr(ensemble, "iter_points"):
+        for m in ensemble.iter_points():
+            try:
+                _st, _et, center, _f, _u, _x = m.model
+            except Exception:
+                continue
+            lons.append(center.lon)
+            lats.append(center.lat)
+    else:
+        for gp in area.iter_gridpoints():
+            try:
+                _st, _et, center, _f, _u, _x = ensemble[gp].model
+            except Exception:
+                continue
+            lons.append(center.lon)
+            lats.append(center.lat)
+    if not lons:
+        return None
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+    # Mirror buildField: pad 5% of span per side, with a small floor when the
+    # span is ~0 (single point / degenerate).
+    pad_lon = (max_lon - min_lon) * 0.05 or 0.01
+    pad_lat = (max_lat - min_lat) * 0.05 or 0.01
+    return {
+        "w": min_lon - pad_lon, "e": max_lon + pad_lon,
+        "s": min_lat - pad_lat, "n": max_lat + pad_lat,
+    }
 
 
 @router.get("/{model}/type/ensemble/stream")
@@ -548,36 +701,40 @@ def ensemble_series_stream(
         if not models:
             return
 
-        # GRID WIRE FORMAT. The coordinate lattice is FIXED for an area, so it
-        # is sent ONCE as a header line and omitted from every frame:
-        #   {"type":"grid","uom":...,"coords":[[lon,lat],...]}   (first line)
-        #   {"time":epoch,"vals":[v0,v1,...]}                     (each frame)
-        # `vals` is aligned to the header's `coords` by INDEX and is always the
-        # same length; a point with no value THIS frame (out of horizon) is
-        # `null`. This removes the ~Nx coordinate repetition that dominated the
-        # payload on large areas (coords were ~86% of a multi-hundred-MB sweep).
-        # The client rehydrates each values-only frame against the header coords
-        # before caching, so the cache/render path stays self-contained.
+        # BINARY SIDECAR WIRE FORMAT (see weather_radar.lib.framing). The
+        # coordinate lattice is FIXED for an area, so it is sent ONCE in a JSON
+        # header record; every frame is a compact binary record
+        # [epoch][N × int16] (values scaled by the header's scale/offset, a
+        # sentinel for missing points). This replaces ~3-5 ASCII bytes/value +
+        # a per-frame JSON.parse with 2 bytes/value + a typed-array view.
         #
         # Skip the header here if the bundle path already sent one (single
         # header per stream). Live coords == bundle coords (same ensemble point
-        # order for the area), so the one header covers both.
+        # order for the area), so the one header covers both. scale/offset are
+        # derived from the uom and MUST match what the bundle used (choose_scale
+        # is a pure function of uom, so they agree).
+        scale, offset = framing.choose_scale(uom)
         if not header_sent:
-            yield json.dumps({"type": "grid", "uom": uom, "coords": coords},
-                             separators=(",", ":")) + "\n"
+            yield framing.record(framing.encode_header(uom, coords, scale, offset))
 
         t_eval_start = time.perf_counter()
         t_first_frame = None
         frames_emitted = 0
+        # Fast per-point evaluator: NDFD point models expose predict_epoch()
+        # (absolute-epoch spline eval, no per-call datetime/closure allocation);
+        # JSON gridpoint models use the datetime predict(). Resolve the mode
+        # ONCE (all models in a sweep are the same kind) so the hot loop below
+        # doesn't branch per (point × frame).
+        use_epoch = bool(models) and hasattr(models[0], "predict_epoch")
         for epoch in remaining:
-            t = datetime.fromtimestamp(epoch)
+            t = None if use_epoch else datetime.fromtimestamp(epoch)
             vals = []
             any_val = False
             for m in models:
                 try:
-                    y = m.predict(t, verbose=False)
+                    y = m.predict_epoch(epoch) if use_epoch else m.predict(t, verbose=False)
                 except BoundsError:
-                    vals.append(None)   # out of horizon this frame -> null slot
+                    vals.append(None)   # out of horizon this frame -> sentinel
                     continue
                 except Exception:
                     vals.append(None)
@@ -588,8 +745,8 @@ def ensemble_series_stream(
                 if t_first_frame is None:
                     t_first_frame = time.perf_counter()
                 frames_emitted += 1
-                yield json.dumps({"time": epoch, "vals": vals},
-                                 separators=(",", ":")) + "\n"
+                yield framing.record(
+                    framing.encode_frame(epoch, vals, scale, offset))
 
         # --- One structured timing line per request. Durations in ms. ---
         #   resolve     : area.iter_gridpoints()
@@ -615,5 +772,5 @@ def ensemble_series_stream(
             )
 
     return StreamingResponse(_gzip_stream(generate()),
-                             media_type="application/x-ndjson",
-                             headers=_GZIP_NDJSON_HEADERS)
+                             media_type=_STREAM_MEDIA_TYPE,
+                             headers=_GZIP_STREAM_HEADERS)

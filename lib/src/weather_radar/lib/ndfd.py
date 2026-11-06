@@ -350,7 +350,7 @@ def grid_mtime(attribute):
 
 # --- Area fitting -----------------------------------------------------------
 
-def fit_area(area, attribute):
+def fit_area(area, attribute, accumulate=False):
     """Resolve an area's NDFD field into per-lattice-point CubicSplines over
     the forecast series (epoch -> display value), so any instant can be
     evaluated (smooth scrubbing) — structurally identical to aqi.fit_area.
@@ -362,9 +362,19 @@ def fit_area(area, attribute):
        "units": str, "nonneg": bool}
     or None if the grid/attribute is unavailable. Points whose series has < 2
     valid (non-fill) samples are dropped.
+
+    ACCUMULATION MODE (`accumulate=True`): NDFD publishes qpf/snow/ice as
+    PER-INTERVAL amounts (the fall during each forecast period), not a running
+    storm total. With accumulate=True each point's series is integrated into a
+    CUMULATIVE total from the forecast window start (a 0 is anchored at `start`
+    so the total begins at zero), and fit with a MONOTONE interpolator
+    (PchipInterpolator) so the rendered total is non-decreasing with no
+    between-knot dips. Fill/no-data intervals contribute 0 to the running sum
+    (no reported fall there) rather than truncating the series. Observation
+    mode (the default) is unchanged — it splines the raw per-interval values.
     """
     import numpy as np
-    from scipy.interpolate import CubicSpline
+    from scipy.interpolate import CubicSpline, PchipInterpolator
     from .area import MapCoordinate
 
     spec = ELEMENTS.get(attribute)
@@ -387,23 +397,55 @@ def fit_area(area, attribute):
     series = stacked[:, idx]                               # (n_hours, n_points)
 
     convert = spec["convert"]
+    start_epoch = int(epochs[0])
     out_points = []
     out_splines = []
     for col in range(series.shape[1]):
         raw = series[:, col]
         valid = raw < (_FILL - 1.0)       # mask fill/no-data
-        if valid.sum() < 2:
-            continue
-        xe = epochs[valid]
-        yv = raw[valid]
-        if convert is not None:
-            yv = np.array([convert(v) for v in yv], dtype=float)
+
+        if accumulate:
+            # Cumulative total from the window start. Fill intervals contribute
+            # 0 (no reported fall) so the running sum stays defined and
+            # monotonic across the whole window. Need at least one real sample.
+            if valid.sum() < 1:
+                continue
+            amounts = np.where(valid, raw, 0.0).astype(float)
+            if convert is not None:
+                amounts = np.array([convert(v) for v in amounts], dtype=float)
+            # Per-interval amounts are non-negative; guard any convert noise.
+            amounts = np.clip(amounts, 0.0, None)
+            cumulative = np.cumsum(amounts)
+            # Anchor a 0 at the window start so the total begins at zero and the
+            # first segment interpolates 0 -> first-interval total monotonically.
+            xe = np.concatenate(([float(start_epoch)], epochs))
+            yv = np.concatenate(([0.0], cumulative))
+            # Drop any duplicate x (e.g. first frame exactly at start) so the
+            # interpolator gets strictly increasing knots.
+            keep = np.concatenate(([True], np.diff(xe) > 0))
+            xe, yv = xe[keep], yv[keep]
+            if xe.size < 2:
+                continue
+            try:
+                # PCHIP: shape-preserving, monotone on monotone data -> the
+                # cumulative total never dips between knots (CubicSpline can).
+                spline = PchipInterpolator(xe, yv)
+            except Exception:
+                continue
         else:
-            yv = yv.astype(float)
-        try:
-            spline = CubicSpline(xe, yv)
-        except Exception:
-            continue
+            if valid.sum() < 2:
+                continue
+            xe = epochs[valid]
+            yv = raw[valid]
+            if convert is not None:
+                yv = np.array([convert(v) for v in yv], dtype=float)
+            else:
+                yv = yv.astype(float)
+            try:
+                spline = CubicSpline(xe, yv)
+            except Exception:
+                continue
+
         out_points.append(MapCoordinate(lat=coords[col].lat, lon=coords[col].lon))
         out_splines.append(spline)
 
@@ -411,7 +453,7 @@ def fit_area(area, attribute):
         return None
 
     return {
-        "start": int(epochs[0]),
+        "start": start_epoch,
         "end": int(epochs[-1]),
         "points": out_points,
         "splines": out_splines,

@@ -3,8 +3,6 @@
   <head>
     <script src="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@^4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
-    <!-- d3-contour builds filled isobands from a regular grid of values. -->
-    <script src="https://unpkg.com/d3-contour@4"></script>
     <style>
       /* Shared styles for the legend's control buttons/values so the −/+
          columns line up across rows. */
@@ -24,6 +22,13 @@
         border-bottom: 2px solid transparent;
       }
       .ctltab.active { color: #1565c0; border-bottom-color: #1565c0; }
+      /* Address search (glass panel): readable placeholder + thin scrollbar on
+         the dark translucent background. */
+      #addrSearchInput::placeholder { color: rgba(255,255,255,0.5); }
+      #addrSearchList::-webkit-scrollbar { width: 8px; }
+      #addrSearchList::-webkit-scrollbar-thumb {
+        background: rgba(255,255,255,0.25); border-radius: 4px;
+      }
     </style>
   </head>
   <body style="margin: 0px; padding: 0px;">
@@ -139,13 +144,49 @@
       <div id="ctxCaptureArea" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Capture area</div>
       <div id="ctxDrawArea" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Draw observed area</div>
       <div id="ctxDropPin" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Drop pin here</div>
+      <div id="ctxDropPinAddr" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Drop pin by address…</div>
       <div id="ctxSeeGraph" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">See graph</div>
+      <div id="ctxForecast" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">7-day forecast</div>
       <div id="ctxCoords" style="padding: 6px 12px; font-size: 11px;
         color: #666; border-top: 1px solid #eee;"></div>
     </div>
 
     <!-- Container for dropped pin labels (positioned over the map in JS). -->
     <div id="pins"></div>
+
+    <!-- Address search box. Opened from the right-click menu's "Drop pin by
+         address…"; typing shows a live autocomplete list of geocoded matches,
+         and selecting one drops a pin and pans to it. Hidden until opened.
+         Glassy (translucent + backdrop blur), large, centered in the window. -->
+    <div id="addrSearchPanel" style="position:fixed; z-index:106; top:50%;
+      left:50%; transform:translate(-50%,-50%); display:none;
+      width:min(640px,92vw);
+      background:rgba(20,22,28,0.45);
+      -webkit-backdrop-filter:blur(18px) saturate(160%);
+      backdrop-filter:blur(18px) saturate(160%);
+      border:1px solid rgba(255,255,255,0.18); border-radius:16px;
+      box-shadow:0 12px 48px rgba(0,0,0,0.45); font-family:sans-serif;
+      overflow:hidden;">
+      <div style="display:flex; align-items:center; gap:12px; padding:18px 22px;">
+        <span style="font-size:24px; color:rgba(255,255,255,0.75);">🔍</span>
+        <input id="addrSearchInput" type="text" autocomplete="off"
+          placeholder="Search a street address or place…"
+          style="flex:1 1 auto; min-width:0; border:none; outline:none;
+          font-size:22px; color:#fff; background:transparent;" />
+        <span id="addrSearchStatus" style="font-size:13px;
+          color:rgba(255,255,255,0.6); white-space:nowrap;"></span>
+        <button id="addrSearchAccept" title="Add pin (Enter)" style="display:none;
+          border:none; background:rgba(255,255,255,0.15); cursor:pointer;
+          color:#fff; font-size:20px; line-height:1; border-radius:8px;
+          padding:4px 10px;">→</button>
+        <button id="addrSearchClose" title="Close" style="border:none;
+          background:transparent; cursor:pointer; font-size:26px;
+          color:rgba(255,255,255,0.65); line-height:1; padding:0 4px;">×</button>
+      </div>
+      <ul id="addrSearchList" style="list-style:none; margin:0; padding:0;
+        max-height:48vh; overflow-y:auto; display:none;
+        border-top:1px solid rgba(255,255,255,0.14);"></ul>
+    </div>
 
     <!-- Rubber-band rectangle for "Draw observed area" (shown only while
          drawing; positioned/sized in JS). -->
@@ -186,11 +227,28 @@
     // Available models for the in-legend selector, and the current one.
     const modelOptions = {{model_options}}
     const currentModel = "{{current_model}}"
+    // Human-readable name for the active model (e.g. "Snowfall Amount" rather
+    // than the kebab-case "snowfall-amount"), used in the pin/cursor readouts.
+    // Prefer the server-provided label from modelOptions; fall back to
+    // title-casing the kebab key so an unmapped model still reads sensibly.
+    const modelLabel = (() => {
+      const opt = (modelOptions || []).find(o => o.value === model)
+      if (opt && opt.label) return opt.label
+      return String(model).split("-")
+        .map(w => w ? w[0].toUpperCase() + w.slice(1) : w).join(" ")
+    })()
     // Overlay type chosen by the server for this model: "isoband" (filled
     // d3-contour bands + lines) or "heatmap" (a continuous intensity wash
     // whose opacity scales with value). Both consume the same IDW raster.
     const renderType = "{{render_type}}"
-    const isHeatmap = renderType === "heatmap"
+    // Per-model heatmap opacity multiplier (server-provided): dense/continuous
+    // fields (temperature, sky, AQI) are dimmed so the basemap shows through;
+    // sparse fields (snow/precip) stay fully opaque where present. 1.0 = no dim.
+    const heatmapOpacity = {{heatmap_opacity}}
+    // Isoband (contour) rendering was dropped — every model renders as a
+    // heatmap wash. This is forced true so the contour branches are never
+    // taken, regardless of what renderType says.
+    const isHeatmap = true
     // AQI (NAQFC) is a separate data path: gridded hourly air-quality forecast
     // sampled server-side (no NOAA /points prefetch, no bundle). When true the
     // client fetches the /aqi/* endpoints instead of the NOAA ensemble ones;
@@ -206,7 +264,7 @@
 
     // Fixed color-scale range across the whole forecast lifecycle, fetched
     // once before the first render so colors/legend stay stable over time.
-    // Null until fetched (then buildContours falls back to the frame range).
+    // Null until fetched (then buildHeatmap falls back to the frame range).
     let globalMin = null, globalMax = null
     // Forecast time window (epoch seconds) for the current area, from the
     // range API — the FULL available range. Null until fetched.
@@ -351,7 +409,7 @@
       // on a flat/all-zero frame (e.g. snowfall with no snow this step), whose
       // own per-frame min/max would otherwise collapse the legend to [0, 0].
       // Fall back to the passed per-frame range only before the global range
-      // is resolved. (buildContours/buildHeatmap already color the FIELD via
+      // is resolved. (buildHeatmap already colors the FIELD via
       // the global range; this keeps the LEGEND consistent with that.)
       const lo = (globalMin !== null) ? globalMin : vMin
       const hi = (globalMax !== null && globalMax > globalMin) ? globalMax : vMax
@@ -370,11 +428,49 @@
     // (values is row-major, row 0 = minLat), or null if there isn't enough
     // data / the field is flat. Both the isoband and heatmap overlays consume
     // this, so the interpolation is defined once.
+    //
+    // PER-CELL WEIGHT CACHE: within an area the source point POSITIONS and the
+    // raster lattice are fixed; only the per-point VALUES change frame to
+    // frame. So each raster cell's nearest-K source points AND their
+    // (normalized) IDW weights are constant across the whole animation — the
+    // expensive part (bucket index + per-cell nearest-K search + distance
+    // math) need only run ONCE. We cache a "plan" (CSR-packed neighbor indices
+    // + weights per cell, plus the lattice bounds) keyed by the positions'
+    // signature; a cache hit collapses buildField to a single weighted-sum
+    // pass (val[cell] = Σ wₖ·v[idxₖ]) — ~an order of magnitude less per-frame
+    // work, which is what lets a large-area animation keep up at high speed.
+    //
+    // The plan's neighbor indices reference the PACKED point order (finite
+    // points, in input order). The signature below includes that order, so a
+    // cached plan is only reused when the exact same positions arrive in the
+    // exact same order — making index-aligned value lookup correct even though
+    // membership can shift when a point is null in some frames (a different
+    // membership yields a different signature -> rebuild).
+    let _idwPlan = null  // { sig, GRID, bounds, cellStart, nbrIdx, nbrW }
+
+    // Cheap stable signature of the packed positions + GRID. Positions come
+    // from the fixed coordinate lattice (header coords), so for a steady point
+    // set this is identical every frame. Hash avoids retaining the arrays.
+    function _idwSignature(ptLon, ptLat, nPts, GRID) {
+      // FNV-1a over the position bytes + count + GRID. Collisions would only
+      // cause a wrong-but-same-shape reuse; positions rarely collide in
+      // practice and the cost of a miss is just a rebuild.
+      let h = 0x811c9dc5 >>> 0
+      const mix = (x) => {
+        // Fold a float into the hash via its rounded 1e4-scaled int (positions
+        // are degrees; 1e-4 deg ~ 11m, finer than any gridpoint spacing).
+        const v = (Math.round(x * 1e4) | 0) >>> 0
+        h ^= v & 0xff; h = Math.imul(h, 0x01000193) >>> 0
+        h ^= (v >>> 8) & 0xff; h = Math.imul(h, 0x01000193) >>> 0
+        h ^= (v >>> 16) & 0xff; h = Math.imul(h, 0x01000193) >>> 0
+        h ^= (v >>> 24) & 0xff; h = Math.imul(h, 0x01000193) >>> 0
+      }
+      mix(nPts); mix(GRID)
+      for (let i = 0; i < nPts; i++) { mix(ptLon[i]); mix(ptLat[i]) }
+      return h >>> 0
+    }
+
     function buildField(points) {
-      // Raster resolution adapted to the current view extent (toward ~2.5km
-      // data resolution), clamped. Local to this call so a recenter/zoom picks
-      // the right size without touching the rest of the function.
-      const GRID = gridResFor(width, height)
       // Pack the finite points into parallel typed arrays once. The hot IDW
       // loop below reads these by index (cache-friendly, zero per-cell object
       // allocation) instead of walking arrays of {lon,lat,v} objects.
@@ -389,6 +485,36 @@
       }
       if (nPts < 3) return null
 
+      // ---- FAST PATH: reuse the cached per-cell weight plan ----------------
+      // If the positions (and GRID) match the cached plan, the geometry is
+      // unchanged — only the values differ. Resolve each cell as the cached
+      // weighted sum of the current values; no bucket build, no nearest-K.
+      // Raster resolution is adapted to the current view extent (toward ~2.5km
+      // data resolution), clamped; a recenter/zoom changes it (and the point
+      // set), invalidating the plan via the signature below.
+      const GRID = gridResFor(width, height)
+      const sig = _idwSignature(ptLon, ptLat, nPts, GRID)
+      if (_idwPlan && _idwPlan.sig === sig && _idwPlan.GRID === GRID) {
+        const pl = _idwPlan
+        const cellStart = pl.cellStart, nbrIdx = pl.nbrIdx, nbrW = pl.nbrW
+        const nCells = GRID * GRID
+        const values = new Float64Array(nCells)
+        let vMin = Infinity, vMax = -Infinity
+        for (let c = 0; c < nCells; c++) {
+          const s = cellStart[c], e = cellStart[c + 1]
+          if (e === s) { values[c] = NaN; continue }
+          let val = 0
+          for (let k = s; k < e; k++) val += nbrW[k] * ptV[nbrIdx[k]]
+          values[c] = val
+          if (val < vMin) vMin = val
+          if (val > vMax) vMax = val
+        }
+        const b = pl.bounds
+        return { GRID, minLon: b.minLon, maxLon: b.maxLon,
+                 minLat: b.minLat, maxLat: b.maxLat, values, vMin, vMax }
+      }
+
+      // ---- SLOW PATH: (re)build the plan, then evaluate --------------------
       // Bounds (plain loop; avoids Math.min(...spread) which allocates and can
       // overflow the arg stack on large point sets).
       let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity
@@ -442,17 +568,27 @@
       const bestD2 = new Float64Array(K)
       const bestIdx = new Int32Array(K)
 
-      // IDW value at (plon,plat) from the nearest ~K source points, found by
-      // expanding bucket rings outward until enough candidates are gathered.
-      function idwValue(plon, plat) {
+      // Plan accumulators (CSR). cellStart[c]..cellStart[c+1] is cell c's slice
+      // of (planIdx, planW): the point indices and NORMALIZED weights whose
+      // weighted sum of values is the cell's IDW estimate. An empty slice means
+      // no data -> NaN. Max K neighbors per cell.
+      const nCells = GRID * GRID
+      const cellStart = new Int32Array(nCells + 1)
+      const planIdx = new Int32Array(nCells * K)
+      const planW = new Float64Array(nCells * K)
+      let planLen = 0
+
+      // Resolve cell (plon,plat) to its nearest-K neighbors, writing their
+      // NORMALIZED weights into the plan (planIdx/planW at `planLen`). Returns
+      // the number of neighbors written (0 = no data). Mirrors the original
+      // ring-expanding nearest-K search, but RECORDS weights instead of folding
+      // a single value — so the plan can be replayed against any frame's values.
+      function planCell(plon, plat) {
         let cbx = Math.floor(((plon - minLon) / spanLon) * bN)
         let cby = Math.floor(((plat - minLat) / spanLat) * bN)
         if (cbx < 0) cbx = 0; else if (cbx > bN - 1) cbx = bN - 1
         if (cby < 0) cby = 0; else if (cby > bN - 1) cby = bN - 1
 
-        // Expand ring radius until we've SCANNED at least K candidates (or
-        // covered the whole bucket grid), matching the original stop rule;
-        // then the final ring's candidates are all considered for nearest-K.
         for (let r = 0; r < bN; r++) {
           let kept = 0            // how many of bestD2/bestIdx are populated
           let worstSlot = -1      // slot holding the current largest kept d2
@@ -472,17 +608,20 @@
                 const dLon = plon - ptLon[pi], dLat = plat - ptLat[pi]
                 const d2 = dLon * dLon + dLat * dLat
                 scanned++
-                if (d2 < 1e-12) return ptV[pi]  // exact hit
+                if (d2 < 1e-12) {
+                  // Exact hit: a single neighbor with full weight.
+                  planIdx[planLen] = pi; planW[planLen] = 1
+                  planLen++
+                  return 1
+                }
                 // Bounded insertion into the K-nearest scratch.
                 if (kept < K) {
                   bestD2[kept] = d2; bestIdx[kept] = pi; kept++
                   if (kept === K) {
-                    // Find the worst (largest) once the buffer fills.
                     worstD2 = -Infinity; worstSlot = 0
                     for (let m = 0; m < K; m++) if (bestD2[m] > worstD2) { worstD2 = bestD2[m]; worstSlot = m }
                   }
                 } else if (d2 < worstD2) {
-                  // Replace the current worst, then rescan for the new worst.
                   bestD2[worstSlot] = d2; bestIdx[worstSlot] = pi
                   worstD2 = -Infinity
                   for (let m = 0; m < K; m++) if (bestD2[m] > worstD2) { worstD2 = bestD2[m]; worstSlot = m }
@@ -492,34 +631,55 @@
           }
           const coveredAll = (x0 === 0 && y0 === 0 && x1 === bN - 1 && y1 === bN - 1)
           if (scanned >= K || coveredAll) {
-            // Weighted sum over the kept K-nearest (IDW power 2).
-            let num = 0, den = 0
+            // Normalize the IDW weights (power 2) and record them, so a frame's
+            // value is just Σ w·v with no per-frame division.
+            let den = 0
+            for (let m = 0; m < kept; m++) den += 1 / (bestD2[m] + IDW_EPS)
+            if (den <= 0 || kept === 0) return 0
             for (let m = 0; m < kept; m++) {
-              const w = 1 / (bestD2[m] + IDW_EPS)
-              num += w * ptV[bestIdx[m]]; den += w
+              planIdx[planLen] = bestIdx[m]
+              planW[planLen] = (1 / (bestD2[m] + IDW_EPS)) / den
+              planLen++
             }
-            return den > 0 ? num / den : NaN
+            return kept
           }
-          // else: not enough candidates yet — widen the ring and retry. (Scratch
-          // is rebuilt from scratch next iteration via the `kept`/`worst*`
-          // resets at the top of the loop body.)
+          // else: widen the ring and retry.
         }
-        return NaN
+        return 0
       }
 
-      // IDW resample onto a GRID x GRID lattice (row 0 = minLat).
-      const values = new Float64Array(GRID * GRID)
+      // Build the plan AND evaluate the first frame in one lattice pass.
+      const values = new Float64Array(nCells)
       let vMin = Infinity, vMax = -Infinity
+      let c = 0
       for (let gy = 0; gy < GRID; gy++) {
         const plat = minLat + (gy / (GRID - 1)) * (maxLat - minLat)
-        for (let gx = 0; gx < GRID; gx++) {
+        for (let gx = 0; gx < GRID; gx++, c++) {
           const plon = minLon + (gx / (GRID - 1)) * (maxLon - minLon)
-          const val = idwValue(plon, plat)
-          values[gy * GRID + gx] = val
+          cellStart[c] = planLen
+          const nn = planCell(plon, plat)
+          if (nn === 0) { values[c] = NaN; continue }
+          let val = 0
+          for (let k = cellStart[c]; k < planLen; k++) val += planW[k] * ptV[planIdx[k]]
+          values[c] = val
           if (val < vMin) vMin = val
           if (val > vMax) vMax = val
         }
       }
+      cellStart[nCells] = planLen
+
+      // Cache the plan (trim the over-allocated neighbor arrays to planLen so a
+      // long-lived plan doesn't pin nCells*K slots). Keyed by the positions'
+      // signature + GRID; the next frame with the same positions hits the fast
+      // path above.
+      _idwPlan = {
+        sig, GRID,
+        bounds: { minLon, maxLon, minLat, maxLat },
+        cellStart,
+        nbrIdx: planIdx.subarray(0, planLen),
+        nbrW: planW.subarray(0, planLen),
+      }
+
       return { GRID, minLon, maxLon, minLat, maxLat, values, vMin, vMax }
     }
 
@@ -530,86 +690,6 @@
       const cMin = (globalMin !== null) ? globalMin : vMin
       const cMax = (globalMax !== null && globalMax > globalMin) ? globalMax : vMax
       return { cMin, cMax, cSpan: (cMax - cMin) || 1 }
-    }
-
-    // ---- Contour construction ----------------------------------------------
-
-    // Build filled contour polygons (GeoJSON) from a scatter of points
-    // ({lon, lat, v}). Returns { fc, vMin, vMax, units } or null.
-    function buildContours(points) {
-      const field = buildField(points)
-      if (!field) return null
-      const { GRID, minLon, maxLon, minLat, maxLat, values, vMin, vMax } = field
-      // If the field is completely flat (e.g. an all-zero accumulation like
-      // snowfall with no snow forecast), there are no contours to draw. Emit
-      // an empty collection rather than letting d3-contour produce spurious
-      // full-extent polygons for thresholds at/below the constant value.
-      const FLAT_EPS = 1e-9
-      if (!(vMax - vMin > FLAT_EPS)) {
-        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax,
-                 units: lastUnits || "", extent: { w: minLon, e: maxLon, s: minLat, n: maxLat } }
-      }
-
-      // Color scale: use the FIXED global range (whole forecast lifecycle)
-      // when available, so a given temperature is the same color in every
-      // frame and the legend never shifts. Fall back to the frame's own range.
-      const { cMin, cMax, cSpan } = colorScale(vMin, vMax)
-
-      // Thresholds are anchored to FIXED absolute values spaced `contourStep`
-      // apart (e.g. every 1.0 degree), so a given isoline is always at the
-      // same absolute value every frame. Only thresholds that lie strictly
-      // INSIDE the field's (vMin, vMax) range are kept: a threshold at or
-      // beyond the extremes isn't actually crossed by the field, and d3
-      // would otherwise emit a spurious full-extent (or empty) polygon.
-      const step = contourStep
-      const tLo = Math.ceil(vMin / step) * step
-      const tHi = Math.floor(vMax / step) * step
-      const thresholds = []
-      for (let tv = tLo; tv <= tHi + 1e-9; tv += step) {
-        if (tv > vMin + 1e-9 && tv < vMax - 1e-9) thresholds.push(tv)
-      }
-      if (!thresholds.length) {
-        return { fc: { type: "FeatureCollection", features: [] }, vMin, vMax,
-                 units: lastUnits || "", extent: { w: minLon, e: maxLon, s: minLat, n: maxLat } }
-      }
-
-      const polys = d3.contours().size([GRID, GRID]).thresholds(thresholds)(values)
-
-      const sx = (maxLon - minLon) / (GRID - 1)
-      const sy = (maxLat - minLat) / (GRID - 1)
-      const toLngLat = ([gx, gy]) => [minLon + gx * sx, minLat + gy * sy]
-
-      const outFeatures = polys.map(poly => {
-        const raw = (poly.value - cMin) / cSpan
-        const t = COLOR_BUFFER + Math.max(0, Math.min(1, raw)) * (1 - 2 * COLOR_BUFFER)
-        return {
-          type: "Feature",
-          properties: { fillColor: rampColorAt(t) },
-          geometry: {
-            type: "MultiPolygon",
-            coordinates: poly.coordinates.map(pg => pg.map(ring => ring.map(toLngLat)))
-          }
-        }
-      })
-
-      const units = lastUnits || ""
-      // `extent` = where the drawn contours ACTUALLY reach, derived empirically
-      // (painted − box measured to zero): the field's west/south edges sit at
-      // the raw grid min (minLon/minLat), while the east/north edges overhang
-      // by one full cell. This is d3-contour's grid-space span ([-0.5, GRID-0.5]
-      // GRID cells wide) combined with toLngLat's /(GRID-1) scaling, which puts
-      // the min edge at the grid origin and the max edge a full cell beyond.
-      // Grid-only, so the box is STABLE across frames.
-      const cellLon = (maxLon - minLon) / (GRID - 1)
-      const cellLat = (maxLat - minLat) / (GRID - 1)
-      return {
-        fc: { type: "FeatureCollection", features: outFeatures },
-        vMin: cMin, vMax: cMax, units,
-        extent: {
-          w: minLon, e: maxLon + cellLon,
-          s: minLat, n: maxLat + cellLat,
-        },
-      }
     }
 
     // ---- Heatmap construction ----------------------------------------------
@@ -626,8 +706,11 @@
     // where `coordinates` is the image-source corner quad, or null.
     //
     // Below this fraction of the color span a pixel is fully transparent, so
-    // light trace values don't haze the whole map.
-    const HEATMAP_FLOOR = 0.04
+    // true-zero / sub-noise cells don't haze the map. Kept very small: the
+    // alpha then ramps CONTINUOUSLY from 0 at the floor (no sudden jump), so
+    // the GPU's linear resampling has a smooth alpha gradient to interpolate
+    // instead of a hard transparent/opaque edge (which looked blocky/jerky).
+    const HEATMAP_FLOOR = 0.015
     function buildHeatmap(points) {
       const field = buildField(points)
       if (!field) return null
@@ -644,20 +727,36 @@
       // `values` is minLat (south), but image rows go top-down (north first),
       // so we write row gy into image row (GRID-1-gy) to flip vertically.
       const data = new Uint8ClampedArray(GRID * GRID * 4)
+      // Color written (with alpha 0) to transparent / below-floor cells. Using
+      // the ramp's LOW-END color rather than the default black keeps the GPU's
+      // linear resampling in-hue across a transparent↔opaque edge — writing
+      // black there makes the edge interpolate toward dark, producing the
+      // blocky/jerky dark fringing. (Premultiplied-style edge artifact.)
+      const [fr, fg, fb] = rampRgbAt(COLOR_BUFFER)
       for (let gy = 0; gy < GRID; gy++) {
         const imgRow = (GRID - 1 - gy)
         for (let gx = 0; gx < GRID; gx++) {
           const v = values[gy * GRID + gx]
           const o = (imgRow * GRID + gx) * 4
-          if (!Number.isFinite(v)) { data[o + 3] = 0; continue }
+          if (!Number.isFinite(v)) {
+            data[o] = fr; data[o + 1] = fg; data[o + 2] = fb; data[o + 3] = 0
+            continue
+          }
           const raw = Math.max(0, Math.min(1, (v - cMin) / cSpan))
-          if (raw < HEATMAP_FLOOR) { data[o + 3] = 0; continue }
+          if (raw < HEATMAP_FLOOR) {
+            data[o] = fr; data[o + 1] = fg; data[o + 2] = fb; data[o + 3] = 0
+            continue
+          }
           const t = COLOR_BUFFER + raw * (1 - 2 * COLOR_BUFFER)
           const [r, g, b] = rampRgbAt(t)
-          // Alpha ramps with intensity (sqrt eases the low end up so light
-          // snow is visible), capped below 1 so the basemap faintly shows
-          // through even in the heaviest cells.
-          const alpha = Math.min(0.85, 0.15 + 0.7 * Math.sqrt(raw))
+          // Alpha CONTINUOUS from 0 at the floor up to the cap — no baseline
+          // jump at the floor (a jump makes the GPU's linear resampling show a
+          // hard transparent/opaque edge, which looked blocky). `norm` rescales
+          // raw within [floor, 1] so the fade starts right at the floor; the
+          // pow<1 curve rises quickly so low-but-present values are still
+          // clearly visible, while the cap keeps the basemap showing through.
+          const norm = (raw - HEATMAP_FLOOR) / (1 - HEATMAP_FLOOR)
+          const alpha = 0.9 * Math.pow(norm, 0.45) * heatmapOpacity
           data[o] = r; data[o + 1] = g; data[o + 2] = b; data[o + 3] = Math.round(alpha * 255)
         }
       }
@@ -702,13 +801,12 @@
     // box fits the real geometry (not a reproduced formula). {w,e,s,n} or null.
     let lastFieldExtent = null
     function areaBoxGeoJSON() {
-      if (lastFieldExtent) return boxPolygon(lastFieldExtent)
-      // Fallback before anything is drawn: approximate from width/height.
-      const dx = width / 110.574
-      const dy = height / (111.320 * Math.cos(lat * Math.PI / 180))
-      return boxPolygon({
-        w: lon - dx / 2, e: lon + dx / 2, s: lat - dy / 2, n: lat + dy / 2,
-      })
+      // Don't draw the box until the painted-field extent is known (delivered
+      // by /type/range or the bundle range via applyRange). Returning an empty
+      // collection means no box is shown until then — avoiding a nominal
+      // width×height rectangle that would then resize to the data extent.
+      if (!lastFieldExtent) return { type: "FeatureCollection", features: [] }
+      return boxPolygon(lastFieldExtent)
     }
 
     // Refresh the area-box layer to the current area. Safe to call before the
@@ -739,25 +837,14 @@
     }
 
     map.on("load", async () => {
-      // Overlay sources + layers. The isoband overlay uses the `contours`
-      // source (faint fill + strong lines). The heatmap overlay uses a raster
-      // `image` source, created lazily on the first heatmap frame (MapLibre
-      // image sources require a valid image + coordinates at creation, so they
-      // can't be pre-created empty) and updated in place thereafter.
-      map.addSource("contours", { type: 'geojson', data: { type: "FeatureCollection", features: [] } })
-      map.addLayer({
-        id: 'contours', type: 'fill', source: 'contours',
-        layout: { visibility: isHeatmap ? 'none' : 'visible' },
-        paint: { 'fill-color': ['get', 'fillColor'], 'fill-opacity': 0.03, 'fill-antialias': true }
-      })
-      map.addLayer({
-        id: 'contour-lines', type: 'line', source: 'contours',
-        layout: { 'line-join': 'round', visibility: isHeatmap ? 'none' : 'visible' },
-        paint: { 'line-color': ['get', 'fillColor'], 'line-width': 1.6, 'line-opacity': 0.9 }
-      })
+      // Heatmap overlay uses a raster `image` source, created lazily on the
+      // first heatmap frame (MapLibre image sources require a valid image +
+      // coordinates at creation, so they can't be pre-created empty) and
+      // updated in place thereafter. (Isoband/contour rendering was dropped, so
+      // no `contours` geojson source/layers are created.)
 
       // Outline of the currently-loaded area (the width×height region the
-      // contour/heatmap field covers). A thin solid rectangle so it reads as
+      // heatmap field covers). A thin solid rectangle so it reads as
       // a boundary marker without competing with the data overlay. Updated
       // whenever the area changes (loadArea) via updateAreaBox().
       map.addSource("area", { type: "geojson", data: areaBoxGeoJSON() })
@@ -769,6 +856,21 @@
           "line-opacity": 0.8,
         },
       })
+
+      // Show the legend as soon as the map is up (not only after the first
+      // frame renders). The gradient bar + model selector + control tabs are
+      // meaningful immediately; seed the numeric min/mid/max with a placeholder
+      // 0 / 0 / 0 range so the label row has its final size from the start —
+      // real values (updateLegend) then replace them WITHOUT relengthening the
+      // legend.
+      if (!legendInitialized) {
+        document.getElementById("legendBar").style.background = legendGradientCss()
+        document.getElementById("legendMin").textContent = (0).toFixed(1)
+        document.getElementById("legendMid").textContent = (0).toFixed(1)
+        document.getElementById("legendMax").textContent = (0).toFixed(1)
+        legendInitialized = true
+      }
+      document.getElementById("legend").style.display = "block"
 
       const mapContainer = document.getElementById("weatherRadar")
       const readoutEl = document.getElementById("cursorReadout")
@@ -785,7 +887,7 @@
         const ll = map.unproject([cursorPx.x - rect.left, cursorPx.y - rect.top])
         const v = sampleAt(ll.lng, ll.lat)
         const valueText = v === null ? "—" : `${v.toFixed(1)}${latestUnits ? " " + latestUnits : ""}`
-        readoutEl.innerHTML = `${model}: ${valueText}<br>${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`
+        readoutEl.innerHTML = `${modelLabel}: ${valueText}<br>${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`
         readoutEl.style.left = (cursorPx.x + 12) + "px"
         readoutEl.style.top = (cursorPx.y + 12) + "px"
         readoutEl.style.display = "block"
@@ -794,12 +896,29 @@
       mapContainer.addEventListener("mouseleave", () => { cursorPx = null; readoutEl.style.display = "none" })
       map.on("move", () => { refreshReadout(); refreshPins() })
 
+      // Persist the zoom level to the URL so it survives a refresh. `loadArea`
+      // writes zoom when the AREA changes (recenter/capture/draw), but a plain
+      // scroll/pinch zoom doesn't go through there — without this, refreshing
+      // after zooming would snap back to the last area-write's zoom. zoomend
+      // fires once the gesture settles (not every animation frame), so this is
+      // a single history.replaceState per zoom. The map's own `width`/`height`
+      // (the forecast area) are deliberately NOT changed here — only the view
+      // zoom is persisted; the area is still controlled by capture/recenter.
+      map.on("zoomend", () => {
+        const u = new URL(window.location.href)
+        u.searchParams.set("zoom", map.getZoom().toFixed(2))
+        history.replaceState(null, "", u.toString())
+      })
+
       // ---- Dropped pins -----------------------------------------------------
       // Persistent labels at fixed lat/lon showing the interpolated value,
       // updated each frame and repositioned on map move. Persisted in the URL
       // (`pins=lat,lon;lat,lon;...`) so a refresh restores them.
       const pinsContainer = document.getElementById("pins")
-      let pins = [] // [{ lat, lon, el }]
+      let pins = [] // [{ lat, lon, name, marker, info, ... }]
+      // Monotonic counter for default pin names ("Pin 1", "Pin 2", …). Never
+      // decremented on delete, so names stay unique within a session.
+      let pinCounter = 0
 
       // Pin size: a scale multiplier applied (as a CSS transform:scale) to the
       // whole marker + info box, stepped via the legend +/- buttons and
@@ -854,14 +973,51 @@
       function serializePins() {
         const u = new URL(window.location.href)
         if (pins.length) {
-          u.searchParams.set("pins", pins.map(p => `${p.lat.toFixed(5)},${p.lon.toFixed(5)}`).join(";"))
+          // Each pin: lat,lon,encodedName (name URL-encoded so commas/semicolons
+          // in it don't break the delimiters). Pins joined by ";".
+          u.searchParams.set("pins", pins.map(p =>
+            `${p.lat.toFixed(5)},${p.lon.toFixed(5)},${encodeURIComponent(p.name || "")}`
+          ).join(";"))
         } else {
           u.searchParams.delete("pins")
         }
         history.replaceState(null, "", u.toString())
       }
 
-      function addPin(plat, plon, persist = true) {
+      // Pin identity granularity. Pins serialize to the URL at 5 decimals
+      // (~1 m), so two placements that round to the same 5-decimal lat/lon are
+      // the SAME pin — dropping one again is a no-op (idempotent). This matches
+      // the serialized precision so a reload can't resurrect a "duplicate".
+      const PIN_EPS = 1e-5
+      function samePinLoc(a, b) {
+        return Math.abs(a.lat - b.lat) < PIN_EPS && Math.abs(a.lon - b.lon) < PIN_EPS
+      }
+      function findPin(plat, plon) {
+        const probe = { lat: plat, lon: plon }
+        return pins.find(p => samePinLoc(p, probe)) || null
+      }
+
+      function addPin(plat, plon, persist = true, name = null) {
+        // Idempotent: a pin already at this location (to serialized precision)
+        // isn't duplicated. Return the existing pin so callers can still act on
+        // it (e.g. pan to it).
+        const existing = findPin(plat, plon)
+        if (existing) return existing
+
+        // Sane default name: sequential "Pin N" (N from a monotonic counter so
+        // defaults stay unique even after deletes). An explicit `name`
+        // (restored from the URL or set by the user) overrides it. If a
+        // restored name is itself "Pin N", advance the counter past it so a
+        // later default doesn't collide.
+        let pinName
+        if (name != null && name !== "") {
+          pinName = name
+          const m = /^Pin (\d+)$/.exec(name)
+          if (m) pinCounter = Math.max(pinCounter, parseInt(m[1], 10))
+        } else {
+          pinName = `Pin ${++pinCounter}`
+        }
+
         // Marker: a pin icon anchored exactly at the point (tip at the spot).
         // Base (1x) size + shadow; scaled as a whole via transform (see
         // applyPinSize). transform-origin at the tip (bottom-center) so
@@ -870,29 +1026,157 @@
         marker.textContent = "📍"
         marker.style.cssText = "position:fixed; z-index:101;" +
           "transform-origin:50% 100%; transform:translate(-50%,-100%);" +
-          "font-size:20px; line-height:1; cursor:pointer; user-select:none;" +
+          "font-size:20px; line-height:1; cursor:grab; user-select:none;" +
           "filter:drop-shadow(0 1px 1px rgba(0,0,0,0.5));"
         // Info box: offset to the upper-right of the marker. Base (1x) styling;
         // scaled as a whole via transform (see refreshPins). transform-origin
         // at its anchored bottom-left corner so text, padding, border and
-        // shadow all scale together — the box can't get crowded.
+        // shadow all scale together — the box can't get crowded. Laid out as a
+        // column: a top row with the TEXT span (refreshed each frame) + the
+        // delete ×, then the 📈 graph button anchored at the BOTTOM-RIGHT.
+        // (The text is a child span, not info.innerHTML, so the per-frame
+        // refresh doesn't clobber the buttons.)
         const info = document.createElement("div")
-        info.style.cssText = "position:fixed; z-index:101;" +
+        info.style.cssText = "position:fixed; z-index:101; box-sizing:border-box;" +
+          // Fixed width so the box NEVER resizes when the value fills in (or
+          // changes length frame-to-frame). Wide enough for a long label +
+          // value (e.g. "Snowfall Amount: 128.5 in") and the coords line.
+          "width:190px;" +
           "transform-origin:0% 100%; transform:translate(0,-100%);" +
+          "display:flex; flex-direction:column; gap:2px;" +
           "background:rgba(30,30,30,0.85); color:#fff; font-family:sans-serif; font-size:12px;" +
-          "padding:3px 7px; border-radius:4px; white-space:nowrap; cursor:pointer;" +
+          // Right/top padding clears the corner buttons (× top-right, 📈
+          // bottom-right, both absolute) so the text never sits under them.
+          "padding:3px 22px 5px 7px; border-radius:4px; white-space:nowrap;" +
           "box-shadow:0 1px 4px rgba(0,0,0,0.4);"
+        // Name (editable), on its own row. The × is pinned to the box corner
+        // (absolute, below), so the name row doesn't need to reserve it.
+        const nameEl = document.createElement("span")
+        nameEl.textContent = pinName
+        nameEl.title = "Click to rename"
+        nameEl.style.cssText = "display:block; font-weight:600; cursor:text;" +
+          "overflow:hidden; text-overflow:ellipsis;"
+        // Delete ×: pinned (absolute) to the TOP-RIGHT corner of the box.
+        const closeBtn = document.createElement("span")
+        closeBtn.textContent = "×"
+        closeBtn.title = "Delete pin"
+        closeBtn.style.cssText = "position:absolute; right:5px; top:2px;" +
+          "cursor:pointer; color:rgba(255,255,255,0.7);" +
+          "font-weight:bold; line-height:1; padding:0 1px; user-select:none;"
+        closeBtn.addEventListener("mouseenter", () => { closeBtn.style.color = "#fff" })
+        closeBtn.addEventListener("mouseleave", () => { closeBtn.style.color = "rgba(255,255,255,0.7)" })
+        // Value/coords readout (refreshed each frame). Seeded with the known
+        // label + coords + a placeholder value; the box's fixed width means a
+        // longer value won't resize it (the line just wraps/overflows within).
+        const infoText = document.createElement("span")
+        infoText.style.cssText = "display:block;"
+        const coordStr = `${plat.toFixed(4)}, ${plon.toFixed(4)}`
+        infoText.innerHTML = `${modelLabel}: —<br>${coordStr}`
+        // Graph button: pinned (absolute) to the bottom-right corner of the
+        // box, squared to the corner. The box's right/bottom padding keeps the
+        // text from clipping under it.
+        const graphBtn = document.createElement("span")
+        graphBtn.textContent = "📈"
+        graphBtn.title = "Open forecast graph for this point"
+        graphBtn.style.cssText = "position:absolute; right:5px; bottom:6px;" +
+          "cursor:pointer; line-height:1; font-size:12px;" +
+          "opacity:0.75; user-select:none;"
+        graphBtn.addEventListener("mouseenter", () => { graphBtn.style.opacity = "1" })
+        graphBtn.addEventListener("mouseleave", () => { graphBtn.style.opacity = "0.75" })
+        // 7-day forecast button: pinned bottom-right, just LEFT of the graph.
+        const fcBtn = document.createElement("span")
+        fcBtn.textContent = "\u{1F324}\u{FE0F}"
+        fcBtn.title = "Open 7-day forecast for this point"
+        fcBtn.style.cssText = "position:absolute; right:26px; bottom:6px;" +
+          "cursor:pointer; line-height:1; font-size:12px;" +
+          "opacity:0.75; user-select:none;"
+        fcBtn.addEventListener("mouseenter", () => { fcBtn.style.opacity = "1" })
+        fcBtn.addEventListener("mouseleave", () => { fcBtn.style.opacity = "0.75" })
+        info.appendChild(nameEl)
+        info.appendChild(infoText)
+        info.appendChild(closeBtn)
+        info.appendChild(fcBtn)
+        info.appendChild(graphBtn)
 
-        const pin = { lat: plat, lon: plon, marker, info }
+        const pin = { lat: plat, lon: plon, name: pinName, marker, info, infoText, nameEl }
+
+        // Inline rename: swap the name label for a text input on click.
+        function beginRename(ev) {
+          if (ev) ev.stopPropagation()
+          const input = document.createElement("input")
+          input.type = "text"
+          input.value = pin.name
+          input.style.cssText = "display:block; width:100%; box-sizing:border-box;" +
+            "font:inherit; font-weight:600; color:#222; border:none;" +
+            "border-radius:3px; padding:0 3px;"
+          const commit = (save) => {
+            if (input.parentNode !== info) return
+            if (save) {
+              const v = input.value.trim()
+              if (v) { pin.name = v; nameEl.textContent = v; serializePins() }
+            }
+            info.replaceChild(nameEl, input)
+          }
+          input.addEventListener("keydown", (e) => {
+            e.stopPropagation()
+            if (e.key === "Enter") { e.preventDefault(); commit(true) }
+            else if (e.key === "Escape") { e.preventDefault(); commit(false) }
+          })
+          input.addEventListener("blur", () => commit(true))
+          input.addEventListener("pointerdown", (e) => e.stopPropagation())
+          info.replaceChild(input, nameEl)
+          input.focus()
+          input.select()
+        }
+        nameEl.addEventListener("click", beginRename)
         const remove = (ev) => {
           ev.stopPropagation()
           const i = pins.indexOf(pin)
           if (i >= 0) { marker.remove(); info.remove(); pins.splice(i, 1); serializePins() }
         }
-        marker.title = "Click to remove pin"
-        info.title = "Click to remove pin"
-        marker.addEventListener("click", remove)
-        info.addEventListener("click", remove)
+        // Marker dragging: press and move the pin glyph to reposition it.
+        // (Removal is the × button's job — clicking the marker does NOT delete.)
+        marker.title = "Drag to move pin"
+        marker.style.touchAction = "none"
+        let dragging = false
+        marker.addEventListener("pointerdown", (ev) => {
+          ev.stopPropagation()   // don't let the map start a pan
+          ev.preventDefault()
+          dragging = true
+          try { marker.setPointerCapture(ev.pointerId) } catch (_) {}
+          marker.style.cursor = "grabbing"
+        })
+        marker.addEventListener("pointermove", (ev) => {
+          if (!dragging) return
+          ev.stopPropagation()
+          const rect = mapContainer.getBoundingClientRect()
+          // Screen px -> lng/lat at the CURRENT view. The marker's tip is its
+          // anchor (transform-origin bottom-center), which is where the glyph
+          // sits, so unproject the pointer position directly.
+          const ll = map.unproject([ev.clientX - rect.left, ev.clientY - rect.top])
+          pin.lat = ll.lat
+          pin.lon = ll.lng
+          refreshPins()          // reposition marker + info, re-sample value
+        })
+        const endDrag = (ev) => {
+          if (!dragging) return
+          dragging = false
+          try { marker.releasePointerCapture(ev.pointerId) } catch (_) {}
+          marker.style.cursor = "grab"
+          serializePins()        // persist the new location to the URL
+        }
+        marker.addEventListener("pointerup", endDrag)
+        marker.addEventListener("pointercancel", endDrag)
+
+        closeBtn.addEventListener("click", remove)
+        graphBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation()
+          openGraphAt(pin.lat, pin.lon)
+        })
+        fcBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation()
+          openForecastAt(pin.lat, pin.lon, pin.name)
+        })
 
         pinsContainer.appendChild(marker)
         pinsContainer.appendChild(info)
@@ -900,6 +1184,7 @@
         applyPinSize()  // size the new marker/info to the current scale
         if (persist) serializePins()
         refreshPins()
+        return pin
       }
 
       // Reposition + re-read all pins (called on map move and each frame).
@@ -922,20 +1207,26 @@
 
           const v = sampleAt(p.lon, p.lat)
           const valueText = v === null ? "—" : `${v.toFixed(1)}${latestUnits ? " " + latestUnits : ""}`
-          p.info.innerHTML = `${model}: ${valueText}<br>${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}`
+          p.infoText.innerHTML = `${modelLabel}: ${valueText}<br>${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}`
           p.info.style.left = (x + dx) + "px"
           p.info.style.top = (y + dy) + "px"
           p.info.style.transform = `translate(0,-100%) scale(${pinSize})`
         }
       }
 
-      // Restore pins from the URL on load.
+      // Restore pins from the URL on load. Format per pin: lat,lon[,encName]
+      // (name optional for backward compat with older 2-field URLs).
       ;(() => {
         const raw = new URL(window.location.href).searchParams.get("pins")
         if (!raw) return
         for (const part of raw.split(";")) {
-          const [la, lo] = part.split(",").map(Number)
-          if (Number.isFinite(la) && Number.isFinite(lo)) addPin(la, lo, false)
+          const fields = part.split(",")
+          const la = Number(fields[0]), lo = Number(fields[1])
+          let nm = null
+          if (fields.length >= 3) {
+            try { nm = decodeURIComponent(fields.slice(2).join(",")) } catch (_) { nm = fields.slice(2).join(",") }
+          }
+          if (Number.isFinite(la) && Number.isFinite(lo)) addPin(la, lo, false, nm)
         }
       })()
 
@@ -964,18 +1255,267 @@
         addPin(menuLngLat.lat, menuLngLat.lng)
         hideMenu()
       })
+      // "Drop pin by address…": open the address search panel (defined below).
+      document.getElementById("ctxDropPinAddr").addEventListener("click", () => {
+        hideMenu()
+        openAddrSearch()
+      })
+
+      // Geocode a free-form street address to a LIST of {lat, lon, label}
+      // candidates via our server-side proxy (/api/geocode), which forwards to
+      // OpenStreetMap Nominatim with a policy-compliant User-Agent and caches
+      // results. `limit` caps the candidate count (the autocomplete UI asks for
+      // several). Results are RESTRICTED to the current map viewport (viewbox +
+      // bounded) so a search while viewing Washington doesn't surface a match
+      // in France. Returns [] on no match / error.
+      function currentViewbox() {
+        try {
+          const b = map.getBounds()
+          // Nominatim viewbox order: lon_min,lat_min,lon_max,lat_max.
+          return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
+            .map(n => n.toFixed(6)).join(",")
+        } catch (_) {
+          return ""
+        }
+      }
+      async function geocodeAddress(query, limit = 5) {
+        let url = `/api/geocode/?q=${encodeURIComponent(query)}&limit=${limit}`
+        const vb = currentViewbox()
+        if (vb) url += `&viewbox=${encodeURIComponent(vb)}&bounded=1`
+        let resp
+        try {
+          resp = await fetch(url, { headers: { "Accept": "application/json" } })
+        } catch (_) {
+          return []
+        }
+        if (!resp || !resp.ok) return []   // 400/502 -> treat as no results
+        let data
+        try { data = await resp.json() } catch (_) { return [] }
+        const list = (data && Array.isArray(data.results)) ? data.results : []
+        return list
+          .map(r => ({ lat: parseFloat(r.lat), lon: parseFloat(r.lon),
+                       label: r.label || query }))
+          .filter(r => Number.isFinite(r.lat) && Number.isFinite(r.lon))
+      }
+
+      // --- Address search panel (autocomplete) -------------------------------
+      // The search box opens from the context menu ("Drop pin by address…").
+      // Live, debounced suggestions: ↑/↓ move the highlight, Enter SELECTS the
+      // highlighted result (freezing the list + highlighting it), and a second
+      // Enter — or the → button — ACCEPTS it (drops a pin named with the typed
+      // text). While a result is selected the text stays editable (tweak the
+      // pin name) but suggestions don't refresh. Esc closes.
+      const addrPanel = document.getElementById("addrSearchPanel")
+      const addrInput = document.getElementById("addrSearchInput")
+      const addrList = document.getElementById("addrSearchList")
+      const addrStatus = document.getElementById("addrSearchStatus")
+      const addrCloseBtn = document.getElementById("addrSearchClose")
+      const addrAcceptBtn = document.getElementById("addrSearchAccept")
+
+      let addrResults = []      // current suggestions [{lat,lon,label}]
+      let addrActive = -1       // highlighted index (keyboard nav / hover)
+      let addrSelected = -1     // committed selection; >=0 freezes the list
+      let addrSeq = 0           // guards against out-of-order async responses
+      let addrDebounce = null
+
+      function openAddrSearch() {
+        addrPanel.style.display = "block"
+        addrInput.value = ""
+        clearAddrResults()
+        addrStatus.textContent = ""
+        addrInput.focus()
+      }
+      function closeAddrSearch() {
+        addrPanel.style.display = "none"
+        clearAddrResults()
+        addrStatus.textContent = ""
+      }
+      function clearAddrResults() {
+        addrResults = []
+        addrActive = -1
+        addrSelected = -1
+        addrList.innerHTML = ""
+        addrList.style.display = "none"
+        addrAcceptBtn.style.display = "none"
+      }
+
+      // Highlight tints: ACTIVE (hover/keyboard cursor) vs SELECTED (committed
+      // pick — stronger, and the list freezes). Both read on the glass panel.
+      const ADDR_HILITE = "rgba(255,255,255,0.18)"
+      const ADDR_SELECTED = "rgba(90,150,255,0.45)"
+
+      function paintAddrRows() {
+        Array.from(addrList.children).forEach((li, k) => {
+          li.style.background = (k === addrSelected) ? ADDR_SELECTED
+                              : (k === addrActive) ? ADDR_HILITE : "transparent"
+        })
+      }
+
+      function renderAddrResults() {
+        addrList.innerHTML = ""
+        if (!addrResults.length) { addrList.style.display = "none"; return }
+        addrResults.forEach((r, i) => {
+          const li = document.createElement("li")
+          li.textContent = r.label
+          li.style.cssText = "padding:12px 22px; cursor:pointer; font-size:15px;"
+            + "color:rgba(255,255,255,0.92);"
+            + "border-top:1px solid rgba(255,255,255,0.08); white-space:nowrap;"
+            + "overflow:hidden; text-overflow:ellipsis;"
+          li.title = r.label
+          // Hover only moves the active highlight when nothing is committed yet.
+          li.addEventListener("mouseenter", () => { if (addrSelected < 0) setAddrActive(i) })
+          li.addEventListener("mousedown", (ev) => {
+            ev.preventDefault()   // fire before input blur
+            // Clicking the ALREADY-selected row toggles it off (deselect +
+            // resume searching); clicking any other row selects it.
+            if (addrSelected === i) deselectAddr()
+            else selectAddr(i)
+          })
+          addrList.appendChild(li)
+        })
+        paintAddrRows()
+        addrList.style.display = "block"
+      }
+
+      function setAddrActive(i) {
+        addrActive = i
+        paintAddrRows()
+      }
+
+      // Commit a selection: highlight it, FREEZE the suggestion list (edits to
+      // the text no longer re-search), and reveal the → accept button. The text
+      // input stays editable so the user can tweak the resulting pin name.
+      function selectAddr(i) {
+        if (i < 0 || i >= addrResults.length) return
+        addrSelected = i
+        addrActive = i
+        addrSeq++                     // cancel any in-flight search
+        if (addrDebounce) { clearTimeout(addrDebounce); addrDebounce = null }
+        addrStatus.textContent = "Press ↵ to add"
+        addrAcceptBtn.style.display = "inline-block"
+        paintAddrRows()
+        addrInput.focus()
+      }
+
+      // Title-case a free-form query for use as a pin name: "silver mountain"
+      // -> "Silver Mountain". Lowercases first so an ALL-CAPS entry normalizes.
+      function titleCase(s) {
+        return String(s).trim().toLowerCase().replace(/\b[a-z]/g, c => c.toUpperCase())
+      }
+
+      // Accept the committed selection: drop a pin named with the (editable)
+      // typed text, title-cased. Doesn't move the map.
+      function acceptAddr() {
+        const r = addrResults[addrSelected]
+        if (!r) return
+        const name = titleCase(addrInput.value) || null
+        addPin(r.lat, r.lon, true, name)
+        closeAddrSearch()
+      }
+
+      async function runAddrSearch(query) {
+        const mySeq = ++addrSeq
+        addrStatus.textContent = "Searching…"
+        const results = await geocodeAddress(query, 5)
+        if (mySeq !== addrSeq) return  // a newer keystroke superseded this one
+        addrResults = results
+        addrSelected = -1              // fresh results: nothing committed yet
+        addrActive = results.length ? 0 : -1
+        addrAcceptBtn.style.display = "none"
+        addrStatus.textContent = results.length ? "" : "No matches"
+        renderAddrResults()
+      }
+
+      addrCloseBtn.addEventListener("click", closeAddrSearch)
+      addrAcceptBtn.addEventListener("click", (e) => { e.preventDefault(); acceptAddr() })
+
+      addrInput.addEventListener("input", () => {
+        // While a result is SELECTED the list is FROZEN: the text is now just
+        // the editable pin NAME, so typing must NOT retrigger a search. (Esc
+        // deselects to resume searching.)
+        if (addrSelected >= 0) return
+        const q = addrInput.value.trim()
+        if (addrDebounce) clearTimeout(addrDebounce)
+        if (q.length < 3) {               // wait for a meaningful query
+          clearAddrResults()
+          addrStatus.textContent = ""
+          addrSeq++                        // cancel any in-flight response
+          return
+        }
+        // Debounce so we send ~one request per typing pause (Nominatim-friendly).
+        addrDebounce = setTimeout(() => runAddrSearch(q), 350)
+      })
+
+      // Drop the committed selection (but keep the box open + the suggestions
+      // visible) so the user can search/navigate again.
+      function deselectAddr() {
+        addrSelected = -1
+        addrActive = addrResults.length ? 0 : -1
+        addrAcceptBtn.style.display = "none"
+        addrStatus.textContent = ""
+        paintAddrRows()
+      }
+
+      addrInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "ArrowDown") {
+          ev.preventDefault()
+          if (addrSelected < 0 && addrResults.length)
+            setAddrActive((addrActive + 1) % addrResults.length)
+        } else if (ev.key === "ArrowUp") {
+          ev.preventDefault()
+          if (addrSelected < 0 && addrResults.length)
+            setAddrActive((addrActive - 1 + addrResults.length) % addrResults.length)
+        } else if (ev.key === "Enter") {
+          ev.preventDefault()
+          if (addrSelected >= 0) {
+            acceptAddr()                   // already selected -> accept
+          } else if (addrActive >= 0) {
+            selectAddr(addrActive)         // first Enter -> select (freeze)
+          } else if (addrResults.length) {
+            selectAddr(0)
+          }
+        } else if (ev.key === "Escape") {
+          ev.preventDefault()
+          // First Esc deselects (if something is selected); a second Esc (no
+          // selection) closes the box.
+          if (addrSelected >= 0) deselectAddr()
+          else closeAddrSearch()
+        }
+      })
       // "See graph": open the forecast graph for this location in a new tab.
       // The graph's `models` param maps model-type -> [attribute], e.g.
       // {"observation": ["temperature"]}.
-      document.getElementById("ctxSeeGraph").addEventListener("click", () => {
-        if (!menuLngLat) return
+      // Open the forecast graph for a location in a new tab. The graph's
+      // `models` param maps model-type -> [attribute], e.g. {observation:
+      // ["temperature"]}. Shared by the context menu and per-pin graph button.
+      function openGraphAt(glat, glon) {
         const models = JSON.stringify({ [kind]: [model] })
         const u = new URL("/graph/", window.location.origin)
         u.searchParams.set("models", models)
-        u.searchParams.set("lat", menuLngLat.lat.toFixed(6))
-        u.searchParams.set("lon", menuLngLat.lng.toFixed(6))
-        hideMenu()
+        u.searchParams.set("lat", glat.toFixed(6))
+        u.searchParams.set("lon", glon.toFixed(6))
         window.open(u.toString(), "_blank")
+      }
+      document.getElementById("ctxSeeGraph").addEventListener("click", () => {
+        if (!menuLngLat) return
+        openGraphAt(menuLngLat.lat, menuLngLat.lng)
+        hideMenu()
+      })
+      // Open the standard 7-day forecast for a location (new tab). Uses the
+      // dropdown model key (currentModel) so the forecast page can look up the
+      // model's profile; `name` optionally labels the location (a pin name).
+      function openForecastAt(glat, glon, name) {
+        const u = new URL("/forecast/", window.location.origin)
+        u.searchParams.set("model", currentModel)
+        u.searchParams.set("lat", glat.toFixed(6))
+        u.searchParams.set("lon", glon.toFixed(6))
+        if (name) u.searchParams.set("name", name)
+        window.open(u.toString(), "_blank")
+      }
+      document.getElementById("ctxForecast").addEventListener("click", () => {
+        if (!menuLngLat) return
+        openForecastAt(menuLngLat.lat, menuLngLat.lng)
+        hideMenu()
       })
 
       // "Draw observed area": enter a drag-to-draw mode. The user drags a
@@ -1084,8 +1624,9 @@
           lon = c.lng
         }
 
-        // Moving to a new area invalidates existing pins.
-        clearPins()
+        // Pins are geographic (lat/lon), so they PERSIST across an area change
+        // — a pin inside the new area keeps sampling the new field; one outside
+        // its extent just reads "—". (refreshPins re-samples after the reload.)
 
         // Size the fetched area. From a drawn box: the box's own lon/lat span.
         // Otherwise: the current viewport span. The km conversion mirrors the
@@ -1139,13 +1680,12 @@
         // Clear the old area's overlay immediately so stale geometry isn't
         // left on screen while the new area loads.
         lastFeatures = []
-        if (isHeatmap) {
-          // Blank the raster image if it exists yet (nothing to do otherwise).
-          if (heatReady) showHeatmap({ empty: true })
-        } else {
-          const src = map.getSource("contours")
-          if (src) src.setData({ type: "FeatureCollection", features: [] })
-        }
+        // Drop the old area's IDW weight plan so it's not pinned in memory and
+        // can't be mistakenly reused (the positions signature would differ
+        // anyway, but free it eagerly on the known area boundary).
+        _idwPlan = null
+        // Blank the raster image if it exists yet (nothing to do otherwise).
+        if (heatReady) showHeatmap({ empty: true })
         showSpinner("Loading data…")
         try {
           if (isAqi) {
@@ -1193,6 +1733,16 @@
       map.on("click", hideMenu)
       map.on("movestart", hideMenu)
       window.addEventListener("keydown", (e) => { if (e.key === "Escape") hideMenu() })
+
+      // Ctrl/Cmd+F opens the address search box (overriding the browser's
+      // native find, which isn't useful on a map). Escape closes it (handled
+      // by the input's own keydown). Ignored while already typing in it.
+      window.addEventListener("keydown", (e) => {
+        if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) {
+          e.preventDefault()
+          openAddrSearch()
+        }
+      })
 
       // ---- Rendering --------------------------------------------------------
 
@@ -1262,33 +1812,18 @@
         latestPoints = points.filter(p => Number.isFinite(p.v))
         latestUnits = points.length ? (lastUnits || "") : ""
 
-        // Now that units are known, make sure the contour-interval label shows
-        // them (e.g. "2 mm" instead of a placeholder degree symbol).
-        const stepLbl = document.getElementById("stepLabel")
-        if (stepLbl) stepLbl.textContent = formatStep(contourStep)
-
-        if (isHeatmap) {
-          const info = buildHeatmap(points)
-          if (info) {
-            showHeatmap(info)
-            updateLegend(info.vMin, info.vMax, info.units)
-            // Image corner quad [TL,TR,BR,BL] -> exact painted extent.
-            if (info.coordinates) {
-              const co = info.coordinates
-              lastFieldExtent = {
-                w: Math.min(co[0][0], co[3][0]), e: Math.max(co[1][0], co[2][0]),
-                s: Math.min(co[2][1], co[3][1]), n: Math.max(co[0][1], co[1][1]),
-              }
+        // Heatmap wash (the only overlay now; isobands/contours were dropped).
+        const info = buildHeatmap(points)
+        if (info) {
+          showHeatmap(info)
+          updateLegend(info.vMin, info.vMax, info.units)
+          // Image corner quad [TL,TR,BR,BL] -> exact painted extent.
+          if (info.coordinates) {
+            const co = info.coordinates
+            lastFieldExtent = {
+              w: Math.min(co[0][0], co[3][0]), e: Math.max(co[1][0], co[2][0]),
+              s: Math.min(co[2][1], co[3][1]), n: Math.max(co[0][1], co[1][1]),
             }
-          }
-        } else {
-          const info = buildContours(points)
-          if (info) {
-            map.getSource("contours").setData(info.fc)
-            updateLegend(info.vMin, info.vMax, info.units)
-            // Use the FIELD GRID extent (stable across frames), NOT the contour
-            // polygons' bounds — the latter shrink/grow as thresholds change.
-            if (info.extent) lastFieldExtent = info.extent
           }
         }
         // The painted geometry is now current, so fit the area-outline box.
@@ -1681,44 +2216,78 @@
             } catch (_) { return }
             if (!resp || !resp.ok || !resp.body) return
             const reader = resp.body.getReader()
-            const decoder = new TextDecoder()
-            let buffer = ""
-            // GRID WIRE FORMAT state (per fill stream). The stream's first line
-            // is a grid header {type:"grid", uom, coords:[[lat,lon],...]} that
-            // carries the FIXED coordinate lattice ONCE; every subsequent frame
-            // is values-only {time, vals} with vals aligned by index to those
-            // coords (null where a point has no value that frame). We rehydrate
-            // each values-only frame back into the self-contained
-            // {time, uom, coords, vals} shape the cache + normalizeFrame expect,
-            // so only the WIRE got smaller — the cache/render path is unchanged.
-            let gridCoords = null
-            let gridUom = ""
-            const handle = (line) => {
-              if (!line) return
-              try {
-                const fr = JSON.parse(line)
-                // Grid header: capture coords/uom for the rest of this stream.
-                if (fr && fr.type === "grid") {
-                  gridCoords = Array.isArray(fr.coords) ? fr.coords : null
-                  gridUom = fr.uom || ""
-                  return
-                }
-                if (gen === loadGeneration && myToken === fillToken) {
-                  let rec = fr
-                  // Values-only frame (grid format): rehydrate against the
-                  // header coords into a self-contained record before caching.
-                  if (rec && rec.coords === undefined && Array.isArray(rec.vals)
-                      && gridCoords) {
-                    rec = { time: rec.time, uom: gridUom,
-                            coords: gridCoords, vals: rec.vals }
-                  }
-                  // Self-contained frame (legacy {time,uom,coords,vals}) or a
-                  // rehydrated grid frame; normalizeFrame handles either, plus
-                  // the GeoJSON FeatureCollection from the one-shot /ensemble.
-                  apiClient.put(frameCacheKey(rec.time), rec)
-                }
-              } catch (_) {}
+
+            // BINARY SIDECAR WIRE FORMAT (see weather_radar.lib.framing). The
+            // body is a gzipped stream of length-prefixed records (fetch()
+            // transparently inflates Content-Encoding: gzip, so reader.read()
+            // yields the DECOMPRESSED bytes):
+            //   record := [4-byte BE uint32 len][payload]
+            //   record 0 = JSON grid header {uom, coords, enc, scale, offset,
+            //              sentinel}  — the FIXED lattice + value codec, once.
+            //   record k = [8-byte BE int64 epoch][N × int16 LE] — one frame,
+            //              values = stored/scale + offset, sentinel => missing.
+            // Each decoded frame is rehydrated into the self-contained
+            // {time, uom, coords, vals} record the cache + normalizeFrame
+            // already expect, so only the WIRE changed — render/hover/pins
+            // downstream are untouched.
+            let gridCoords = null, gridUom = "", gridN = 0
+            let scale = 10, offset = 0, sentinel = -32768
+            // Accumulating byte buffer + a parse cursor.
+            let buf = new Uint8Array(0)
+            const append = (chunk) => {
+              const merged = new Uint8Array(buf.length + chunk.length)
+              merged.set(buf, 0); merged.set(chunk, buf.length)
+              buf = merged
             }
+            // Parse as many complete records as `buf` currently holds.
+            const drainRecords = () => {
+              let off = 0
+              while (buf.length - off >= 4) {
+                const dv = new DataView(buf.buffer, buf.byteOffset + off, 4)
+                const len = dv.getUint32(0, false)   // big-endian length
+                if (buf.length - off - 4 < len) break // incomplete record
+                const payload = buf.subarray(off + 4, off + 4 + len)
+                handleRecord(payload)
+                off += 4 + len
+              }
+              if (off > 0) buf = buf.slice(off)       // drop consumed bytes
+            }
+            const handleRecord = (payload) => {
+              if (gridCoords === null) {
+                // First record is the JSON grid header.
+                try {
+                  const hdr = JSON.parse(new TextDecoder().decode(payload))
+                  if (hdr && hdr.type === "grid") {
+                    gridCoords = Array.isArray(hdr.coords) ? hdr.coords : []
+                    gridUom = hdr.uom || ""
+                    gridN = gridCoords.length
+                    scale = hdr.scale || 1
+                    offset = hdr.offset || 0
+                    sentinel = (hdr.sentinel !== undefined) ? hdr.sentinel : -32768
+                    return
+                  }
+                } catch (_) {}
+                return  // malformed header -> ignore the stream
+              }
+              if (gen !== loadGeneration || myToken !== fillToken) return
+              // Binary frame: [8-byte epoch][N × int16 LE].
+              if (payload.length < 8) return
+              const head = new DataView(payload.buffer, payload.byteOffset, 8)
+              // 64-bit epoch; seconds fit comfortably in the low 32 bits for
+              // our range, but read both halves to be safe.
+              const hi = head.getUint32(0, false), lo = head.getUint32(4, false)
+              const epoch = hi * 4294967296 + lo
+              const n = (payload.length - 8) >> 1
+              const vals = new Array(n)
+              const vdv = new DataView(payload.buffer, payload.byteOffset + 8, n * 2)
+              for (let i = 0; i < n; i++) {
+                const iv = vdv.getInt16(i * 2, true)   // little-endian int16
+                vals[i] = (iv === sentinel) ? null : (iv / scale + offset)
+              }
+              const rec = { time: epoch, uom: gridUom, coords: gridCoords, vals }
+              apiClient.put(frameCacheKey(epoch), rec)
+            }
+
             for (;;) {
               if (gen !== loadGeneration || myToken !== fillToken) {
                 try { reader.cancel() } catch (_) {}
@@ -1727,14 +2296,10 @@
               let readChunk
               try { readChunk = await reader.read() } catch (_) { return }
               if (readChunk.done) break
-              buffer += decoder.decode(readChunk.value, { stream: true })
-              let nl
-              while ((nl = buffer.indexOf("\n")) >= 0) {
-                handle(buffer.slice(0, nl).trim())
-                buffer = buffer.slice(nl + 1)
-              }
+              append(readChunk.value)
+              drainRecords()
             }
-            handle(buffer.trim())
+            drainRecords()
             completed = true  // stream read to completion (not aborted)
           } finally {
             if (myToken === fillToken) {
@@ -1838,6 +2403,18 @@
           console.log("[field] global range:", globalMin.toFixed(1), "-", globalMax.toFixed(1), r.uom)
           if (autoStep) applyAutoStep()
         }
+        // Server-provided painted-field extent (bbox of the sampled lattice +
+        // the same 5% IDW pad the client uses). Sizing the area box from this
+        // NOW means it's correct from the first render instead of snapping from
+        // the nominal width×height rectangle when the first frame paints. The
+        // first frame's renderFeatures sets the same extent from the image
+        // quad, so there's no later jump.
+        const ex = r && r.extent
+        if (ex && Number.isFinite(ex.w) && Number.isFinite(ex.e)
+            && Number.isFinite(ex.s) && Number.isFinite(ex.n)) {
+          lastFieldExtent = { w: ex.w, e: ex.e, s: ex.s, n: ex.n }
+          updateAreaBox()
+        }
         mapTimeZone = (r && r.timeZone) || null
         const s = r && r.start ? Math.floor(Date.parse(r.start) / 1000) : NaN
         const e = r && r.end ? Math.floor(Date.parse(r.end) / 1000) : NaN
@@ -1931,9 +2508,12 @@
           if (tickTimer) { clearTimeout(tickTimer); tickTimer = null }
           scheduleNext()
         } else if (!scrubbing) {
-          // Pausing to a resting state: capture the current time in the URL.
-          // (During a scrub, endDrag handles persistence instead.)
-          persistScrubberState()
+          // Pausing to a resting state: persist the WINDOW only, not the
+          // playback position. `t` (the chosen start) is left as the user last
+          // set it, so a refresh returns to that start — not to wherever the
+          // animation had advanced to when it paused. (During a scrub, endDrag
+          // handles persistence of an explicit playhead position instead.)
+          persistScrubberState(false)
         }
       }
       function scheduleNext() {
@@ -2070,6 +2650,7 @@
       let scrubbing = false
       let resumeAfterScrub = false
       let scrubLoadTimer = null
+      let scrubPersistTimer = null   // debounced URL write during a drag
 
       function fmtTime(epochSec) {
         const d = new Date(epochSec * 1000)
@@ -2123,6 +2704,22 @@
         timeSliderLabel.textContent = fmtTime(time)
       }
 
+      // Placeholder layout shown BEFORE any forecast data is loaded, purely so
+      // the controls read as a real range instead of all three handles stacked
+      // at x=0. Treats the empty state as a [0,1] range: start bookend at the
+      // left (0), end bookend at the right (1), playhead at 0. No epoch/time is
+      // implied — the label stays "—" until real data assigns the window.
+      function renderScrubberPlaceholder() {
+        const left = SC_PAD
+        const right = SC_PAD + scWidth()
+        scStartEl.setAttribute("x", String(left - 3))
+        scEndEl.setAttribute("x", String(right - 3))
+        scActive.setAttribute("x1", String(left))
+        scActive.setAttribute("x2", String(right))
+        scPlayheadEl.setAttribute("cx", String(left))
+        timeSliderLabel.textContent = "—"
+      }
+
       // Configure the scrubber once the forecast window is known. Named
       // configureScrubber (fetchGlobalRange calls it) and also aliased to the
       // old configureTimeSlider name used elsewhere.
@@ -2138,12 +2735,19 @@
       // seconds (from/to/t). On load they're clamped into the current forecast
       // range, so a shared/refreshed URL stays valid even if the forecast
       // window has since shifted.
-      function persistScrubberState() {
+      //
+      // `t` is the user's EXPLICITLY-CHOSEN playhead start — set by dragging the
+      // playhead / clicking the track, NOT by playback advancing the clock. So
+      // a refresh returns to where the user last put the playhead (or the window
+      // start), never to wherever the animation happened to be when it paused.
+      // Pass includeTime=false to persist only the window (from/to) and leave
+      // the stored start `t` untouched (used by the playback-pause path).
+      function persistScrubberState(includeTime = true) {
         if (windowStart === null || windowEnd === null) return
         const u = new URL(window.location.href)
         u.searchParams.set("from", String(windowStart))
         u.searchParams.set("to", String(windowEnd))
-        u.searchParams.set("t", String(time))
+        if (includeTime) u.searchParams.set("t", String(time))
         history.replaceState(null, "", u.toString())
       }
       // Apply persisted from/to/t (if present) over the default full window.
@@ -2209,6 +2813,11 @@
         // Debounced frame load so dragging stays responsive.
         if (scrubLoadTimer) clearTimeout(scrubLoadTimer)
         scrubLoadTimer = window.setTimeout(() => { loadFrame(time) }, 60)
+        // Debounced URL write so the window/playhead positions persist across a
+        // refresh even mid-drag (not only on pointer release). Debounced so a
+        // continuous drag isn't one history.replaceState per pointer event.
+        if (scrubPersistTimer) clearTimeout(scrubPersistTimer)
+        scrubPersistTimer = window.setTimeout(persistScrubberState, 120)
       }
       function endDrag(evt) {
         if (!dragWhich) return
@@ -2216,6 +2825,7 @@
         dragWhich = null
         // Load the final frame immediately, then resume if we were playing.
         if (scrubLoadTimer) { clearTimeout(scrubLoadTimer); scrubLoadTimer = null }
+        if (scrubPersistTimer) { clearTimeout(scrubPersistTimer); scrubPersistTimer = null }
         loadFrame(time)
         persistScrubberState() // save window + time to the URL
         scrubbing = false
@@ -2238,8 +2848,16 @@
       scrubberEl.addEventListener("pointercancel", endDrag)
       // Don't let scrubber interaction drag the legend.
       scrubberEl.addEventListener("pointerdown", (e) => e.stopPropagation())
-      // Keep handles positioned correctly if the legend/window resizes.
-      window.addEventListener("resize", renderScrubber)
+      // Keep handles positioned correctly if the legend/window resizes. Before
+      // data loads, redraw the [0,1] placeholder layout instead.
+      window.addEventListener("resize", () => {
+        if (scrubberReady) renderScrubber()
+        else renderScrubberPlaceholder()
+      })
+
+      // Initial paint: until the forecast window is known, show the [0,1]
+      // placeholder so the bookends/playhead aren't stacked at the left edge.
+      renderScrubberPlaceholder()
 
       // Wire up the control buttons (stopPropagation so clicks don't drag the
       // legend).

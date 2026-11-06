@@ -110,7 +110,7 @@ class TestBundleGridFormat:
             {"time": 2000, "vals": [11, None]},
             {"time": 3000, "vals": [12, 22]},
         ]
-        n = b._write_bundle_ndjson(path, header, iter(frames))
+        n = b._write_bundle(path, header, iter(frames))
         assert n == 3
         assert os.path.exists(path)
 
@@ -118,7 +118,8 @@ class TestBundleGridFormat:
         rng = b.read_bundle_range(model, lat, lon, w, h, dt, kind)
         assert rng["uom"] == "AQI" and rng["max"] == 300
 
-    def test_serve_emits_grid_header_first(self, tmp_path, monkeypatch):
+    def test_serve_emits_binary_header_then_frames(self, tmp_path, monkeypatch):
+        from weather_radar.lib import framing as F
         b = self._mk(tmp_path, monkeypatch)
         model, lat, lon, w, h, dt, kind = "pm25", 47.2, -116.9, 10, 10, 3600, "aqi"
         path = b._bundle_path(model, lat, lon, w, h, dt, kind)
@@ -128,36 +129,49 @@ class TestBundleGridFormat:
         frames = [{"time": 1000, "vals": [10, 20]},
                   {"time": 2000, "vals": [11, None]},
                   {"time": 3000, "vals": [12, 22]}]
-        b._write_bundle_ndjson(path, header, iter(frames))
+        b._write_bundle(path, header, iter(frames))
 
         covered = set()
         out = list(b.serve_bundle_epochs(model, lat, lon, w, h, dt, kind,
                                          [1000, 3000], covered, emit_header=True))
-        # First line is the grid header; then the two matching frames.
-        first = json.loads(out[0])
-        assert first["type"] == "grid"
-        assert first["coords"] == [[-116.9, 47.2], [-116.8, 47.2]]
-        assert first["uom"] == "AQI"
-        bodies = [json.loads(l) for l in out[1:]]
-        times = sorted(x["time"] for x in bodies)
-        assert times == [1000, 3000]
-        assert all("coords" not in x for x in bodies)  # values-only frames
+        # Each yielded item is one length-prefixed record. First = grid header,
+        # then the two matching frames.
+        assert len(out) == 3
+        hdr_payload = next(F.iter_records(out[0]))
+        hdr = json.loads(hdr_payload.decode("utf-8"))
+        assert hdr["type"] == "grid"
+        assert hdr["coords"] == [[-116.9, 47.2], [-116.8, 47.2]]
+        assert hdr["enc"] == "i16"
+        # Decode the frame records back to values.
+        got = {}
+        for rec in out[1:]:
+            pl = next(F.iter_records(rec))
+            epoch = F.decode_frame_epoch(pl)
+            import struct
+            n = (len(pl) - 8) // 2
+            ints = struct.unpack_from("<%dh" % n, pl, 8)
+            got[epoch] = [None if iv == hdr["sentinel"]
+                          else iv / hdr["scale"] + hdr["offset"] for iv in ints]
+        assert sorted(got) == [1000, 3000]
+        assert got[1000] == [10.0, 20.0]
+        assert got[3000] == [12.0, 22.0]
         assert covered == {1000, 3000}
 
     def test_serve_without_header(self, tmp_path, monkeypatch):
+        from weather_radar.lib import framing as F
         b = self._mk(tmp_path, monkeypatch)
         model, lat, lon, w, h, dt, kind = "pm25", 47.2, -116.9, 10, 10, 3600, "aqi"
         path = b._bundle_path(model, lat, lon, w, h, dt, kind)
         header = {"type": "range", "range": {}, "uom": "AQI",
                   "coords": [[-116.9, 47.2]], "meta": {"source_mtime": 1.0}}
-        b._write_bundle_ndjson(path, header,
-                               iter([{"time": 2000, "vals": [11]}]))
+        b._write_bundle(path, header, iter([{"time": 2000, "vals": [11]}]))
         covered = set()
         out = list(b.serve_bundle_epochs(model, lat, lon, w, h, dt, kind,
                                          [2000], covered, emit_header=False))
-        # No header line; just the frame.
+        # No header record; just the one frame.
         assert len(out) == 1
-        assert json.loads(out[0])["time"] == 2000
+        pl = next(F.iter_records(out[0]))
+        assert F.decode_frame_epoch(pl) == 2000
         assert covered == {2000}
 
     def test_serve_missing_bundle_yields_nothing(self, tmp_path, monkeypatch):
@@ -178,9 +192,8 @@ class TestGzipStream:
             from weather_radar.server.api.models import _gzip_stream
         except Exception:
             pytest.skip("server deps (fastapi) unavailable")
-        lines = ['{"type":"grid","uom":"AQI","coords":[[-1,2]]}\n',
-                 '{"time":1,"vals":[10]}\n',
-                 '{"time":2,"vals":[0]}\n']
-        out = b"".join(_gzip_stream(iter(lines)))
-        dec = _gzip.GzipFile(fileobj=io.BytesIO(out)).read().decode()
-        assert dec == "".join(lines)
+        # _gzip_stream now compresses BYTE chunks (binary sidecar records).
+        chunks = [b"\x00\x01\x02\x03", b"\x04\x05\x06", b"\x07"]
+        out = b"".join(_gzip_stream(iter(chunks)))
+        dec = _gzip.GzipFile(fileobj=io.BytesIO(out)).read()
+        assert dec == b"".join(chunks)
