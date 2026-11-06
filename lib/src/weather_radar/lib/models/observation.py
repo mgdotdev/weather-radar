@@ -95,8 +95,15 @@ class ObservationModel:
         polygon, = data["geometry"]["coordinates"]
         polygon = set(tuple(x) for x in polygon)
         polygon = list(zip(*polygon))
-        center_coordinate = [sum(item) / len(item) for item in polygon]
-        center_coordinate = MapCoordinate(*center_coordinate)
+        # NOAA polygon rings are [lon, lat]; after zip(*) the means are
+        # [mean_lon, mean_lat]. Construct the center with the CORRECT axes
+        # (lat<-mean_lat, lon<-mean_lon) — previously this was built as
+        # MapCoordinate(mean_lon, mean_lat), which swapped the axes (center.lat
+        # held the longitude). That latent swap happened to cancel at the old
+        # GeoJSON emission; it's fixed here so center.lat is a true latitude and
+        # every emission uses the one honest [lon, lat] convention.
+        means = [sum(item) / len(item) for item in polygon]
+        center_coordinate = MapCoordinate(lat=means[1], lon=means[0])
         data = data["properties"][attr]
         # Some layers are dimensionless (e.g. probabilityOfThunder) and omit
         # `uom` entirely; others use "wmoUnit:degC" style. Default to no unit.
@@ -144,7 +151,8 @@ class ObservationModel:
                 },
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [center_coordinate.lat, center_coordinate.lon]
+                    # [lon, lat] (GeoJSON; normalizeFrame reads coordinates[0]=lon).
+                    "coordinates": [center_coordinate.lon, center_coordinate.lat]
                 }
             }
         return y

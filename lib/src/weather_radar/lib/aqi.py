@@ -48,6 +48,13 @@ NAQFC_DIR = os.path.join(CACHE_ROOT, "weather-radar-naqfc")
 # NAQFC runs at 06 and 12 UTC. We try the newest cycle first and fall back.
 CYCLES = ("12", "06")
 
+# When the on-disk GRIB's Expires has passed but the SAME cycle is still the
+# newest available (NAQFC only publishes twice daily, but Expires is ~4h), we
+# extend the local freshness stamp by this long instead of re-downloading the
+# identical file. Bounds how often we re-probe NOMADS for a newer cycle in the
+# expired-but-unchanged window. Default 30 min.
+NAQFC_RECHECK_SECONDS = int(os.environ.get("NAQFC_RECHECK_SECONDS", "1800"))
+
 # Pollutant -> (NOMADS file infix, concentration->AQI converter key).
 # `_bc` = bias-corrected (model nudged toward observations); preferred.
 POLLUTANTS = {
@@ -198,7 +205,7 @@ def _download_grib(day, cyc, pollutant, force=False):
 # value arrays and validity epochs. Keyed by (path, mtime) so a REFRESHED file
 # (new cycle, new mtime) re-parses and the stale entry is evicted.
 
-_GRID_CACHE = {}          # path -> {"mtime", "tree", "frames":[(epoch, values)]}
+_GRID_CACHE = {}          # path -> {"size", "tree", "frames":[(epoch, values)]}
 _GRID_CACHE_LOCK = threading.Lock()
 
 # Throttle NOMADS cycle probing: remember the resolved current path per
@@ -210,15 +217,20 @@ _CURRENT_PATH_LOCK = threading.Lock()
 
 def _load_grid(path, pollutant):
     """Parse a NAQFC GRIB2 into (KDTree, [(epoch, values)]) and memoize it by
-    (path, mtime). Re-parses when the file's mtime changes (a refresh) and
-    drops the superseded entry so stale cycles don't accumulate in memory."""
+    (path, SIZE). Keyed on the file SIZE, not its mtime: ensure_grid bumps the
+    mtime forward to extend freshness in the expired-but-same-cycle window (so
+    it doesn't re-download the identical file), and keying the parse cache on
+    mtime would make every such bump force a needless re-parse of unchanged
+    bytes. Size changes iff the content does (a new cycle writes a different
+    file — and to a different path anyway), so size is the stable content
+    signal here."""
     try:
-        mtime = os.path.getmtime(path)
+        size = os.path.getsize(path)
     except OSError:
         return None
     with _GRID_CACHE_LOCK:
         cached = _GRID_CACHE.get(path)
-        if cached is not None and cached["mtime"] == mtime:
+        if cached is not None and cached["size"] == size:
             return cached
 
     import numpy as np
@@ -247,10 +259,10 @@ def _load_grid(path, pollutant):
             finally:
                 ec.codes_release(gid)
 
-    result = {"mtime": mtime, "tree": tree, "frames": frames}
+    result = {"size": size, "tree": tree, "frames": frames}
     with _GRID_CACHE_LOCK:
-        # Evict any stale cycles for OTHER pollutants' old paths is left alone;
-        # just replace this path's entry (old mtime superseded).
+        # Replace this path's entry (a different-size file supersedes it). Other
+        # pollutants' paths are left alone.
         _GRID_CACHE[path] = result
     logger.warning("NAQFC parsed %s: %d hourly frames", os.path.basename(path),
                    len(frames))
@@ -275,7 +287,15 @@ def ensure_grid(pollutant="pm25"):
     if cur is not None and _is_fresh(cur):
         return _load_grid(cur, pollutant)
 
-    # Stale/unknown: re-probe the latest cycle and (re)download.
+    # Stale/unknown: re-probe the latest cycle. NOTE: NAQFC publishes only
+    # twice daily (06z/12z) but the HTTP Expires is only ~4h out, so there's a
+    # multi-hour window where Expires has passed yet the SAME cycle is still the
+    # newest. In that window we must NOT re-download the (identical) 68MB file
+    # on every request — that was the bug. The cycle's path encodes day+cyc, so
+    # if the resolved path already exists on disk, it's the same cycle we have:
+    # just extend its freshness (bump mtime forward by the recheck interval) and
+    # reuse it. A genuinely NEWER cycle resolves to a DIFFERENT path (not on
+    # disk) and downloads normally.
     cyc = _latest_cycle()
     if cyc is None:
         # NOMADS unreachable: fall back to the last file we have, even if its
@@ -284,6 +304,21 @@ def ensure_grid(pollutant="pm25"):
             return _load_grid(cur, pollutant)
         return None
     day, c = cyc
+    resolved = _grib_path(day, c, pollutant)
+    if os.path.exists(resolved):
+        # Same cycle we already downloaded: no re-download. Push the freshness
+        # stamp out by NAQFC_RECHECK_SECONDS so the next request's fast path
+        # hits (no re-probe, no re-download) until it's worth re-checking for a
+        # newer cycle. Does NOT change content, only the freshness mtime.
+        try:
+            new_mtime = time.time() + NAQFC_RECHECK_SECONDS
+            os.utime(resolved, (new_mtime, new_mtime))
+        except OSError:
+            pass
+        with _CURRENT_PATH_LOCK:
+            _CURRENT_PATH[pollutant] = resolved
+        return _load_grid(resolved, pollutant)
+
     path = _download_grib(day, c, pollutant)
     if path is None:
         return None
@@ -356,18 +391,43 @@ def fit_area(area, pollutant="pm25"):
     }
 
 
-def predict_area(fit, epochs):
+def predict_area(fit, epochs, fixed_grid=False):
     """Evaluate a fitted area (from fit_area) at the given list of epoch
-    seconds. Yields one frame dict per epoch:
-      {"epoch": int, "coords": [[lon,lat],...], "vals": [aqi,...]}
-    Points whose spline is None, or whose epoch is outside the forecast window,
-    are dropped from that frame (coords/vals stay aligned). AQI is clamped to
-    >= 0 and rounded to an int.
-    """
-    import numpy as np
+    seconds.
+
+    Two output shapes:
+      * fixed_grid=False (default, legacy): yields self-contained frames
+        {"epoch", "coords":[[lon,lat],...], "vals":[...]} with per-frame
+        coords (points with no spline / out of window are DROPPED). Kept for
+        any caller that still wants standalone frames.
+      * fixed_grid=True (grid wire format): the point set is FIXED to fit's
+        points (same order every frame); yields {"epoch", "vals":[...]} where
+        vals is aligned by index to fit["points"] and is `None` for a point
+        whose spline is None or whose value is out of the forecast window.
+        Caller emits the shared coords header once (see `grid_points`).
+    AQI is clamped to >= 0 and rounded to an int."""
     pts = fit["points"]
     splines = fit["splines"]
     lo, hi = fit["start"], fit["end"]
+
+    if fixed_grid:
+        for t in epochs:
+            vals = []
+            any_val = False
+            in_window = (lo <= t <= hi)
+            for s in splines:
+                if s is None or not in_window:
+                    vals.append(None)
+                    continue
+                y = float(s(t))
+                if y < 0:
+                    y = 0.0
+                vals.append(round(y))
+                any_val = True
+            if any_val:
+                yield {"epoch": int(t), "vals": vals}
+        return
+
     for t in epochs:
         if t < lo or t > hi:
             continue
@@ -383,3 +443,10 @@ def predict_area(fit, epochs):
             vals.append(round(y))
         if vals:
             yield {"epoch": int(t), "coords": co, "vals": vals}
+
+
+def grid_points(fit):
+    """The FIXED coords header for an AQI fit, as [[lon,lat],...] aligned to
+    the vals arrays predict_area(fixed_grid=True) emits. `fit["points"]` is
+    already [lon,lat] pairs."""
+    return list(fit["points"])

@@ -346,10 +346,19 @@
         document.getElementById("legendBar").style.background = legendGradientCss()
         legendInitialized = true
       }
+      // Always display the FIXED global range (whole-forecast min/max) when it
+      // is known, so the legend bounds NEVER shift frame-to-frame — including
+      // on a flat/all-zero frame (e.g. snowfall with no snow this step), whose
+      // own per-frame min/max would otherwise collapse the legend to [0, 0].
+      // Fall back to the passed per-frame range only before the global range
+      // is resolved. (buildContours/buildHeatmap already color the FIELD via
+      // the global range; this keeps the LEGEND consistent with that.)
+      const lo = (globalMin !== null) ? globalMin : vMin
+      const hi = (globalMax !== null && globalMax > globalMin) ? globalMax : vMax
       document.getElementById("legendUnits").textContent = units ? `(${units})` : ""
-      document.getElementById("legendMin").textContent = vMin.toFixed(1)
-      document.getElementById("legendMid").textContent = ((vMin + vMax) / 2).toFixed(1)
-      document.getElementById("legendMax").textContent = vMax.toFixed(1)
+      document.getElementById("legendMin").textContent = lo.toFixed(1)
+      document.getElementById("legendMid").textContent = ((lo + hi) / 2).toFixed(1)
+      document.getElementById("legendMax").textContent = hi.toFixed(1)
       document.getElementById("legend").style.display = "block"
     }
 
@@ -1223,13 +1232,20 @@
         lastHeatCoords = info.coordinates
         if (!heatReady) {
           map.addSource("heatmap", { type: "image", url, coordinates: info.coordinates })
-          // Insert ABOVE the basemap but below labels where possible. Simplest
-          // robust placement: add on top (labels in positron are drawn by the
-          // basemap style; the semi-transparent wash keeps them legible).
+          // Insert ABOVE the basemap but BELOW the area-box outline so the box
+          // stays visible over the wash. The heatmap layer is created lazily
+          // (on the first heatmap frame), AFTER area-box was added at load, so
+          // without an explicit beforeId MapLibre would append it on TOP and
+          // the semi-opaque raster would occlude the thin box line — which is
+          // why the area box was invisible on heatmap layers (snowfall-rate,
+          // sky-cover, AQI, the rate variants) but fine on isoband layers
+          // (whose contour layers are added before area-box at load).
+          const beforeId = (map.getLayer && map.getLayer("area-box"))
+            ? "area-box" : undefined
           map.addLayer({
             id: "heatmap", type: "raster", source: "heatmap",
             paint: { "raster-opacity": 1, "raster-resampling": "linear", "raster-fade-duration": 0 },
-          })
+          }, beforeId)
           heatReady = true
         } else {
           map.getSource("heatmap").updateImage({ url, coordinates: info.coordinates })
@@ -1667,16 +1683,39 @@
             const reader = resp.body.getReader()
             const decoder = new TextDecoder()
             let buffer = ""
+            // GRID WIRE FORMAT state (per fill stream). The stream's first line
+            // is a grid header {type:"grid", uom, coords:[[lat,lon],...]} that
+            // carries the FIXED coordinate lattice ONCE; every subsequent frame
+            // is values-only {time, vals} with vals aligned by index to those
+            // coords (null where a point has no value that frame). We rehydrate
+            // each values-only frame back into the self-contained
+            // {time, uom, coords, vals} shape the cache + normalizeFrame expect,
+            // so only the WIRE got smaller — the cache/render path is unchanged.
+            let gridCoords = null
+            let gridUom = ""
             const handle = (line) => {
               if (!line) return
               try {
                 const fr = JSON.parse(line)
+                // Grid header: capture coords/uom for the rest of this stream.
+                if (fr && fr.type === "grid") {
+                  gridCoords = Array.isArray(fr.coords) ? fr.coords : null
+                  gridUom = fr.uom || ""
+                  return
+                }
                 if (gen === loadGeneration && myToken === fillToken) {
-                  // Slim wire format: cache the frame record itself
-                  // ({time, uom, coords, vals}). normalizeFrame() lets the
-                  // render path consume this or a GeoJSON FeatureCollection
-                  // (the one-shot /ensemble endpoint still returns GeoJSON).
-                  apiClient.put(frameCacheKey(fr.time), fr)
+                  let rec = fr
+                  // Values-only frame (grid format): rehydrate against the
+                  // header coords into a self-contained record before caching.
+                  if (rec && rec.coords === undefined && Array.isArray(rec.vals)
+                      && gridCoords) {
+                    rec = { time: rec.time, uom: gridUom,
+                            coords: gridCoords, vals: rec.vals }
+                  }
+                  // Self-contained frame (legacy {time,uom,coords,vals}) or a
+                  // rehydrated grid frame; normalizeFrame handles either, plus
+                  // the GeoJSON FeatureCollection from the one-shot /ensemble.
+                  apiClient.put(frameCacheKey(rec.time), rec)
                 }
               } catch (_) {}
             }

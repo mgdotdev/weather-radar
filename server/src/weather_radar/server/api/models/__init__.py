@@ -4,14 +4,47 @@ import json
 import logging
 import os
 import time
+import zlib
 
 from weather_radar.server.api.models.utils import datetime_from_time, time_t
 
-from weather_radar.lib.models import model_from_type
+from weather_radar.lib.models import model_from_type, ensemble_kinds, weather_source
 from weather_radar.lib.models.accumulation import AccumulationEnsemble
 from weather_radar.lib.models.observation import ObservationEnsemble
 from weather_radar.lib.area import MapCoordinate, CoordinateArea
 from weather_radar.lib.models.utils import BoundsError
+
+
+def _gzip_stream(line_iter):
+    """Wrap a text-line generator in a streaming gzip compressor.
+
+    Yields gzip-compressed bytes incrementally: each source chunk is compressed
+    with Z_SYNC_FLUSH so the client receives (and can decode) data as it
+    arrives — preserving the per-frame streaming / first-frame latency that the
+    whole animation pipeline depends on. The grid wire format repeats small
+    integers and (for the header) a coord lattice, both of which gzip heavily;
+    combined with coords-sent-once this cuts a large sweep from ~hundreds of MB
+    to tens of MB on the wire.
+
+    The browser's fetch() transparently inflates `Content-Encoding: gzip`, so
+    the client's NDJSON line reader is UNCHANGED."""
+    # wbits=31 -> gzip wrapper (not raw deflate / zlib).
+    compressor = zlib.compressobj(6, zlib.DEFLATED, 31)
+    for line in line_iter:
+        if not line:
+            continue
+        chunk = compressor.compress(line.encode("utf-8"))
+        chunk += compressor.flush(zlib.Z_SYNC_FLUSH)
+        if chunk:
+            yield chunk
+    tail = compressor.flush(zlib.Z_FINISH)
+    if tail:
+        yield tail
+
+
+# Standard headers for a gzipped NDJSON stream.
+_GZIP_NDJSON_HEADERS = {"Content-Encoding": "gzip"}
+
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +61,21 @@ router = APIRouter(prefix="/models")
 # segment), so e.g. kind="observation" + model="temperature" produces a
 # temperature heatmap, while kind="accumulation" + model="quantitative-precipitation"
 # produces a precipitation heatmap.
-ENSEMBLE_KINDS = {
-    "accumulation": AccumulationEnsemble,
-    "observation": ObservationEnsemble,
-}
+#
+# The CONCRETE classes depend on the configured weather source
+# (WR_WEATHER_SOURCE): gridpoints JSON (default) or NDFD GRIB. ENSEMBLE_KINDS
+# is a function (not a static dict) so a source change is picked up without a
+# reimport. Callers resolve with ENSEMBLE_KINDS().get(kind, <default>).
+def ENSEMBLE_KINDS():
+    return ensemble_kinds()
+
+
+# True when the active weather source is NDFD (GRIB grid sampling) rather than
+# the NOAA /gridpoints JSON. NDFD ensembles sample the area's lattice points
+# directly (no WFO gridpoint resolution), so the hot series path branches on
+# this to iterate the ensemble's points instead of area.iter_gridpoints().
+def _is_ndfd():
+    return weather_source() == "ndfd"
 
 
 @router.get("/{model}/params/{param}", response_class=JSONResponse)
@@ -82,6 +126,21 @@ def prefetch_stream(lat: float, lon: float, width: float=1, height: float=1,
                     return
             except Exception:
                 pass  # fall through to the normal resolve/fetch
+
+        # NDFD source: there are no NOAA /points or /gridpoints to resolve —
+        # the national element GRIB is fetched (writer-owned) and sampled in
+        # the fit. Warm it here so the subsequent /type/range + series stream
+        # are fast, and report a single-phase completion so the client's
+        # prefetch progress bar still advances.
+        if _is_ndfd() and model is not None:
+            try:
+                from weather_radar.lib import ndfd
+                ndfd._load_grid(model)  # download (writer) + parse + cache
+            except Exception:
+                pass
+            yield json.dumps({"phase": "gridpoints", "done": 1, "total": 1}) + "\n"
+            return
+
         for progress in area.iter_cache():
             yield json.dumps(progress) + "\n"
 
@@ -102,7 +161,7 @@ def ensemble(
     dtime = datetime_from_time(time)
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
-    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
+    ensemble_class = ENSEMBLE_KINDS().get(kind, AccumulationEnsemble)
     # Compute from the (NOAA-cached) gridpoint data. The interpolation itself
     # isn't cached server-side — the browser caches results (apiClient), and
     # the NOAA source data is kept warm by the writer/hotcache.
@@ -172,7 +231,7 @@ def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
     watched url, built in the background), its frames are served straight from
     disk — zero spline fit/eval — and only epochs the bundle lacks fall through
     to the live spline path. Same mechanism as /series/stream."""
-    from weather_radar.lib.aqi import fit_area, predict_area
+    from weather_radar.lib.aqi import fit_area, predict_area, grid_points
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
     epochs = _frame_times(start, end, dt, times)
@@ -180,13 +239,17 @@ def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
     def generate():
         if not epochs:
             return
-        # Bundle first (keyed by kind="aqi", model=pollutant).
+        # Bundle first (keyed by kind="aqi", model=pollutant). The bundle emits
+        # the grid header; the live path emits one only if the bundle didn't.
         remaining = list(epochs)
+        header_sent = False
         try:
             from weather_radar.server.bundle import serve_bundle_epochs
             covered = set()
             for line in serve_bundle_epochs(pollutant, lat, lon, width, height,
-                                            dt, "aqi", epochs, covered):
+                                            dt, "aqi", epochs, covered,
+                                            emit_header=True):
+                header_sent = True
                 yield line
             if covered:
                 remaining = [e for e in epochs if int(e) not in covered]
@@ -199,11 +262,18 @@ def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
         fit = fit_area(area, pollutant)
         if fit is None:
             return
-        for fr in predict_area(fit, remaining):
-            yield json.dumps({"time": fr["epoch"], "uom": "AQI",
-                              "coords": fr["coords"], "vals": fr["vals"]}) + "\n"
+        # GRID FORMAT: coords once, then values-only frames aligned to them.
+        if not header_sent:
+            yield json.dumps({"type": "grid", "uom": "AQI",
+                              "coords": grid_points(fit)},
+                             separators=(",", ":")) + "\n"
+        for fr in predict_area(fit, remaining, fixed_grid=True):
+            yield json.dumps({"time": fr["epoch"], "vals": fr["vals"]},
+                             separators=(",", ":")) + "\n"
 
-    return StreamingResponse(generate(), media_type="application/x-ndjson")
+    return StreamingResponse(_gzip_stream(generate()),
+                             media_type="application/x-ndjson",
+                             headers=_GZIP_NDJSON_HEADERS)
 
 
 
@@ -222,7 +292,7 @@ def ensemble_range(
     range. Fast once the area is cached (call /prefetch first)."""
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
-    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
+    ensemble_class = ENSEMBLE_KINDS().get(kind, AccumulationEnsemble)
     ensemble = ensemble_class(area, model)
     result = ensemble.value_range() or {
         "min": None, "max": None, "uom": None, "start": None, "end": None
@@ -250,7 +320,7 @@ def ensemble_stream(
     dtime = datetime_from_time(time)
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
-    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
+    ensemble_class = ENSEMBLE_KINDS().get(kind, AccumulationEnsemble)
 
     def generate():
         for feature in ensemble_class(area, model).iter_predict(dtime, verbose=True):
@@ -348,7 +418,7 @@ def ensemble_series_stream(
     epochs = _frame_times(start, end, dt, times)
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
-    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
+    ensemble_class = ENSEMBLE_KINDS().get(kind, AccumulationEnsemble)
     ensemble = ensemble_class(area, model)
 
     def generate():
@@ -363,12 +433,21 @@ def ensemble_series_stream(
         # previous version only short-circuited pure-sequence requests, so the
         # common case — a fill with a gap `times` batch — bypassed the bundle
         # and recomputed everything live. Serving by epoch fixes that.)
+        #
+        # GRID FORMAT: the stream emits exactly ONE grid header (coords sent
+        # once). The bundle path emits its header first when it serves anything;
+        # if it didn't (no bundle / nothing covered), the live path emits its
+        # own. `header_sent` tracks this so coords aren't double-sent — and the
+        # FE keys all subsequent values-only frames to that single header.
         remaining = list(epochs)
+        header_sent = False
         try:
             from weather_radar.server.bundle import serve_bundle_epochs
             covered = set()
             for line in serve_bundle_epochs(model, lat, lon, width, height,
-                                            dt, kind, epochs, covered):
+                                            dt, kind, epochs, covered,
+                                            emit_header=True):
+                header_sent = True  # first line from the bundle is the header
                 yield line
             if covered:
                 remaining = [e for e in epochs if int(e) not in covered]
@@ -383,58 +462,78 @@ def ensemble_series_stream(
         # without extra log config. Monotonic clock; negligible overhead. ---
         t_start = time.perf_counter()
 
-        # Resolve gridpoints + fit every spline ONCE for the whole sweep.
-        # Previously each frame called ensemble.predict(), which re-resolved
-        # the gridpoint set AND re-ran ensure() — re-opening/parsing all ~N
-        # gridpoint cache files from disk every frame (N files × M frames I/O).
-        # That per-frame redundancy, not the spline math, dominated the cost.
-        # Here we build the per-gridpoint models once, then each frame is just
-        # spline evaluations against already-fitted models.
-        try:
-            gridpoints = list(area.iter_gridpoints())
-        except Exception:
-            return
-        t_resolved = time.perf_counter()
-        # Warm all gridpoint data in one batched writer job before fitting.
-        try:
-            from weather_radar.lib.cachewriter import ensure as _ensure_cached
-            _ensure_cached([f"/gridpoints/{gp}" for gp in gridpoints])
-        except Exception:
-            pass
-        t_warmed = time.perf_counter()
-        # Fetch (and fit) each gridpoint's model once. ensemble[gp] returns the
-        # process-wide cached model, fitting it on first access. Skip any that
-        # fail to build so one bad cell doesn't abort the sweep.
-        #
-        # Track how many models were already fitted (hot in this worker's
-        # _MODEL_CACHE) vs. fit cold right now — the key signal for whether
-        # keeping splines hot would help. A model is "hot" if its `model`
-        # cached_property is already populated and not expired.
         n_hot = 0
         n_cold = 0
         models = []
-        for gp in gridpoints:
+
+        if _is_ndfd():
+            # NDFD source: no WFO gridpoint resolution, no /gridpoints warm.
+            # The ensemble fits the whole area's lattice points from the GRIB
+            # grid once (lazily on first access); iterate its wrapped points.
+            # The GRIB download itself is writer-owned inside ndfd.fit_area.
+            t_resolved = t_warmed = time.perf_counter()
             try:
-                m = ensemble[gp]
-                was_hot = ("model" in m.__dict__) and (not m.is_expired)
-                m.model  # force the spline fit now (cached_property)
-                if was_hot:
-                    n_hot += 1
-                else:
-                    n_cold += 1
-                models.append(m)
+                models = list(ensemble.iter_points())
             except Exception:
-                continue
-        t_fit = time.perf_counter()
+                logger.warning("NDFD fit failed", exc_info=True)
+                return
+            n_cold = len(models)
+            gridpoints = models  # for the timing log's gp count
+            t_fit = time.perf_counter()
+        else:
+            # Resolve gridpoints + fit every spline ONCE for the whole sweep.
+            # Previously each frame called ensemble.predict(), which re-resolved
+            # the gridpoint set AND re-ran ensure() — re-opening/parsing all ~N
+            # gridpoint cache files from disk every frame (N files × M frames I/O).
+            # That per-frame redundancy, not the spline math, dominated the cost.
+            # Here we build the per-gridpoint models once, then each frame is just
+            # spline evaluations against already-fitted models.
+            try:
+                gridpoints = list(area.iter_gridpoints())
+            except Exception:
+                return
+            t_resolved = time.perf_counter()
+            # Warm all gridpoint data in one batched writer job before fitting.
+            try:
+                from weather_radar.lib.cachewriter import ensure as _ensure_cached
+                _ensure_cached([f"/gridpoints/{gp}" for gp in gridpoints])
+            except Exception:
+                pass
+            t_warmed = time.perf_counter()
+            # Fetch (and fit) each gridpoint's model once. ensemble[gp] returns
+            # the process-wide cached model, fitting it on first access. Skip
+            # any that fail to build so one bad cell doesn't abort the sweep.
+            #
+            # Track how many models were already fitted (hot in this worker's
+            # _MODEL_CACHE) vs. fit cold right now — the key signal for whether
+            # keeping splines hot would help. A model is "hot" if its `model`
+            # cached_property is already populated and not expired.
+            for gp in gridpoints:
+                try:
+                    m = ensemble[gp]
+                    was_hot = ("model" in m.__dict__) and (not m.is_expired)
+                    m.model  # force the spline fit now (cached_property)
+                    if was_hot:
+                        n_hot += 1
+                    else:
+                        n_cold += 1
+                    models.append(m)
+                except Exception:
+                    continue
+            t_fit = time.perf_counter()
         if not models:
             return
 
         # Precompute each model's coordinate + units ONCE (identical across all
-        # frames). Coordinate order is preserved EXACTLY as the GeoJSON path
-        # emitted it — [center.lat, center.lon] — so the client reads coords the
-        # same way it always has; this is purely a wire-format slimming, not a
-        # semantic change.
-        coords = []   # [[c0, c1], ...] parallel to `models`
+        # frames). Wire coords are [lon, lat] (the client's normalizeFrame reads
+        # coords[0]=lon, coords[1]=lat; MapLibre's image-source corners need a
+        # valid latitude). `center` is an honest MapCoordinate (.lat = true
+        # latitude) for BOTH sources now, so [center.lon, center.lat] is correct.
+        # (Earlier this emitted [center.lat, center.lon], which relied on a
+        # swapped-axis center in the JSON path and was simply wrong for NDFD —
+        # it fed MapLibre an out-of-range latitude on heatmap layers, throwing
+        # "Invalid LngLat" and aborting the frame render.)
+        coords = []   # [[lon, lat], ...] parallel to `models` (the FIXED grid)
         uom = ""
         kept = []
         for m in models:
@@ -442,44 +541,55 @@ def ensemble_series_stream(
                 _st, _et, center, _f, units, _exp = m.model
             except Exception:
                 continue
-            coords.append([center.lat, center.lon])
+            coords.append([center.lon, center.lat])
             uom = uom or units
             kept.append(m)
         models = kept
         if not models:
             return
 
-        # Each frame is emitted as a SLIM record instead of a full GeoJSON
-        # FeatureCollection: per-frame `time` and `uom` once (not repeated on
-        # every point), and parallel `coords`/`vals` arrays instead of ~N nested
-        # Feature objects. This cuts payload size and client JSON.parse cost
-        # several-fold. Records are SELF-CONTAINED (coords included each frame)
-        # so the client can cache and render any frame independently; coords is
-        # just numbers, so even repeated it's far smaller than GeoJSON. `vals`
-        # is aligned to `coords`; null where a gridpoint is out of horizon.
+        # GRID WIRE FORMAT. The coordinate lattice is FIXED for an area, so it
+        # is sent ONCE as a header line and omitted from every frame:
+        #   {"type":"grid","uom":...,"coords":[[lon,lat],...]}   (first line)
+        #   {"time":epoch,"vals":[v0,v1,...]}                     (each frame)
+        # `vals` is aligned to the header's `coords` by INDEX and is always the
+        # same length; a point with no value THIS frame (out of horizon) is
+        # `null`. This removes the ~Nx coordinate repetition that dominated the
+        # payload on large areas (coords were ~86% of a multi-hundred-MB sweep).
+        # The client rehydrates each values-only frame against the header coords
+        # before caching, so the cache/render path stays self-contained.
+        #
+        # Skip the header here if the bundle path already sent one (single
+        # header per stream). Live coords == bundle coords (same ensemble point
+        # order for the area), so the one header covers both.
+        if not header_sent:
+            yield json.dumps({"type": "grid", "uom": uom, "coords": coords},
+                             separators=(",", ":")) + "\n"
+
         t_eval_start = time.perf_counter()
         t_first_frame = None
         frames_emitted = 0
         for epoch in remaining:
             t = datetime.fromtimestamp(epoch)
-            fcoords = []
             vals = []
             any_val = False
-            for m, c in zip(models, coords):
+            for m in models:
                 try:
                     y = m.predict(t, verbose=False)
                 except BoundsError:
-                    continue  # out of horizon this frame -> omit the point
-                except Exception:
+                    vals.append(None)   # out of horizon this frame -> null slot
                     continue
-                fcoords.append(c)
+                except Exception:
+                    vals.append(None)
+                    continue
                 vals.append(y)
                 any_val = True
             if any_val:
                 if t_first_frame is None:
                     t_first_frame = time.perf_counter()
                 frames_emitted += 1
-                yield json.dumps({"time": epoch, "uom": uom, "coords": fcoords, "vals": vals}) + "\n"
+                yield json.dumps({"time": epoch, "vals": vals},
+                                 separators=(",", ":")) + "\n"
 
         # --- One structured timing line per request. Durations in ms. ---
         #   resolve     : area.iter_gridpoints()
@@ -504,4 +614,6 @@ def ensemble_series_stream(
                 n_hot, n_cold,
             )
 
-    return StreamingResponse(generate(), media_type="application/x-ndjson")
+    return StreamingResponse(_gzip_stream(generate()),
+                             media_type="application/x-ndjson",
+                             headers=_GZIP_NDJSON_HEADERS)

@@ -104,6 +104,17 @@ def _aqi_grib_mtime(pollutant):
     return 0.0
 
 
+def _ndfd_grid_mtime(attribute):
+    """Freshness signal for an NDFD bundle: the newest mtime of the element
+    GRIB files backing `attribute`. A bundle is stale once a newer element
+    file is downloaded. Returns 0.0 if unknown."""
+    try:
+        from weather_radar.lib import ndfd
+        return ndfd.grid_mtime(attribute)
+    except Exception:
+        return 0.0
+
+
 def _build_bundle_aqi(model, lat, lon, width, height, dt, kind):
     """Produce (header, frame_iterator, path) for an AQI bundle — the frames
     come from the NAQFC per-gridpoint CubicSpline fit (aqi.fit_area), evaluated
@@ -133,6 +144,10 @@ def _build_bundle_aqi(model, lat, lon, width, height, dt, kind):
            "end": datetime.fromtimestamp(end).isoformat(), "timeZone": tz}
     header = {
         "type": "range", "range": rng,
+        # Grid header: fixed coords (once) + uom, so the AQI bundle header is
+        # also the stream grid header. Frames are values-only, index-aligned.
+        "uom": "AQI",
+        "coords": aqi_mod.grid_points(fit),
         "meta": {"model": model, "kind": kind, "lat": lat, "lon": lon,
                  "width": width, "height": height, "dt": int(dt),
                  "source_mtime": _aqi_grib_mtime(model),
@@ -142,9 +157,8 @@ def _build_bundle_aqi(model, lat, lon, width, height, dt, kind):
     epochs = list(range(start, end + 1, step))
 
     def frames():
-        for fr in aqi_mod.predict_area(fit, epochs):
-            yield {"time": fr["epoch"], "uom": "AQI",
-                   "coords": fr["coords"], "vals": fr["vals"]}
+        for fr in aqi_mod.predict_area(fit, epochs, fixed_grid=True):
+            yield {"time": fr["epoch"], "vals": fr["vals"]}
 
     return header, frames()
 
@@ -200,16 +214,23 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
                        model, int(width), int(height), int(dt), n)
         return path
 
-    # --- NOAA ensemble path ---
+    # --- NOAA / NDFD ensemble path ---
+    # Both sources expose the same ensemble contract (value_range + per-point
+    # models with a `(start,end,center,f,units,expiry)` tuple), so the bundle
+    # math below is shared. They differ only in how the per-point models are
+    # enumerated: NOAA resolves WFO gridpoints (area.iter_gridpoints), NDFD
+    # samples the area's lattice points from the GRIB grid (iter_points).
     from datetime import datetime
     from weather_radar.lib.area import MapCoordinate, CoordinateArea
     from weather_radar.lib.models.utils import BoundsError
     from weather_radar.server.api.models import ENSEMBLE_KINDS
+    from weather_radar.lib.models import weather_source
     from weather_radar.lib.models.accumulation import AccumulationEnsemble
 
+    is_ndfd = weather_source() == "ndfd"
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
-    ensemble_class = ENSEMBLE_KINDS.get(kind, AccumulationEnsemble)
+    ensemble_class = ENSEMBLE_KINDS().get(kind, AccumulationEnsemble)
     ensemble = ensemble_class(area, model)
 
     # Range (also yields the forecast window that anchors the frame grid).
@@ -231,29 +252,52 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
     if end <= start:
         return None
 
-    gridpoints = list(area.iter_gridpoints())
     models = []
     coords = []
     uom = ""
-    for gp in gridpoints:
+    if is_ndfd:
+        # NDFD: the ensemble fit the whole area already (value_range above);
+        # iterate its wrapped lattice-point models directly — no /points.
         try:
-            m = ensemble[gp]
-            _st, _et, center, _f, units, _exp = m.model
+            point_models = list(ensemble.iter_points())
         except Exception:
-            continue
-        models.append(m)
-        coords.append([center.lat, center.lon])
-        uom = uom or units
+            point_models = []
+        for m in point_models:
+            try:
+                _st, _et, center, _f, units, _exp = m.model
+            except Exception:
+                continue
+            models.append(m)
+            coords.append([center.lon, center.lat])  # [lon,lat]; see series_stream
+            uom = uom or units
+    else:
+        gridpoints = list(area.iter_gridpoints())
+        for gp in gridpoints:
+            try:
+                m = ensemble[gp]
+                _st, _et, center, _f, units, _exp = m.model
+            except Exception:
+                continue
+            models.append(m)
+            coords.append([center.lon, center.lat])  # [lon,lat]; see series_stream
+            uom = uom or units
     if not models:
         return None
 
     header = {
         "type": "range",
         "range": rng,
+        # Grid header fields: the FIXED coords lattice (sent once) + uom, so a
+        # bundle's header line is ALSO the stream's grid header. Frames below
+        # are values-only, aligned by index to these coords.
+        "uom": uom,
+        "coords": coords,
         "meta": {
             "model": model, "kind": kind,
             "lat": lat, "lon": lon, "width": width, "height": height,
-            "dt": int(dt), "source_mtime": _area_source_mtime(area),
+            "dt": int(dt),
+            "source_mtime": (_ndfd_grid_mtime(model)
+                             if is_ndfd else _area_source_mtime(area)),
             "built": datetime.now().isoformat(),
         },
     }
@@ -263,19 +307,21 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
         n = 0
         while t <= end + 1 and n < MAX_FRAMES:
             dtime = datetime.fromtimestamp(t)
-            fcoords = []
             vals = []
-            for m, c in zip(models, coords):
+            any_val = False
+            for m in models:
                 try:
                     y = m.predict(dtime, verbose=False)
                 except BoundsError:
+                    vals.append(None)   # fixed-length: null where out of horizon
                     continue
                 except Exception:
+                    vals.append(None)
                     continue
-                fcoords.append(c)
                 vals.append(y)
-            if vals:
-                yield {"time": t, "uom": uom, "coords": fcoords, "vals": vals}
+                any_val = True
+            if any_val:
+                yield {"time": t, "vals": vals}
             t += step
             n += 1
 
@@ -320,20 +366,23 @@ def read_bundle_range(model, lat, lon, width, height, dt, kind):
     return header.get("range")
 
 
-def serve_bundle_epochs(model, lat, lon, width, height, dt, kind, epochs, covered):
+def serve_bundle_epochs(model, lat, lon, width, height, dt, kind, epochs,
+                        covered, emit_header=False):
     """Yield the bundle's frame lines for exactly the requested `epochs` (an
-    iterable of int epochs), skipping the range header. Each epoch actually
-    found is added to the `covered` set (so the caller can live-compute only
-    the remainder). Yields nothing if no bundle exists for these params.
+    iterable of int epochs). Each epoch found is added to `covered`. Yields
+    nothing if no bundle exists for these params.
 
-    This serves BOTH the sequence and the batch of a /series/stream request —
-    the bundle has the whole window, so a watched url is satisfied almost
-    entirely from disk; only epochs the bundle happens to lack fall through to
-    live compute. Lines are newline-terminated and byte-compatible with
-    live-computed frames.
+    GRID FORMAT: when `emit_header=True`, the FIRST yielded line is the grid
+    header {"type":"grid","uom",...,"coords":[...]} reconstructed from the
+    bundle's stored header (so the stream's values-only frames can be keyed to
+    it by the client). Frames themselves are the stored values-only
+    {"time","vals"} lines, filtered to the wanted epochs. The header is emitted
+    only if the bundle exists AND at least one line will follow — we emit it
+    lazily, right before the first matching frame, so a totally-missed request
+    yields nothing (letting the live path emit its own header).
 
-    CHEAP + bounded memory: decompresses line-by-line; never loads the whole
-    bundle; NO gridpoint resolution.
+    This serves BOTH the sequence and the batch of a /series/stream request.
+    CHEAP + bounded memory: decompresses line-by-line; NO gridpoint resolution.
     """
     path = _bundle_path(model, lat, lon, width, height, dt, kind)
     if not os.path.exists(path):
@@ -343,14 +392,23 @@ def serve_bundle_epochs(model, lat, lon, width, height, dt, kind, epochs, covere
         return
     with gzip.open(path, "rt", encoding="utf-8") as f:
         first = True
+        grid_header_line = None
         for line in f:
             if not line.strip():
                 continue
             if first:
                 first = False
+                # The bundle's header line carries uom + coords. Convert it to
+                # a grid header line to emit lazily before the first frame.
                 try:
-                    if json.loads(line).get("type") == "range":
-                        continue  # skip header
+                    hdr = json.loads(line)
+                    if hdr.get("type") == "range":
+                        grid_header_line = json.dumps(
+                            {"type": "grid",
+                             "uom": hdr.get("uom", ""),
+                             "coords": hdr.get("coords", [])},
+                            separators=(",", ":")) + "\n"
+                        continue  # don't emit the range header as a frame
                 except Exception:
                     pass
             try:
@@ -359,6 +417,9 @@ def serve_bundle_epochs(model, lat, lon, width, height, dt, kind, epochs, covere
                 continue
             if t in wanted:
                 covered.add(t)
+                if emit_header and grid_header_line is not None:
+                    yield grid_header_line
+                    grid_header_line = None  # once
                 yield line if line.endswith("\n") else line + "\n"
 
 
@@ -435,6 +496,11 @@ def _bundle_is_fresh(model, lat, lon, width, height, dt, kind):
         if kind == "aqi":
             # AQI source = the NAQFC GRIB; stale once a newer cycle downloaded.
             return _aqi_grib_mtime(model) <= built + 1e-6
+        from weather_radar.lib.models import weather_source
+        if weather_source() == "ndfd":
+            # NDFD source = the element GRIB files; stale once a newer file is
+            # downloaded. No data resolution needed (just a stat).
+            return _ndfd_grid_mtime(model) <= built + 1e-6
         from weather_radar.lib.area import MapCoordinate, CoordinateArea
         area = CoordinateArea(MapCoordinate(lat, lon), width, height)
         return _area_source_mtime(area) <= built + 1e-6

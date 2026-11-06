@@ -90,8 +90,11 @@ class AccumulationModel:
         polygon, = data["geometry"]["coordinates"]
         polygon = set(tuple(x) for x in polygon)
         polygon = list(zip(*polygon))
-        center_coordinate = [sum(item) / len(item) for item in polygon]
-        center_coordinate = MapCoordinate(*center_coordinate)
+        # [mean_lon, mean_lat]; build the center with correct axes (see the
+        # matching note in ObservationModel.model — this fixes the old
+        # swapped-axis construction).
+        means = [sum(item) / len(item) for item in polygon]
+        center_coordinate = MapCoordinate(lat=means[1], lon=means[0])
         data = data["properties"][to_camel_case(self.attribute)]
         # Some layers omit `uom` (dimensionless); default to no unit.
         uom = data.get("uom", "")
@@ -147,7 +150,8 @@ class AccumulationModel:
                 },
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [center_coordinate.lat, center_coordinate.lon]
+                    # [lon, lat] (GeoJSON; normalizeFrame reads coordinates[0]=lon).
+                    "coordinates": [center_coordinate.lon, center_coordinate.lat]
                 }
             }
         return y

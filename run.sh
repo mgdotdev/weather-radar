@@ -19,6 +19,11 @@ container() {
       -e WR_STREAM_TIMING \
       -e WR_RESOLVE_TIMING \
       -e NOAA_MAX_CONCURRENCY \
+      -e WR_WEATHER_SOURCE \
+      -e NDFD_SECTOR \
+      -e NDFD_TTL_SECONDS \
+      -e NDFD_MISS_TTL_SECONDS \
+      -e NAQFC_RECHECK_SECONDS \
       "$IMAGE" bash
 }
 
@@ -39,6 +44,11 @@ server() {
           -e WR_STREAM_TIMING \
           -e WR_RESOLVE_TIMING \
           -e NOAA_MAX_CONCURRENCY \
+          -e WR_WEATHER_SOURCE \
+          -e NDFD_SECTOR \
+          -e NDFD_TTL_SECONDS \
+          -e NDFD_MISS_TTL_SECONDS \
+          -e NAQFC_RECHECK_SECONDS \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh server $workers"
     else
         local py="$VENV_PY"
@@ -67,6 +77,11 @@ dev() {
           -e WR_STREAM_TIMING \
           -e WR_RESOLVE_TIMING \
           -e NOAA_MAX_CONCURRENCY \
+          -e WR_WEATHER_SOURCE \
+          -e NDFD_SECTOR \
+          -e NDFD_TTL_SECONDS \
+          -e NDFD_MISS_TTL_SECONDS \
+          -e NAQFC_RECHECK_SECONDS \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh dev"
     else
         local py="$VENV_PY"
