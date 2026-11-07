@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in — Weather Radar</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      display: flex; align-items: center; justify-content: center;
+      font-family: -apple-system, system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 50% -10%, #1e2a44 0%, #0f1526 55%, #0b0f1c 100%);
+      color: #e8ecf5; padding: 24px;
+    }
+    .card {
+      max-width: 420px; width: 100%;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 18px; padding: 30px 26px;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.45);
+      -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+    }
+    h1 { font-size: 20px; margin: 0 0 4px; font-weight: 700; text-align: center; }
+    .sub { color: #aab3c7; font-size: 13px; text-align: center; margin-bottom: 20px; }
+    label { display: block; font-size: 12px; color: #9aa4ba; margin: 0 0 5px; }
+    input[type=password], input[type=text] {
+      width: 100%; padding: 11px 12px; border-radius: 10px; font-size: 15px;
+      border: 1px solid rgba(255,255,255,0.18); background: rgba(0,0,0,0.25);
+      color: #fff; outline: none;
+    }
+    input::placeholder { color: #6b7488; }
+    button {
+      width: 100%; margin-top: 14px; padding: 11px; border: none; cursor: pointer;
+      border-radius: 10px; font-size: 15px; font-weight: 700;
+      background: #3b6fe0; color: #fff;
+    }
+    .divider { display: flex; align-items: center; gap: 10px; margin: 20px 0;
+      color: #6b7488; font-size: 12px; }
+    .divider::before, .divider::after { content: ""; flex: 1; height: 1px;
+      background: rgba(255,255,255,0.12); }
+    .err { color: #ff9b9b; font-size: 13px; margin-top: 12px; text-align: center;
+      min-height: 1em; }
+    .hint { color: #7b8498; font-size: 12px; text-align: center; margin-top: 14px; }
+    .hint a { color: #8aa4ff; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Weather Radar</h1>
+    <div class="sub">Sign in to continue</div>
+
+    <div id="pwBlock">
+      <label for="pw">Admin password</label>
+      <input id="pw" type="password" autocomplete="current-password" placeholder="password" />
+      <button id="pwBtn">Sign in</button>
+    </div>
+
+    <div class="divider">or</div>
+
+    <div>
+      <label for="tok">Access token</label>
+      <input id="tok" type="text" autocomplete="off" placeholder="paste a token" />
+      <button id="tokBtn">Use token</button>
+    </div>
+
+    <div id="err" class="err"></div>
+    <div class="hint">Need a token? <a href="/admin/tokens">Manage access tokens</a></div>
+  </div>
+
+  <script>
+    // Validate `next` is a SAFE same-origin relative path (no open-redirect:
+    // must start with a single "/", not "//" or a scheme). Default to the map.
+    function safeNext() {
+      const raw = new URL(window.location.href).searchParams.get("next") || "";
+      try {
+        const dec = decodeURIComponent(raw);
+        if (dec.startsWith("/") && !dec.startsWith("//")) return dec;
+      } catch (_) {}
+      return "/map/models/temperature/";
+    }
+    const NEXT = safeNext();
+    const errEl = document.getElementById("err");
+
+    function doRedirect(token) {
+      const u = new URL(NEXT, window.location.origin);
+      // Append the access token when we have one (app pages need it in the
+      // URL for the cross-origin iframe case). Admin pages (/admin*) ride the
+      // admin SESSION cookie instead, so no token is appended/needed there.
+      if (token && !u.pathname.startsWith("/admin")) {
+        u.searchParams.set("token", token);
+      }
+      window.location.replace(u.toString());
+    }
+
+    async function submit(body) {
+      errEl.textContent = "";
+      let res, data;
+      try {
+        res = await fetch("/api/auth/login-token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        data = await res.json();
+      } catch (_) {
+        errEl.textContent = "Network error. Try again.";
+        return;
+      }
+      if (res.ok && data && data.ok) {
+        const goingAdmin = NEXT.startsWith("/admin");
+        if (data.token || goingAdmin) {
+          doRedirect(data.token);
+        } else {
+          // Authenticated but no access token exists yet and we're heading to
+          // an app page that needs one. Point the operator at token creation.
+          errEl.innerHTML = 'No access tokens exist yet. '
+            + '<a href="/admin/tokens" style="color:#8aa4ff;">Create one</a>.';
+        }
+      } else {
+        errEl.textContent = (data && data.detail) || "Sign in failed.";
+      }
+    }
+
+    document.getElementById("pwBtn").addEventListener("click", () => {
+      submit({ password: document.getElementById("pw").value });
+    });
+    document.getElementById("pw").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("pwBtn").click();
+    });
+    document.getElementById("tokBtn").addEventListener("click", () => {
+      submit({ token: document.getElementById("tok").value.trim() });
+    });
+    document.getElementById("tok").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("tokBtn").click();
+    });
+
+    // If no admin password is configured, hide the password block (token-only).
+    fetch("/api/auth/status").then(r => r.json()).then(s => {
+      if (s && s.password_configured === false) {
+        document.getElementById("pwBlock").style.display = "none";
+        document.querySelector(".divider").style.display = "none";
+      }
+    }).catch(() => {});
+
+    document.getElementById("pw").focus();
+  </script>
+</body>
+</html>

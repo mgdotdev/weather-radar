@@ -52,16 +52,16 @@
 </head>
 <body>
   <div class="wrap">
+    <nav aria-label="Breadcrumb" style="font-size:13px; margin-bottom:10px; color:#9aa1ad;">
+      <a href="/admin" style="color:#1565c0; text-decoration:none;">Admin</a>
+      <span style="margin:0 6px;">/</span>
+      <span>Hot cache</span>
+    </nav>
     <h1>Hot-cache admin</h1>
     <div class="sub">
       Designate app URLs to keep "hot". The scheduler refreshes their NOAA data
       just before it expires, so navigating to a watched URL finds everything
       already cached and current.
-    </div>
-
-    <div class="card">
-      <label for="token">Admin token <span class="hint">(only needed if the server sets <code>ADMIN_TOKEN</code>)</span></label>
-      <input type="text" id="token" placeholder="leave blank on localhost" autocomplete="off" />
     </div>
 
     <div class="card">
@@ -97,7 +97,7 @@
 
   <script>
     const $ = (id) => document.getElementById(id)
-    const tokenEl = $("token"), urlEl = $("url"), msgEl = $("msg"),
+    const urlEl = $("url"), msgEl = $("msg"),
           rowsEl = $("rows"), statsEl = $("stats")
 
     // Previews are static canvas images (OSM raster tiles with the area drawn
@@ -106,16 +106,11 @@
     // tear down between renders now, but keep a no-op for call sites.
     function destroyPreviews() {}
 
-    // Persist the token locally so it survives reloads (convenience only).
-    tokenEl.value = localStorage.getItem("wr_admin_token") || ""
-    tokenEl.addEventListener("change", () =>
-      localStorage.setItem("wr_admin_token", tokenEl.value.trim()))
-
+    // Admin API auth is the shared admin SESSION cookie (set by the password
+    // login); it's same-origin, so the browser sends it automatically — no
+    // token header needed here.
     function headers() {
-      const h = { "Content-Type": "application/json" }
-      const t = tokenEl.value.trim()
-      if (t) h["X-Admin-Token"] = t
-      return h
+      return { "Content-Type": "application/json" }
     }
 
     function setMsg(text, kind) {
@@ -132,6 +127,13 @@
         opts.body = JSON.stringify(body)
       }
       const resp = await fetch(url, opts)
+      // Admin session missing/expired -> close the live stream and go to login
+      // (don't let anything keep retrying against a 401).
+      if (resp.status === 401 || resp.status === 403) {
+        try { if (evtSource) { evtSource.close(); evtSource = null } } catch (_) {}
+        window.location.href = "/login?next=" + encodeURIComponent("/admin/hotcache")
+        throw new Error("admin session expired")
+      }
       let data = null
       try { data = await resp.json() } catch (_) {}
       if (!resp.ok) {
@@ -371,9 +373,39 @@
     $("refreshBtn").addEventListener("click", refresh)
     urlEl.addEventListener("keydown", (e) => { if (e.key === "Enter") add() })
 
-    refresh()
-    // Auto-refresh so warming progress updates live.
-    setInterval(refresh, 3000)
+    // --- Live updates via SSE (push, not polling) --------------------------
+    // One long-lived EventSource; the server pushes the watch-list only when
+    // it changes. The admin session cookie authorizes it (same-origin). On a
+    // connection error we close and probe auth with a single REST refresh()
+    // (which redirects to /login on 401) — avoiding EventSource's built-in
+    // reconnect hammering a 401 forever. A transient drop reconnects.
+    let evtSource = null;
+    let sseReconnectTimer = null;
+
+    function openStream() {
+      try { if (evtSource) evtSource.close(); } catch (_) {}
+      evtSource = new EventSource("/api/admin/hotcache/stream");
+      evtSource.addEventListener("watchlist", (e) => {
+        try { render(JSON.parse(e.data)); setMsg(""); } catch (_) {}
+      });
+      evtSource.onerror = () => {
+        // Close this connection; decide whether to reconnect or bail to login.
+        try { evtSource.close(); } catch (_) {}
+        evtSource = null;
+        if (sseReconnectTimer) return;
+        // Probe auth + get a fresh snapshot once. api() redirects on 401/403.
+        refresh().then(() => {
+          // Still authed (transient drop) -> reopen the stream shortly.
+          sseReconnectTimer = setTimeout(() => {
+            sseReconnectTimer = null;
+            openStream();
+          }, 3000);
+        }).catch(() => { /* api() already handled auth failure / showed error */ });
+      };
+    }
+
+    // Initial snapshot (also catches a 401 immediately), then open the stream.
+    refresh().then(openStream).catch(() => {});
   </script>
 </body>
 </html>

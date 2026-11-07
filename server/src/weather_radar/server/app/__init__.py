@@ -1,9 +1,35 @@
 import os
 import json
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
+from urllib.parse import quote
+
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from jinja2 import Template
+
+from weather_radar.lib import auth as _auth
+
+
+def _admin_authed(request):
+    """True if the request carries a valid admin session, or (no admin
+    password configured) comes from localhost. No bypass once a password is
+    set — localhost included."""
+    session = request.cookies.get("wr_admin")
+    if session and _auth.verify_admin_session(session):
+        return True
+    if not _auth.admin_password_configured():
+        client = request.client.host if request.client else None
+        return _auth.is_localhost(client)
+    return False
+
+
+def _admin_login_redirect(request):
+    """Redirect an unauthenticated admin page to the login page, returning
+    afterward to the admin path."""
+    nxt = request.url.path
+    if request.url.query:
+        nxt += "?" + request.url.query
+    return RedirectResponse("/login?next=" + quote(nxt, safe=""), status_code=302)
 
 
 
@@ -12,6 +38,10 @@ MAP_HTML = os.path.join(HERE, "map.html")
 GRAPH_HTML = os.path.join(HERE, "graph.html")
 FORECAST_HTML = os.path.join(HERE, "forecast.html")
 ADMIN_HTML = os.path.join(HERE, "admin.html")
+ADMIN_INDEX_HTML = os.path.join(HERE, "admin_index.html")
+TOKENS_HTML = os.path.join(HERE, "tokens.html")
+NOT_AUTHORIZED_HTML = os.path.join(HERE, "not_authorized.html")
+LOGIN_HTML = os.path.join(HERE, "login.html")
 
 router = APIRouter()
 
@@ -322,11 +352,53 @@ def map(model: str, width: float, height: float, lat: float, lon: float, dt: int
 
 
 @router.get("/admin", response_class=HTMLResponse)
-def admin():
-    """Serve the hot-cache admin page. The page's API calls are themselves
-    access-controlled (localhost-only, or ADMIN_TOKEN); this just serves the
-    static UI."""
+def admin(request: Request):
+    """Admin index — GATED by the admin session (redirects to /login when not
+    authenticated; no localhost bypass once a password is set). Links to the
+    admin sub-pages (hot-cache, access tokens)."""
+    if not _admin_authed(request):
+        return _admin_login_redirect(request)
+    with open(ADMIN_INDEX_HTML) as f:
+        return HTMLResponse(f.read())
+
+
+@router.get("/admin/hotcache", response_class=HTMLResponse)
+def admin_hotcache(request: Request):
+    """Serve the hot-cache admin page — GATED by the admin session. Its API
+    calls (/api/admin/*) are independently authorized too."""
+    if not _admin_authed(request):
+        return _admin_login_redirect(request)
     with open(ADMIN_HTML) as f:
+        return HTMLResponse(f.read())
+
+
+@router.get("/admin/tokens", response_class=HTMLResponse)
+def admin_tokens(request: Request):
+    """Serve the access-token management page — GATED by the admin session
+    (redirects to /login when not authenticated). Its API calls (/api/auth/*)
+    are independently authorized too."""
+    if not _admin_authed(request):
+        return _admin_login_redirect(request)
+    with open(TOKENS_HTML) as f:
+        return HTMLResponse(f.read())
+
+
+@router.get("/not-authorized", response_class=HTMLResponse)
+def not_authorized():
+    """Friendly 'Not Authorized' page. The access-control middleware redirects
+    unauthenticated PAGE navigations here (API calls get a JSON 401 instead).
+    Served open (exempt from token auth) so it can actually display."""
+    with open(NOT_AUTHORIZED_HTML) as f:
+        return HTMLResponse(f.read(), status_code=401)
+
+
+@router.get("/login", response_class=HTMLResponse)
+def login_page():
+    """Login page. Unauthorized page navigations redirect here (with ?next=).
+    The user authenticates with the admin password OR by pasting an existing
+    token; the page then redirects back to `next` with the token appended.
+    Served open (exempt from token auth)."""
+    with open(LOGIN_HTML) as f:
         return f.read()
 
 

@@ -59,6 +59,20 @@ WATCHLIST_PATH = os.path.join(CACHE_ROOT, "weather-radar-hotcache-urls.json")
 
 # --- URL -> NOAA paths -------------------------------------------------------
 
+def normalize_watch_url(url):
+    """Strip auth/credential params (currently `token`) from a watched URL so
+    the persisted watch-list never stores a secret, and so two requests that
+    differ ONLY by their token resolve to the SAME watched url (a token param
+    must not fragment the cache/bundle keying). Other params are preserved and
+    their order kept stable."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    parts = urlsplit(url)
+    kept = [(k, v) for (k, v) in parse_qsl(parts.query, keep_blank_values=True)
+            if k != "token"]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(kept), parts.fragment))
+
+
 def paths_for_url(url):
     """Resolve an app URL to the set of NOAA API paths its cache depends on.
 
@@ -139,7 +153,9 @@ class _Scheduler:
     # ---- public (manager) API ----
     def watch(self, url):
         """Start keeping `url` hot. Resolves its paths, schedules each by
-        expiry, persists the watch-list, and wakes the loop."""
+        expiry, persists the watch-list, and wakes the loop. The url is
+        normalized (token stripped) so the watch-list stays token-agnostic."""
+        url = normalize_watch_url(url)
         try:
             paths = paths_for_url(url)
         except Exception as e:
@@ -156,6 +172,7 @@ class _Scheduler:
         return json.dumps({"ok": True, "paths": len(paths)})
 
     def unwatch(self, url):
+        url = normalize_watch_url(url)
         with self._cond:
             paths = self._url_paths.pop(url, None)
             existed = paths is not None

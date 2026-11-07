@@ -24,6 +24,11 @@ container() {
       -e NDFD_TTL_SECONDS \
       -e NDFD_MISS_TTL_SECONDS \
       -e NAQFC_RECHECK_SECONDS \
+      -e WR_AUTH_DIR \
+      -e WR_ADMIN_PASSWORD \
+      -e WR_ADMIN_PASSWORD_HASH \
+      -e WR_ADMIN_SECRET \
+      -e WR_ADMIN_SESSION_TTL \
       "$IMAGE" bash
 }
 
@@ -49,6 +54,11 @@ server() {
           -e NDFD_TTL_SECONDS \
           -e NDFD_MISS_TTL_SECONDS \
           -e NAQFC_RECHECK_SECONDS \
+          -e WR_AUTH_DIR \
+          -e WR_ADMIN_PASSWORD \
+          -e WR_ADMIN_PASSWORD_HASH \
+          -e WR_ADMIN_SECRET \
+          -e WR_ADMIN_SESSION_TTL \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh server $workers"
     else
         local py="$VENV_PY"
@@ -82,6 +92,11 @@ dev() {
           -e NDFD_TTL_SECONDS \
           -e NDFD_MISS_TTL_SECONDS \
           -e NAQFC_RECHECK_SECONDS \
+          -e WR_AUTH_DIR \
+          -e WR_ADMIN_PASSWORD \
+          -e WR_ADMIN_PASSWORD_HASH \
+          -e WR_ADMIN_SECRET \
+          -e WR_ADMIN_SESSION_TTL \
           "$IMAGE" bash -c "cd $CODE_DIR && ./run.sh dev"
     else
         local py="$VENV_PY"
@@ -97,7 +112,30 @@ dev() {
     fi
 }
 
-# Internal: run pytest against the source tree using the venv interpreter
+# Generate a WR_ADMIN_PASSWORD_HASH for the admin page. Prompts (hidden) for a
+# password and prints the 'scrypt$salt$hash' string to set as the env var, so
+# the plaintext password never needs to live in your compose/env file.
+#   ./run.sh hash_password
+hash_password() {
+    local py="$VENV_PY"
+    command -v "$py" >/dev/null 2>&1 || py="python"
+    PYTHONPATH="$PWD/lib/src${PYTHONPATH:+:$PYTHONPATH}" "$py" - <<'PY'
+import getpass
+from weather_radar.lib import auth
+p1 = getpass.getpass("Admin password: ")
+p2 = getpass.getpass("Confirm: ")
+if p1 != p2:
+    raise SystemExit("passwords do not match")
+if not p1:
+    raise SystemExit("empty password")
+h = auth.hash_password(p1)
+print("\nSet this in your environment (the value uses '.' delimiters, so it is")
+print("safe to paste unquoted in a shell or docker-compose file):\n")
+print("WR_ADMIN_PASSWORD_HASH=" + h)
+PY
+}
+
+
 # (which has requests/scipy/etc. installed). PYTHONPATH points at both `src`
 # roots so the `weather_radar` PEP 420 namespace package — split across
 # lib/src and server/src — resolves regardless of the editable install.

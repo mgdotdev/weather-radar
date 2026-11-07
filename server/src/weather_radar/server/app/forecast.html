@@ -55,6 +55,27 @@
   </div>
 
   <script>
+    // Forward ?token=… to same-origin API requests (credentialed/iframe
+    // access; see map.html). No-op when no token is present.
+    (function () {
+      const WR_TOKEN = new URL(window.location.href).searchParams.get("token");
+      if (!WR_TOKEN) return;
+      const _fetch = window.fetch;
+      window.fetch = function (input, init) {
+        try {
+          let url = (typeof input === "string") ? input : (input && input.url);
+          if (url) {
+            const u = new URL(url, window.location.origin);
+            if (u.origin === window.location.origin && !u.searchParams.has("token")) {
+              u.searchParams.set("token", WR_TOKEN);
+              input = (typeof input === "string") ? u.toString() : new Request(u.toString(), input);
+            }
+          }
+        } catch (_) {}
+        return _fetch.call(this, input, init);
+      };
+    })();
+
     const LAT = {{starting_latitude}};
     const LON = {{starting_longitude}};
     const KIND = "{{kind}}";

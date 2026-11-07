@@ -113,6 +113,8 @@ def server():
 
     server = FastAPI()
 
+    _install_access_control(server)
+
     @server.on_event("startup")
     def _startup():
         # Each uvicorn worker runs this; the file lock ensures exactly one
@@ -125,10 +127,89 @@ def server():
             from .bundle import start_builder
             start_builder()
 
+    @server.get("/health")
+    def _health():
+        return {"ok": True}
+
     server.include_router(api.router)
     server.include_router(app.router)
 
     return server
+
+
+def _install_access_control(server):
+    """Gate every route behind an access token WHEN tokens are configured.
+
+    A request is allowed if it presents a valid token via `?token=`, the
+    `X-Access-Token` header, or the `wr_token` cookie (best-effort — iOS
+    WebKit ITP often blocks cross-origin iframe cookies, so the token also
+    rides the URL and is threaded into client API calls). When NO access
+    tokens are configured the app is open (dev default); localhost is also
+    always allowed so a local dev run is never locked out.
+
+    EXEMPT paths (never token-gated): /health, and the admin surface
+    (/admin, /api/admin/... and the admin login/token endpoints), which carry
+    their OWN password-based auth. This lets an operator reach the admin page
+    to mint the first token without already having one.
+    """
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, RedirectResponse
+    from weather_radar.lib import auth
+
+    EXEMPT_PREFIXES = ("/health", "/admin", "/api/admin", "/api/auth",
+                       "/not-authorized", "/login")
+
+    @server.middleware("http")
+    async def _access_control(request: Request, call_next):
+        path = request.url.path
+        if _path_exempt(path, EXEMPT_PREFIXES):
+            return await call_next(request)
+
+        # Open ONLY when no tokens are configured (fresh/dev install). Once a
+        # token exists, EVERY request must present one — no localhost bypass.
+        if not auth.access_tokens_configured():
+            return await call_next(request)
+
+        supplied = (request.query_params.get("token")
+                    or request.headers.get("X-Access-Token")
+                    or request.cookies.get("wr_token"))
+        if auth.verify_access_token(supplied):
+            response = await call_next(request)
+            # Best-effort cookie so same-origin navigations don't need the
+            # token re-appended (ignored by ITP in cross-origin iframes, which
+            # is why the token also threads through the URL/API calls).
+            try:
+                response.set_cookie("wr_token", supplied, max_age=7 * 24 * 3600,
+                                    httponly=True, secure=True, samesite="none")
+            except Exception:
+                pass
+            return response
+
+        # Unauthorized. API / XHR callers get a JSON 401. For a top-level PAGE
+        # navigation:
+        #   * NO token supplied        -> /login (prompt to authenticate)
+        #   * token supplied but WRONG -> /not-authorized (dead-end; a bad/
+        #     rotated/revoked token shouldn't re-loop through login, and an
+        #     iframe with a stale token gets the clean message)
+        accept = request.headers.get("accept", "")
+        is_page = (not path.startswith("/api")) and ("text/html" in accept)
+        if is_page:
+            if supplied:
+                return RedirectResponse("/not-authorized", status_code=302)
+            from urllib.parse import quote
+            nxt = request.url.path
+            if request.url.query:
+                nxt += "?" + request.url.query
+            return RedirectResponse("/login?next=" + quote(nxt, safe=""),
+                                    status_code=302)
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
+def _path_exempt(path, prefixes):
+    for p in prefixes:
+        if path == p or path.startswith(p + "/"):
+            return True
+    return False
 
 
 def main():

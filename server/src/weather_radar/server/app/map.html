@@ -147,6 +147,7 @@
       <div id="ctxDropPinAddr" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Drop pin by address…</div>
       <div id="ctxSeeGraph" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">See graph</div>
       <div id="ctxForecast" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">7-day forecast</div>
+      <div id="ctxHotCache" style="padding: 8px 12px; cursor: pointer; border-top: 1px solid #eee;">Add to Hot Cache</div>
       <div id="ctxCoords" style="padding: 6px 12px; font-size: 11px;
         color: #666; border-top: 1px solid #eee;"></div>
     </div>
@@ -215,6 +216,35 @@
     </div>
   </body>
   <script>
+    // ---- Access-token forwarding (credentialed/iframe access) --------------
+    // When the page is loaded with ?token=… (e.g. embedded as a Home Assistant
+    // iframe), the app's own API/navigation requests must carry it too — a
+    // cross-origin iframe on iOS WebKit can't rely on the auth cookie (ITP
+    // blocks it). We capture the token once and patch fetch() to append it to
+    // same-origin requests that don't already specify one. A no-op when no
+    // token is present (open/dev deployments).
+    (function () {
+      const WR_TOKEN = new URL(window.location.href).searchParams.get("token");
+      if (!WR_TOKEN) return;
+      const _fetch = window.fetch;
+      window.fetch = function (input, init) {
+        try {
+          let url = (typeof input === "string") ? input : (input && input.url);
+          if (url) {
+            const u = new URL(url, window.location.origin);
+            if (u.origin === window.location.origin && !u.searchParams.has("token")) {
+              u.searchParams.set("token", WR_TOKEN);
+              if (typeof input === "string") input = u.toString();
+              else input = new Request(u.toString(), input);
+            }
+          }
+        } catch (_) {}
+        return _fetch.call(this, input, init);
+      };
+      // Expose for any code that builds URLs for window.open / new tabs.
+      window.WR_TOKEN = WR_TOKEN;
+    })();
+
     // ---- Config (from the server) ------------------------------------------
     const model = {{weather_model}}
     const kind = "{{kind}}"
@@ -1494,6 +1524,7 @@
         u.searchParams.set("models", models)
         u.searchParams.set("lat", glat.toFixed(6))
         u.searchParams.set("lon", glon.toFixed(6))
+        if (window.WR_TOKEN) u.searchParams.set("token", window.WR_TOKEN)
         window.open(u.toString(), "_blank")
       }
       document.getElementById("ctxSeeGraph").addEventListener("click", () => {
@@ -1510,12 +1541,53 @@
         u.searchParams.set("lat", glat.toFixed(6))
         u.searchParams.set("lon", glon.toFixed(6))
         if (name) u.searchParams.set("name", name)
+        if (window.WR_TOKEN) u.searchParams.set("token", window.WR_TOKEN)
         window.open(u.toString(), "_blank")
       }
       document.getElementById("ctxForecast").addEventListener("click", () => {
         if (!menuLngLat) return
         openForecastAt(menuLngLat.lat, menuLngLat.lng)
         hideMenu()
+      })
+      // "Add to Hot Cache": register the CURRENT VIEW's map URL with the
+      // hot-cache so its NOAA data is kept warm. Uses the current page URL
+      // (the loaded area/model/dt), with the token stripped (the server also
+      // strips it; the watch-list is token-agnostic). Requires an admin
+      // session — a 401 means "sign in first".
+      document.getElementById("ctxHotCache").addEventListener("click", async () => {
+        hideMenu()
+        const u = new URL(window.location.href)
+        u.searchParams.delete("token")
+        // Only the area/model/dt matter to the hot-cache; drop view-only params.
+        for (const k of ["zoom", "speed", "step", "from", "to", "t", "pins", "pinSize"]) {
+          u.searchParams.delete(k)
+        }
+        const watchUrl = u.pathname + (u.search || "")
+        let resp
+        try {
+          resp = await fetch("/api/admin/hotcache", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: watchUrl }),
+          })
+        } catch (_) {
+          window.alert("Could not reach the server to add this view to the hot cache.")
+          return
+        }
+        if (resp.status === 401 || resp.status === 403) {
+          if (window.confirm("Admin sign-in is required to add to the hot cache. Go to the sign-in page?")) {
+            window.location.href = "/login?next=" + encodeURIComponent("/admin/hotcache")
+          }
+          return
+        }
+        let data = null
+        try { data = await resp.json() } catch (_) {}
+        if (resp.ok && data && (data.ok || data.paths !== undefined)) {
+          window.alert("Added the current view to the hot cache"
+            + (data.paths !== undefined ? ` (tracking ${data.paths} NOAA path(s)).` : "."))
+        } else {
+          window.alert("Failed to add to hot cache: " + ((data && data.detail) || resp.statusText))
+        }
       })
 
       // "Draw observed area": enter a drag-to-draw mode. The user drags a
@@ -2539,17 +2611,24 @@
         const u = new URL(window.location.href)
         u.searchParams.set("dt", String(dt))
         history.replaceState(null, "", u.toString())
-        // The frame grid changed; recompute the cache fill for the new dt's
-        // times (cached instants that overlap are reused via the shared
-        // dt-independent key — this is exactly the batch+sequence case).
+        // The frame grid changed; recompute the cache fill AND reload the
+        // displayed frame for the new dt's grid.
         //
-        // DEBOUNCED: rapid +/- presses would otherwise each kick off a
-        // fillCache — building the (potentially large) uncached inventory and
-        // firing a stream — making the buttons feel laggy. The label and URL
-        // above update instantly on every press; only the last dt (after a
-        // short quiet period) triggers the actual fill.
+        // DEBOUNCED: rapid +/- presses would otherwise each kick off a fetch
+        // (fillCache builds the uncached inventory and fires a stream; the
+        // frame reload may hit the network) — making the buttons feel laggy and
+        // spamming requests. The label and URL above update instantly on every
+        // press; only the LAST dt (after a short quiet period) triggers the
+        // actual fetch work.
         if (setDt._fillTimer) clearTimeout(setDt._fillTimer)
-        setDt._fillTimer = setTimeout(() => { setDt._fillTimer = null; fillCache() }, 200)
+        setDt._fillTimer = setTimeout(() => {
+          setDt._fillTimer = null
+          fillCache()
+          // Snap the playhead onto the new grid and refresh the shown frame.
+          if (typeof loadFrame === "function" && time !== undefined) {
+            loadFrame(snapToGrid(time))
+          }
+        }, 400)
       }
       function stepDt(dir) {
         // Move to the neighboring preset (dir = +1 bigger, -1 smaller).
