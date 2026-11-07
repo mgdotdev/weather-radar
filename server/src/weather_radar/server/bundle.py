@@ -92,13 +92,15 @@ def _area_source_mtime(area):
 def _aqi_grib_mtime(pollutant):
     """Freshness signal for an AQI bundle: the mtime of the NAQFC GRIB the
     bundle was built from. A bundle is stale once a newer GRIB is downloaded
-    (new cycle). Returns 0.0 if unknown."""
+    (new cycle). Returns 0.0 if unknown. NowCast variants ("pm25-nowcast")
+    share the base pollutant's current grid, so key on the base."""
     try:
         from weather_radar.lib import aqi
         import os as _os
+        base, _nowcast = aqi._parse_pollutant(pollutant)
         # The current grid path for this pollutant (set when ensure_grid ran).
         with aqi._CURRENT_PATH_LOCK:
-            path = aqi._CURRENT_PATH.get(pollutant)
+            path = aqi._CURRENT_PATH.get(base)
         if path and _os.path.exists(path):
             return _os.path.getmtime(path)
     except Exception:

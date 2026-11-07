@@ -206,6 +206,12 @@ MODEL_CATALOG = {
     # client to the AQI data path instead of the NOAA ensemble path.
     "air-quality-pm25": (_AQI, "Air Quality (PM2.5)", "pm25"),
     "air-quality-ozone": (_AQI, "Air Quality (Ozone)", "ozone"),
+    # NowCast variants: the EPA-weighted trailing-hour average consumer apps
+    # (AirNow, Apple Weather) report, instead of the raw instantaneous hourly
+    # value. Same NAQFC field + /aqi endpoints; the "-nowcast" attribute tells
+    # the AQI fit to apply the NowCast aggregation (see lib/aqi.fit_area).
+    "air-quality-pm25-nowcast": (_AQI, "Air Quality (PM2.5, NowCast)", "pm25-nowcast"),
+    "air-quality-ozone-nowcast": (_AQI, "Air Quality (Ozone, NowCast)", "ozone-nowcast"),
 }
 
 # Optional bespoke styling per model (seed step + ramp). Anything omitted uses
@@ -254,6 +260,8 @@ _CUSTOM_STYLE = {
     # (covers the whole area), so dimmed so the basemap shows through.
     "air-quality-pm25": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP, "opacity": _OPACITY_DENSE},
     "air-quality-ozone": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP, "opacity": _OPACITY_DENSE},
+    "air-quality-pm25-nowcast": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP, "opacity": _OPACITY_DENSE},
+    "air-quality-ozone-nowcast": {"contour_step": 25.0, "color_ramp": _RAMP_AQI, "render": _RENDER_HEATMAP, "opacity": _OPACITY_DENSE},
 }
 
 _DEFAULT_STYLE = {"contour_step": 1.0, "color_ramp": _RAMP_NEUTRAL}

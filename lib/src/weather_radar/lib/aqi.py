@@ -42,11 +42,28 @@ NOMADS_BASE = os.environ.get(
     "NAQFC_BASE_URL",
     "https://nomads.ncep.noaa.gov/pub/data/nccf/com/aqm/prod",
 )
+# NAQFC historical archive (NOAA Open Data on AWS). Unlike NOMADS (~2-day
+# retention), this keeps every operational cycle back to 2020-01-01, keyed by
+# model version / sector / date / cycle. We use it ONLY to backfill a cycle's
+# trailing hours for NowCast (NOMADS alone can't reach far enough back when the
+# requested "now" is near a cycle's issuance). AQMv7 / CS(=CONUS) is the live
+# line since 2024-05-14 — the same products + 227 grid NOMADS serves.
+NAQFC_ARCHIVE_BASE = os.environ.get(
+    "NAQFC_ARCHIVE_BASE_URL",
+    "https://noaa-nws-naqfc-pds.s3.amazonaws.com",
+)
+NAQFC_ARCHIVE_VERSION = os.environ.get("NAQFC_ARCHIVE_VERSION", "AQMv7")
+NAQFC_ARCHIVE_SECTOR = os.environ.get("NAQFC_ARCHIVE_SECTOR", "CS")  # CONUS
 CACHE_ROOT = os.environ.get("CACHE_DIR", "/tmp")
 NAQFC_DIR = os.path.join(CACHE_ROOT, "weather-radar-naqfc")
 
 # NAQFC runs at 06 and 12 UTC. We try the newest cycle first and fall back.
 CYCLES = ("12", "06")
+
+# NowCast trailing window: the EPA PM2.5 NowCast weights the most recent 12
+# hourly concentrations. We need at least this many trailing hours (ending at
+# the evaluated hour) to compute it; fewer -> fall back to the raw hourly AQI.
+NOWCAST_HOURS = 12
 
 # When the on-disk GRIB's Expires has passed but the SAME cycle is still the
 # newest available (NAQFC only publishes twice daily, but Expires is ~4h), we
@@ -61,6 +78,26 @@ POLLUTANTS = {
     "pm25": "ave_1hr_pm25_bc",
     "ozone": "ave_1hr_o3_bc",
 }
+
+# NowCast variants are the SAME underlying field (same NOMADS infix / 227
+# grid) with a different time-aggregation applied at fit time. They're surfaced
+# as distinct public pollutant ids ("pm25-nowcast", "ozone-nowcast") so they
+# flow through the existing `pollutant` query param, bundle keys, and catalog
+# without new endpoints. `_parse_pollutant` maps them back to a base + flag.
+_NOWCAST_SUFFIX = "-nowcast"
+
+
+def _parse_pollutant(pollutant):
+    """Split a public pollutant id into (base, nowcast: bool).
+
+    "pm25"          -> ("pm25", False)
+    "pm25-nowcast"  -> ("pm25", True)
+    Unknown ids pass through as (pollutant, False) so callers' existing
+    membership checks (`pollutant in POLLUTANTS`) behave unchanged for them."""
+    p = (pollutant or "").strip().lower()
+    if p.endswith(_NOWCAST_SUFFIX):
+        return p[: -len(_NOWCAST_SUFFIX)], True
+    return p, False
 
 GRID_ID = "227"  # CONUS ~5km Lambert grid
 
@@ -102,6 +139,52 @@ def _aqi_from_ozone(c):
 _CONVERTER = {"pm25": _aqi_from_pm25, "ozone": _aqi_from_ozone}
 
 
+# --- NowCast (EPA weighted multi-hour concentration) ------------------------
+# Consumer AQI (AirNow, Apple Weather) reports NowCast, not a single hour: a
+# weighted average over the trailing 12 hourly CONCENTRATIONS that damps
+# short-term spikes. Computed on concentration, THEN converted to AQI.
+#
+# Algorithm (EPA; same shape for PM2.5 and ozone, differing only in the band
+# table the resulting concentration is run through):
+#   over the last N hours c[0]=most-recent .. c[N-1]=oldest:
+#     range = max(c) - min(c); w* = 1 - range/max(c)
+#     weight = clamp(w*, 0.5, 1)
+#     nowcast = Σ weight**i · c[i]  /  Σ weight**i   (i skips missing hours)
+# At least 2 of the most recent 3 hours must be present, else NowCast is
+# undefined for that hour (we return None -> caller omits / falls back).
+
+def _nowcast_concentration(recent):
+    """`recent` = concentrations ordered MOST-RECENT first (len up to
+    NOWCAST_HOURS). None = missing hour. Returns the NowCast concentration, or
+    None if it can't be computed per the EPA data-sufficiency rule."""
+    vals = list(recent)[:NOWCAST_HOURS]
+    # Data sufficiency: need >=2 of the 3 most recent hours.
+    recent3 = [v for v in vals[:3] if v is not None and 0 <= v < 9999]
+    if len(recent3) < 2:
+        return None
+    present = [v for v in vals if v is not None and 0 <= v < 9999]
+    if len(present) < 2:
+        return None
+    cmax = max(present)
+    cmin = min(present)
+    if cmax <= 0:
+        return 0.0
+    w = 1.0 - (cmax - cmin) / cmax
+    if w < 0.5:
+        w = 0.5
+    num = 0.0
+    den = 0.0
+    for i, v in enumerate(vals):
+        if v is None or v < 0 or v >= 9999:
+            continue
+        wi = w ** i
+        num += wi * v
+        den += wi
+    if den <= 0:
+        return None
+    return num / den
+
+
 # --- Cycle discovery + download ---------------------------------------------
 
 def _latest_cycle():
@@ -130,6 +213,53 @@ def _grib_path(day, cyc, pollutant):
 def _grib_url(day, cyc, pollutant):
     infix = POLLUTANTS[pollutant]
     return f"{NOMADS_BASE}/aqm.{day}/{cyc}/aqm.t{cyc}z.{infix}.{GRID_ID}.grib2"
+
+
+def _prev_cycle(day, cyc):
+    """The NAQFC cycle immediately BEFORE (day, cyc). Cycles are 06z then 12z
+    each day, so the predecessor of 12z is the same day's 06z, and the
+    predecessor of 06z is the PRIOR day's 12z. Returns (yyyymmdd, cycle)."""
+    if cyc == "12":
+        return day, "06"
+    # cyc == "06" -> previous day's 12z
+    d = datetime.strptime(day, "%Y%m%d").replace(tzinfo=timezone.utc)
+    return (d - timedelta(days=1)).strftime("%Y%m%d"), "12"
+
+
+def _archive_url(day, cyc, pollutant):
+    """Historical-archive URL for a cycle's pollutant GRIB2. The archive repeats
+    the date in the filename and nests under version/sector/date/cycle; the
+    product infix + 227 grid are otherwise identical to NOMADS."""
+    infix = POLLUTANTS[pollutant]
+    return (f"{NAQFC_ARCHIVE_BASE}/{NAQFC_ARCHIVE_VERSION}/{NAQFC_ARCHIVE_SECTOR}"
+            f"/{day}/{cyc}/aqm.t{cyc}z.{infix}.{day}.{GRID_ID}.grib2")
+
+
+def _archive_path(day, cyc, pollutant):
+    # Distinct local name (…​.archive.…) so an archived cycle never collides
+    # with a same-day NOMADS download of the current cycle.
+    return os.path.join(
+        NAQFC_DIR, f"aqm.{day}.t{cyc}z.{pollutant}.archive.{GRID_ID}.grib2")
+
+
+def _download_archive_grib(day, cyc, pollutant):
+    """Fetch a PRIOR cycle's pollutant GRIB2 from the historical archive to
+    disk (writer-owned), returning its path or None. Archived cycles are
+    immutable, so once on disk it's permanently fresh — no Expires, no
+    re-download. Used only to backfill NowCast trailing hours."""
+    if pollutant not in POLLUTANTS:
+        return None
+    path = _archive_path(day, cyc, pollutant)
+    if os.path.exists(path):
+        return path
+    url = _archive_url(day, cyc, pollutant)
+    try:
+        from . import cachewriter
+        cachewriter.ensure_binary(url, path, False)
+        return path if os.path.exists(path) else None
+    except Exception:
+        logger.warning("NAQFC archive fetch failed for %s", url, exc_info=True)
+        return path if os.path.exists(path) else None
 
 
 def _is_fresh(path):
@@ -212,6 +342,7 @@ _GRID_CACHE_LOCK = threading.Lock()
 # pollutant and only re-probe when the on-disk file is no longer fresh (its
 # stamped Expires has passed). Avoids 3-6 HTTP probes on every AQI request.
 _CURRENT_PATH = {}        # pollutant -> path
+_CURRENT_CYCLE = {}       # pollutant -> (yyyymmdd, cycle) of the current grid
 _CURRENT_PATH_LOCK = threading.Lock()
 
 
@@ -317,6 +448,7 @@ def ensure_grid(pollutant="pm25"):
             pass
         with _CURRENT_PATH_LOCK:
             _CURRENT_PATH[pollutant] = resolved
+            _CURRENT_CYCLE[pollutant] = (day, c)
         return _load_grid(resolved, pollutant)
 
     path = _download_grib(day, c, pollutant)
@@ -324,15 +456,86 @@ def ensure_grid(pollutant="pm25"):
         return None
     with _CURRENT_PATH_LOCK:
         _CURRENT_PATH[pollutant] = path
+        _CURRENT_CYCLE[pollutant] = (day, c)
     return _load_grid(path, pollutant)
 
 
 # --- Area sampling ----------------------------------------------------------
 
+def _prior_frames(pollutant):
+    """Parsed frames for the cycle immediately BEFORE the current one, from the
+    historical archive — used to backfill NowCast's trailing hours when the
+    evaluated hour sits near the current cycle's start. Returns a parsed-grid
+    dict (same shape as _load_grid) or None. Best-effort: any failure (no
+    current cycle known yet, archive unreachable) yields None and NowCast
+    simply falls back to whatever current-cycle history it has."""
+    with _CURRENT_PATH_LOCK:
+        cur_cycle = _CURRENT_CYCLE.get(pollutant)
+    if not cur_cycle:
+        return None
+    pday, pcyc = _prev_cycle(*cur_cycle)
+    path = _download_archive_grib(pday, pcyc, pollutant)
+    if path is None:
+        return None
+    return _load_grid(path, pollutant)
+
+
+def _combined_series(area, pollutant):
+    """Build the hourly CONCENTRATION series for an area's lattice points,
+    concatenating the prior archived cycle's frames (for NowCast trailing
+    hours) ahead of the current cycle's, de-duplicated by epoch and sorted
+    ascending.
+
+    Returns (epochs, series, points, idx, grid) where:
+      epochs : (n_hours,) float epoch seconds, ascending, unique
+      series : (n_hours, n_points) concentrations at the lattice points
+      points : [[lon,lat], ...] wire order
+      idx    : nearest-cell index per lattice point (current grid's KDTree)
+      grid   : the current parsed grid (for start/end window)
+    or None if the current grid is unavailable."""
+    import numpy as np
+
+    grid = ensure_grid(pollutant)
+    if grid is None or grid["tree"] is None or not grid["frames"]:
+        return None
+
+    coords = list(area.map_coordinates)
+    if not coords:
+        return None
+    pts = np.array([[c.lat, c.lon] for c in coords])
+    _, idx = grid["tree"].query(pts, k=1)
+
+    # Merge prior-cycle frames (if any) with the current cycle's, keyed by
+    # epoch. Current-cycle values win on overlap (they're the newer forecast
+    # for the same valid hour). Both share the identical 227 grid / cell order,
+    # so the SAME `idx` samples both — no re-query against the prior tree.
+    by_epoch = {}
+    prior = _prior_frames(pollutant)
+    if prior is not None and prior["frames"]:
+        for e, v in prior["frames"]:
+            by_epoch[int(e)] = v
+    for e, v in grid["frames"]:
+        by_epoch[int(e)] = v
+
+    epochs_sorted = sorted(by_epoch)
+    epochs = np.array(epochs_sorted, dtype=float)
+    stacked = np.vstack([by_epoch[e] for e in epochs_sorted])  # (n_hours, cells)
+    series = stacked[:, idx]                                   # (n_hours, pts)
+    points = [[c.lon, c.lat] for c in coords]
+    return epochs, series, points, idx, grid
+
+
 def fit_area(area, pollutant="pm25"):
     """Resolve an area's AQI once into per-lattice-point CubicSplines over the
     hourly NAQFC series, so the stream can evaluate ANY instant (smooth
     scrubbing), exactly like the NOAA observation model's per-gridpoint spline.
+
+    `pollutant` may be a base id ("pm25", "ozone") or a NowCast variant
+    ("pm25-nowcast", "ozone-nowcast"). For the raw variants each hour's
+    concentration is converted straight to AQI. For NowCast, each hour's AQI is
+    derived from the EPA-weighted average of the trailing NOWCAST_HOURS
+    concentrations (backfilled across the prior cycle via the archive) — the
+    damped number consumer apps report — THEN converted to AQI.
 
     Returns a dict:
       {"start": epoch, "end": epoch,      # forecast window (first/last hour)
@@ -346,46 +549,55 @@ def fit_area(area, pollutant="pm25"):
     import numpy as np
     from scipy.interpolate import CubicSpline
 
-    grid = ensure_grid(pollutant)
-    if grid is None or grid["tree"] is None or not grid["frames"]:
+    base, nowcast = _parse_pollutant(pollutant)
+    if base not in POLLUTANTS:
         return None
 
-    coords = list(area.map_coordinates)
-    if not coords:
+    combined = _combined_series(area, base)
+    if combined is None:
         return None
-    # KDTree built on [lat, lon]; query in that order.
-    pts = np.array([[c.lat, c.lon] for c in coords])
-    _, idx = grid["tree"].query(pts, k=1)   # nearest grid cell per lattice point
+    epochs, series, points, _idx, grid = combined
+    convert = _CONVERTER[base]
 
-    convert = _CONVERTER[pollutant]
-    epochs = np.array([e for e, _ in grid["frames"]], dtype=float)
-    # Stack the hourly value arrays -> shape (n_hours, n_gridcells); pick the
-    # columns for our lattice points -> (n_hours, n_points).
-    stacked = np.vstack([v for _, v in grid["frames"]])   # (n_hours, n_cells)
-    series = stacked[:, idx]                               # (n_hours, n_points)
+    # The served forecast WINDOW is always the current cycle's span — prior
+    # cycle hours exist only to feed NowCast's trailing average, not to extend
+    # the user-visible timeline.
+    win_start = int(grid["frames"][0][0])
+    win_end = int(grid["frames"][-1][0])
 
-    points = [[c.lon, c.lat] for c in coords]
     splines = []
     for col in range(series.shape[1]):
         raw = series[:, col]
-        # Convert each hourly concentration -> AQI; None where out of coverage.
-        aqi = np.array([convert(float(x)) for x in raw], dtype=object)
-        valid = np.array([a is not None for a in aqi])
+        if nowcast:
+            # Per hour: NowCast of the trailing NOWCAST_HOURS concentrations
+            # (most-recent-first), then concentration -> AQI.
+            aqi_vals = []
+            for i in range(len(raw)):
+                lo = max(0, i - NOWCAST_HOURS + 1)
+                trailing = [float(raw[j]) for j in range(i, lo - 1, -1)]
+                nc = _nowcast_concentration(trailing)
+                aqi_vals.append(convert(nc) if nc is not None else None)
+            aqi = np.array(aqi_vals, dtype=object)
+        else:
+            aqi = np.array([convert(float(x)) for x in raw], dtype=object)
+
+        # Only fit over hours inside the current forecast window (prior-cycle
+        # hours are inputs to NowCast, not knots we want to serve/extrapolate).
+        in_win = (epochs >= win_start) & (epochs <= win_end)
+        valid = np.array([a is not None for a in aqi]) & in_win
         if valid.sum() < 2:
-            splines.append(None)    # need >=2 points to interpolate
+            splines.append(None)
             continue
         xe = epochs[valid]
         ye = np.array([a for a in aqi[valid]], dtype=float)
-        # CubicSpline needs strictly increasing x; epochs are already sorted
-        # ascending and unique (hourly), so pass as-is.
         try:
             splines.append(CubicSpline(xe, ye))
         except Exception:
             splines.append(None)
 
     return {
-        "start": int(epochs[0]),
-        "end": int(epochs[-1]),
+        "start": win_start,
+        "end": win_end,
         "points": points,
         "splines": splines,
     }
