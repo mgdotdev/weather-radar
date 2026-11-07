@@ -122,7 +122,13 @@ def login_token(request: Request, body: LoginTokenBody):
         raise HTTPException(status_code=403, detail="admin password not configured")
     if not auth.verify_admin_password(password):
         raise HTTPException(status_code=401, detail="invalid password")
-    tok = auth.newest_token()   # may be None (no tokens yet)
+    # Hand back the newest existing token; if NONE exist yet, auto-generate one
+    # so a fresh deployment isn't stuck (the app is always token-gated, so a
+    # password-only sign-in would otherwise have no token to continue with).
+    tok = auth.newest_token()
+    if not tok:
+        created = auth.generate_token(label="auto (first sign-in)")
+        tok = created["token"]
     resp = JSONResponse({"ok": True, "token": tok, "admin": True})
     # Password login also grants admin (session cookie) so the admin pages are
     # reachable right after signing in.

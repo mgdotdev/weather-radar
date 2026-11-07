@@ -336,7 +336,7 @@
     const IDW_EPS = 0.015 * 0.015
     const COLOR_BUFFER = 0.1
 
-    const initialZoom = parseFloat(new URL(window.location.href).searchParams.get("zoom")) || 9
+    const initialZoom = parseFloat(new URL(window.location.href).searchParams.get("zoom")) || 7.65
 
     const map = new maplibregl.Map({
       container: "weatherRadar",
@@ -1565,7 +1565,7 @@
         const watchUrl = u.pathname + (u.search || "")
         let resp
         try {
-          resp = await fetch("/api/admin/hotcache", {
+          resp = await fetch("/api/hotcache", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ url: watchUrl }),
@@ -1575,9 +1575,11 @@
           return
         }
         if (resp.status === 401 || resp.status === 403) {
-          if (window.confirm("Admin sign-in is required to add to the hot cache. Go to the sign-in page?")) {
-            window.location.href = "/login?next=" + encodeURIComponent("/admin/hotcache")
-          }
+          // Needs a valid access token (not admin). The fetch shim already
+          // carries the page's token; a 401 here means the token is missing/
+          // invalid — the middleware will have the page bounce to login on the
+          // next navigation, so just inform the user.
+          window.alert("A valid access token is required to add to the hot cache.")
           return
         }
         let data = null

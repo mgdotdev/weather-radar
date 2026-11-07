@@ -115,6 +115,21 @@ def server():
 
     _install_access_control(server)
 
+    # The app is always token-gated. Warn loudly if NOTHING can bootstrap it —
+    # no access token exists AND no admin password is configured, which means
+    # /admin/tokens is only reachable from localhost (or not at all remotely),
+    # so a remote deployment would be fully locked with no way in.
+    try:
+        from weather_radar.lib import auth as _auth
+        if not _auth.access_tokens_configured() and not _auth.admin_password_configured():
+            logger.warning(
+                "ACCESS CONTROL: no access tokens AND no admin password set. "
+                "The app is locked; the only way to mint the first token is "
+                "/admin/tokens, which is localhost-only without a password. "
+                "Set WR_ADMIN_PASSWORD[_HASH] to manage tokens remotely.")
+    except Exception:
+        pass
+
     @server.on_event("startup")
     def _startup():
         # Each uvicorn worker runs this; the file lock ensures exactly one
@@ -165,11 +180,13 @@ def _install_access_control(server):
         if _path_exempt(path, EXEMPT_PREFIXES):
             return await call_next(request)
 
-        # Open ONLY when no tokens are configured (fresh/dev install). Once a
-        # token exists, EVERY request must present one — no localhost bypass.
-        if not auth.access_tokens_configured():
-            return await call_next(request)
-
+        # The app is ALWAYS token-gated — no exceptions, no "open when no
+        # tokens" fallback, no localhost bypass. (Bootstrapping is still
+        # possible: the admin surface — /admin*, /api/admin*, /api/auth*, plus
+        # /login and /not-authorized — is EXEMPT above and password-gated, so
+        # an operator can reach /admin/tokens to mint the first token. If no
+        # tokens AND no admin password are configured, nothing is reachable;
+        # server() logs a loud warning at startup in that case.)
         supplied = (request.query_params.get("token")
                     or request.headers.get("X-Access-Token")
                     or request.cookies.get("wr_token"))

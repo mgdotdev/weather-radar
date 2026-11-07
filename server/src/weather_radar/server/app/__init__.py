@@ -288,8 +288,29 @@ DEFAULT_PROFILE = {"kind": _OBSERVATION, "label": "Value", "render": _RENDER_HEA
 
 
 
+@router.get("/", response_class=HTMLResponse)
+def root(request: Request):
+    """Bare root -> the default map view so there's always a usable landing
+    page (the user can then recenter / capture an area to create their view).
+    Preserves the query string (e.g. ?token=…) so access survives the hop."""
+    qs = ("?" + request.url.query) if request.url.query else ""
+    return RedirectResponse("/map/models/temperature/" + qs, status_code=302)
+
+
+# Sensible defaults so a param-less /map/models/{model}/ URL doesn't 422 —
+# the user lands on the map and can recenter/capture to build their view.
+# Default view: North Idaho (the panhandle, ~Coeur d'Alene/Sandpoint).
+_DEFAULT_LAT = 48.123221
+_DEFAULT_LON = -116.630892
+_DEFAULT_WIDTH = 293.80
+_DEFAULT_HEIGHT = 128.76
+_DEFAULT_DT = 3600
+
+
 @router.get("/map/models/{model}/", response_class=HTMLResponse)
-def map(model: str, width: float, height: float, lat: float, lon: float, dt: int, kind: str = None, step: float = None, speed: float = 1.0, render: str = None):
+def map(model: str, width: float = _DEFAULT_WIDTH, height: float = _DEFAULT_HEIGHT,
+        lat: float = _DEFAULT_LAT, lon: float = _DEFAULT_LON, dt: int = _DEFAULT_DT,
+        kind: str = None, step: float = None, speed: float = 1.0, render: str = None):
     # Model names are kebab-case end-to-end (URL, GeoJSON property key, API
     # params). The data layer converts to the camelCase NOAA attribute only
     # when reading the gridpoint (see models.utils.to_camel_case), so nothing
