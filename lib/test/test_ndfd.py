@@ -370,16 +370,131 @@ class TestAccumulationFit:
         assert float(spline(fit["start"] + 2 * 3600)) < float(spline(fit["start"] + 3600))
 
     def test_accumulation_ensemble_requests_accumulate(self, monkeypatch):
-        # NDFDAccumulationEnsemble must drive fit_area with accumulate=True.
+        # NDFDAccumulationEnsemble must drive the fit with accumulate=True.
+        # The ensemble calls fit_area_dense (which, at upsample=1, delegates to
+        # fit_area); patch the dense entry point the ensemble actually uses.
         from weather_radar.lib.models.ndfd_model import NDFDAccumulationEnsemble
         captured = {}
 
-        def fake_fit(area, attr, accumulate=False):
+        def fake_fit(area, attr, accumulate=False, upsample=None):
             captured["accumulate"] = accumulate
             return None  # no data -> ensemble stays empty; we only check the flag
 
-        monkeypatch.setattr(ndfd, "fit_area", fake_fit)
+        monkeypatch.setattr(ndfd, "fit_area_dense", fake_fit)
         monkeypatch.setattr(ndfd, "grid_mtime", lambda attr: 1.0)
         ens = NDFDAccumulationEnsemble(_StubArea(n=1), "snowfall-amount")
         list(ens.iter_points())  # triggers _ensure_fit
         assert captured.get("accumulate") is True
+
+
+# --- Dense (spatial) fitting: fit_area_dense --------------------------------
+# fit_area_dense spatially densifies the output lattice by WR_NDFD_UPSAMPLE via
+# a two-stage (time-then-space) interpolation, while returning the SAME dict
+# shape as fit_area. These stub _load_grid with a real cKDTree over a small
+# regular lattice so the spatial reshape/interp runs for real (no eccodes).
+
+class TestDenseFit:
+    def _stub_regular_grid(self, monkeypatch, n=3, n_hours=4,
+                           value_fn=None, fills=None):
+        """Install a _load_grid stub over an n x n regular lattice (matching
+        _StubArea(n)'s coordinates). `value_fn(i, j, h)` gives the native cell
+        value; `fills` is an optional set of (i, j, h) forced to the _FILL
+        sentinel."""
+        import numpy as np
+        from scipy.spatial import cKDTree
+        base_lat, base_lon = 45.6, -118.8
+        cells = [(base_lat + i * 0.1, base_lon + j * 0.1)
+                 for i in range(n) for j in range(n)]
+        tree = cKDTree(np.array(cells, dtype=float))
+        start = int(datetime(2026, 11, 5, 0, 0).timestamp())
+        if value_fn is None:
+            # A smooth spatial ramp that also varies in time.
+            value_fn = lambda i, j, h: 10.0 + i + 2.0 * j + 0.5 * h
+        fills = fills or set()
+        frames = []
+        for h in range(n_hours):
+            vals = []
+            for i in range(n):
+                for j in range(n):
+                    if (i, j, h) in fills:
+                        vals.append(ndfd._FILL)
+                    else:
+                        vals.append(float(value_fn(i, j, h)))
+            frames.append((float(start + h * 3600), np.array(vals, dtype=float)))
+        monkeypatch.setattr(ndfd, "_load_grid",
+                            lambda attr: {"tree": tree, "frames": frames})
+        return start
+
+    def test_upsample_1_is_passthrough(self, monkeypatch):
+        # k=1 must equal fit_area exactly (same point count + coordinates).
+        self._stub_regular_grid(monkeypatch, n=3)
+        area = _StubArea(n=3)
+        plain = ndfd.fit_area(area, "temperature")
+        dense = ndfd.fit_area_dense(area, "temperature", upsample=1)
+        assert dense is not None and plain is not None
+        assert len(dense["points"]) == len(plain["points"]) == 9
+        pp = sorted((round(p.lat, 6), round(p.lon, 6)) for p in plain["points"])
+        dp = sorted((round(p.lat, 6), round(p.lon, 6)) for p in dense["points"])
+        assert pp == dp
+
+    def test_upsample_increases_point_count(self, monkeypatch):
+        # A 3x3 native lattice at k=2 -> a 5x5 dense lattice (k per interval,
+        # endpoint-inclusive): (n-1)*k + 1 = 2*2+1 = 5 per axis.
+        self._stub_regular_grid(monkeypatch, n=3)
+        dense = ndfd.fit_area_dense(_StubArea(n=3), "temperature", upsample=2)
+        assert dense is not None
+        assert len(dense["points"]) == 25
+
+    def test_dense_preserves_values_at_native_points(self, monkeypatch):
+        # On a linear spatial field, cubic interpolation is exact at native
+        # nodes: the dense fit evaluated at a native coordinate/time must match
+        # the plain fit there.
+        import numpy as np
+        self._stub_regular_grid(monkeypatch, n=3)
+        area = _StubArea(n=3)
+        plain = ndfd.fit_area(area, "temperature")
+        dense = ndfd.fit_area_dense(area, "temperature", upsample=2)
+        # Native center point (i=1, j=1) = (45.7, -118.7).
+        target = (round(45.7, 6), round(-118.7, 6))
+        p_idx = [i for i, p in enumerate(plain["points"])
+                 if (round(p.lat, 6), round(p.lon, 6)) == target][0]
+        d_idx = [i for i, p in enumerate(dense["points"])
+                 if (round(p.lat, 6), round(p.lon, 6)) == target][0]
+        t = float(plain["start"]) + 1800.0
+        assert float(dense["splines"][d_idx](t)) == pytest.approx(
+            float(plain["splines"][p_idx](t)), abs=1e-6)
+
+    def test_dense_fills_holes_and_stays_complete(self, monkeypatch):
+        # A single fill cell must NOT leave a hole in the dense grid: every
+        # dense point still gets a spline.
+        self._stub_regular_grid(monkeypatch, n=3, fills={(1, 1, 2)})
+        dense = ndfd.fit_area_dense(_StubArea(n=3), "temperature", upsample=2)
+        assert dense is not None
+        assert len(dense["points"]) == 25  # complete 5x5, no dropped points
+
+    def test_dense_accumulation_is_monotonic(self, monkeypatch):
+        # Accumulation mode must remain monotone-nondecreasing in time at a
+        # densified point too.
+        import numpy as np
+        # Per-interval amounts increase then stop; same at every cell.
+        per = [0.0, 0.01, 0.03, 0.0]
+        self._stub_regular_grid(
+            monkeypatch, n=3, n_hours=len(per),
+            value_fn=lambda i, j, h: per[h])
+        dense = ndfd.fit_area_dense(_StubArea(n=3), "snowfall-amount",
+                                    upsample=2, accumulate=True)
+        assert dense is not None
+        spline = dense["splines"][0]
+        ts = np.arange(dense["start"], dense["end"], 300, dtype=float)
+        ys = spline(ts)
+        assert np.all(np.diff(ys) >= -1e-9)
+
+    def test_env_var_drives_upsample(self, monkeypatch):
+        # WR_NDFD_UPSAMPLE is read when `upsample` is not passed explicitly.
+        self._stub_regular_grid(monkeypatch, n=3)
+        monkeypatch.setenv("WR_NDFD_UPSAMPLE", "2")
+        dense = ndfd.fit_area_dense(_StubArea(n=3), "temperature")
+        assert len(dense["points"]) == 25
+        monkeypatch.setenv("WR_NDFD_UPSAMPLE", "1")
+        plain = ndfd.fit_area_dense(_StubArea(n=3), "temperature")
+        assert len(plain["points"]) == 9

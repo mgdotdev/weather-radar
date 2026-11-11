@@ -329,12 +329,49 @@
     // Max source points considered per raster cell (nearest-first). Enough to
     // blend smoothly without the full O(points) sum at every cell.
     const IDW_K = 12
-    // IDW smoothing radius (squared, in deg^2) added to each weight's
-    // denominator. NOAA gridpoints are ~2.5km (~0.023 deg) apart; a radius
-    // around half the spacing blends neighbors smoothly and avoids the
-    // "bull's-eye" rings that appear when points dominate tight circles.
-    const IDW_EPS = 0.015 * 0.015
+    // IDW smoothing radius as a FRACTION of the actual point spacing (not an
+    // absolute degree value). The field spacing shrinks when the server
+    // densifies (WR_NDFD_UPSAMPLE), so a relative radius sharpens the field
+    // proportionally — denser points => tighter smoothing => true peaks show
+    // through instead of being averaged flat. ~0.65x spacing keeps gradients
+    // smooth (no "bull's-eye" rings) while letting a cell's nearest point
+    // dominate its own location. Used as (IDW_EPS_FRAC * spacing)^2 per build.
+    const IDW_EPS_FRAC = 0.65
+    // Fallback absolute smoothing radius (squared, deg^2) used only when the
+    // point spacing can't be estimated (e.g. < 2 points). Matches the former
+    // hardcoded value tuned for ~2.5km NOAA gridpoint spacing.
+    const IDW_EPS_FALLBACK = 0.015 * 0.015
+    // IDW weight power: w = 1/(d^2 + eps)^(POWER/2). Power 2 is classic
+    // inverse-square; combined with the spacing-relative eps below and the
+    // nearest-value point readout, it preserves true peaks on a dense field
+    // while interpolating smoothly. (Higher powers sharpen further but can
+    // show faint bull's-eye rings around isolated points on sparse fields.)
+    const IDW_POWER = 2
     const COLOR_BUFFER = 0.1
+
+    // Estimate the typical point spacing (degrees) of the packed point set as
+    // the median nearest-neighbor distance over a bounded sample (cheap; the
+    // lattice is regular so a small sample is representative). Returns 0 if it
+    // can't be estimated.
+    function estimateSpacing(ptLon, ptLat, nPts) {
+      if (nPts < 2) return 0
+      const SAMPLE = Math.min(nPts, 200)
+      const stride = Math.max(1, Math.floor(nPts / SAMPLE))
+      const dists = []
+      for (let i = 0; i < nPts; i += stride) {
+        let best = Infinity
+        for (let j = 0; j < nPts; j++) {
+          if (j === i) continue
+          const dLon = ptLon[i] - ptLon[j], dLat = ptLat[i] - ptLat[j]
+          const d2 = dLon * dLon + dLat * dLat
+          if (d2 < best) best = d2
+        }
+        if (best < Infinity && best > 0) dists.push(Math.sqrt(best))
+      }
+      if (!dists.length) return 0
+      dists.sort((a, b) => a - b)
+      return dists[dists.length >> 1]   // median nearest-neighbor distance
+    }
 
     const initialZoom = parseFloat(new URL(window.location.href).searchParams.get("zoom")) || 7.65
 
@@ -545,6 +582,14 @@
       }
 
       // ---- SLOW PATH: (re)build the plan, then evaluate --------------------
+      // Spacing-relative IDW smoothing radius: estimate the field's point
+      // spacing and scale eps to it, so a densified field (smaller spacing)
+      // smooths proportionally less and true peaks survive. Falls back to the
+      // former absolute radius if spacing can't be estimated.
+      const _spacing = estimateSpacing(ptLon, ptLat, nPts)
+      const idwEps = _spacing > 0
+        ? (IDW_EPS_FRAC * _spacing) * (IDW_EPS_FRAC * _spacing)
+        : IDW_EPS_FALLBACK
       // Bounds (plain loop; avoids Math.min(...spread) which allocates and can
       // overflow the arg stack on large point sets).
       let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity
@@ -662,13 +707,16 @@
           const coveredAll = (x0 === 0 && y0 === 0 && x1 === bN - 1 && y1 === bN - 1)
           if (scanned >= K || coveredAll) {
             // Normalize the IDW weights (power 2) and record them, so a frame's
-            // value is just Σ w·v with no per-frame division.
+            // value is just Σ w·v with no per-frame division. Weight is
+            // (d^2 + eps)^(-POWER/2); POWER=3 makes the nearest point dominate
+            // faster than inverse-square, preserving peaks on a dense field.
+            const halfPow = IDW_POWER / 2
             let den = 0
-            for (let m = 0; m < kept; m++) den += 1 / (bestD2[m] + IDW_EPS)
+            for (let m = 0; m < kept; m++) den += Math.pow(bestD2[m] + idwEps, -halfPow)
             if (den <= 0 || kept === 0) return 0
             for (let m = 0; m < kept; m++) {
               planIdx[planLen] = bestIdx[m]
-              planW[planLen] = (1 / (bestD2[m] + IDW_EPS)) / den
+              planW[planLen] = Math.pow(bestD2[m] + idwEps, -halfPow) / den
               planLen++
             }
             return kept
@@ -804,17 +852,21 @@
     }
     // ---- Cursor readout -----------------------------------------------------
     let latestPoints = [], latestUnits = ""
+    // Point probe: return the value of the NEAREST lattice point to (plon,plat),
+    // NOT an IDW blend. A pin/cursor is a precise probe — it should report the
+    // actual data at that location, not a smoothed average that flattens peaks.
+    // (The heatmap wash still uses IDW for continuous rendering; this readout is
+    // deliberately exact so "the number under the cursor" matches the real field
+    // and the legend's true max is reachable by hovering the peak cell.)
     function sampleAt(plon, plat) {
       if (!latestPoints.length) return null
-      let num = 0, den = 0
+      let best = null, bestD2 = Infinity
       for (const p of latestPoints) {
         const dLon = plon - p.lon, dLat = plat - p.lat
         const d2 = dLon * dLon + dLat * dLat
-        if (d2 < 1e-12) return p.v
-        const w = 1 / (d2 + IDW_EPS)
-        num += w * p.v; den += w
+        if (d2 < bestD2) { bestD2 = d2; best = p.v }
       }
-      return num / den
+      return best
     }
 
     function boxPolygon(ext) {

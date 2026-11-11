@@ -179,8 +179,11 @@ class NDFDObservationEnsemble:
             return
         self._fit_done = True
         from .. import ndfd
-        fit = ndfd.fit_area(self.area, self.attribute,
-                            accumulate=self._accumulate)
+        # fit_area_dense spatially densifies the output lattice by
+        # WR_NDFD_UPSAMPLE (default 1 = identical to fit_area). The returned
+        # dict shape is unchanged, so wrapping/consumers below are untouched.
+        fit = ndfd.fit_area_dense(self.area, self.attribute,
+                                  accumulate=self._accumulate)
         self._fit = fit
         self._models = {}
         if fit is None:
