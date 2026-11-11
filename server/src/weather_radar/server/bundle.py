@@ -129,7 +129,7 @@ def _build_bundle_aqi(model, lat, lon, width, height, dt, kind):
     from weather_radar.lib import aqi as aqi_mod
 
     area = CoordinateArea(MapCoordinate(lat, lon), width, height)
-    fit = aqi_mod.fit_area(area, model)
+    fit = aqi_mod.fit_area_dense(area, model)
     if fit is None:
         return None
     start, end = fit["start"], fit["end"]

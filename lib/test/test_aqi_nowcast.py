@@ -158,3 +158,126 @@ class TestFitAreaNowCast:
     def test_unknown_base_returns_none(self, monkeypatch):
         _stub_grid(monkeypatch, [(1, np.array([5.0]))])
         assert aqi.fit_area(_Area(), "bogus-nowcast") is None
+
+
+# --- Dense (spatial) AQI fitting: fit_area_dense + shared interp -------------
+
+class _GridArea:
+    """A regular n x n lattice area (matches a stubbed multi-cell grid)."""
+    def __init__(self, n=3, base_lat=45.0, base_lon=-118.0, step=0.1):
+        self._n, self._bl, self._bo, self._st = n, base_lat, base_lon, step
+
+    @property
+    def map_coordinates(self):
+        return [_Coord(self._bl + i * self._st, self._bo + j * self._st)
+                for i in range(self._n) for j in range(self._n)]
+
+
+def _stub_grid_nxn(monkeypatch, n, n_hours, value_fn):
+    """Stub a NAQFC grid over an n x n lattice. The KDTree returns each query
+    point's own index (points queried in map_coordinates order == cell order).
+    value_fn(cell, h) -> concentration."""
+    class _Tree:
+        def query(self, pts, k=1):
+            m = len(pts)
+            return np.zeros(m), np.arange(m, dtype=int)
+    t0 = 1_700_000_000
+    frames = [(t0 + h * 3600,
+               np.array([value_fn(c, h) for c in range(n * n)], dtype=float))
+              for h in range(n_hours)]
+    cur = {"size": n * n, "tree": _Tree(), "frames": frames}
+    monkeypatch.setattr(aqi, "ensure_grid", lambda pollutant="pm25": cur)
+    monkeypatch.setattr(aqi, "_prior_frames", lambda pollutant: None)
+    return t0
+
+
+class TestAqiDenseFit:
+    def test_upsample_1_passthrough(self, monkeypatch):
+        _stub_grid_nxn(monkeypatch, 3, 6, lambda c, h: 10.0 + c + h)
+        area = _GridArea(3)
+        plain = aqi.fit_area(area, "pm25")
+        dense = aqi.fit_area_dense(area, "pm25", upsample=1)
+        assert len(dense["points"]) == len(plain["points"]) == 9
+
+    def test_upsample_increases_points(self, monkeypatch):
+        _stub_grid_nxn(monkeypatch, 3, 6, lambda c, h: 10.0 + c + h)
+        dense = aqi.fit_area_dense(_GridArea(3), "pm25", upsample=2)
+        # 3x3 native -> 5x5 dense ((n-1)*k+1 per axis).
+        assert len(dense["points"]) == 25
+
+    def test_dense_points_are_lon_lat_pairs(self, monkeypatch):
+        _stub_grid_nxn(monkeypatch, 3, 6, lambda c, h: 10.0 + c + h)
+        dense = aqi.fit_area_dense(_GridArea(3), "pm25", upsample=2)
+        p = dense["points"][0]
+        assert isinstance(p, list) and len(p) == 2  # [lon, lat]
+
+    def test_env_var_drives_upsample(self, monkeypatch):
+        _stub_grid_nxn(monkeypatch, 3, 6, lambda c, h: 10.0 + c + h)
+        monkeypatch.setenv("WR_AQI_UPSAMPLE", "2")
+        assert len(aqi.fit_area_dense(_GridArea(3), "pm25")["points"]) == 25
+        monkeypatch.setenv("WR_AQI_UPSAMPLE", "1")
+        assert len(aqi.fit_area_dense(_GridArea(3), "pm25")["points"]) == 9
+
+
+class TestInterpDensify:
+    """Direct tests of the shared stage-2 helper (no source coupling)."""
+
+    def test_densify_axis(self):
+        from weather_radar.lib import interp
+        ax = np.array([0.0, 1.0, 2.0])
+        out = interp.densify_axis(ax, 2)
+        # (n-1)*k + 1 = 5 points, endpoint-inclusive, strictly increasing.
+        assert out.tolist() == [0.0, 0.5, 1.0, 1.5, 2.0]
+        assert interp.densify_axis(ax, 1).tolist() == ax.tolist()
+
+    def test_exact_at_native_nodes_linear_field(self):
+        # A spatially-linear field is reproduced exactly by cubic interp at the
+        # native nodes, so a dense re-fit matches the native spline there.
+        from weather_radar.lib import interp
+        from scipy.interpolate import CubicSpline
+        lats = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
+        lons = np.array([0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0])
+        epochs = np.array([0.0, 3600.0, 7200.0])
+        # value = 10 + lat + 2*lon, constant in time -> per-point splines.
+        native = []
+        for la, lo in zip(lats, lons):
+            v = 10.0 + la + 2.0 * lo
+            native.append(CubicSpline(epochs, np.array([v, v, v])))
+
+        def refit(vals, ep):
+            good = np.isfinite(vals)
+            return CubicSpline(ep[good], vals[good]) if good.sum() >= 2 else None
+
+        d_lats, d_lons, d_spl = interp.densify_fit(lats, lons, epochs, native,
+                                                   refit, 2)
+        # Find the dense point at native node (1,1); its value must be 10+1+2=13.
+        for la, lo, sp in zip(d_lats, d_lons, d_spl):
+            if abs(la - 1.0) < 1e-9 and abs(lo - 1.0) < 1e-9:
+                assert float(sp(3600.0)) == __import__("pytest").approx(13.0, abs=1e-6)
+                break
+        else:
+            raise AssertionError("native node (1,1) not in dense lattice")
+
+    def test_holes_are_filled(self):
+        # A None native spline (hole) must not leave a dense hole.
+        from weather_radar.lib import interp
+        from scipy.interpolate import CubicSpline
+        lats = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
+        lons = np.array([0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0])
+        epochs = np.array([0.0, 3600.0, 7200.0])
+        native = []
+        for k, (la, lo) in enumerate(zip(lats, lons)):
+            if k == 4:              # drop the center point
+                native.append(None)
+                continue
+            v = 10.0 + la + lo
+            native.append(CubicSpline(epochs, np.array([v, v, v])))
+
+        def refit(vals, ep):
+            good = np.isfinite(vals)
+            return CubicSpline(ep[good], vals[good]) if good.sum() >= 2 else None
+
+        d_lats, d_lons, d_spl = interp.densify_fit(lats, lons, epochs, native,
+                                                   refit, 2)
+        assert len(d_spl) == 25
+        assert all(s is not None for s in d_spl)   # no dense holes

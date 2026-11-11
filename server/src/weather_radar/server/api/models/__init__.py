@@ -333,7 +333,7 @@ def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
     watched url, built in the background), its frames are served straight from
     disk — zero spline fit/eval — and only epochs the bundle lacks fall through
     to the live spline path. Same mechanism as /series/stream."""
-    from weather_radar.lib.aqi import fit_area, predict_area, grid_points
+    from weather_radar.lib.aqi import fit_area_dense, predict_area, grid_points
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
     epochs = _frame_times(start, end, dt, times)
@@ -362,7 +362,7 @@ def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
             remaining = list(epochs)
 
         # Live spline path for whatever the bundle didn't cover.
-        fit = fit_area(area, pollutant)
+        fit = fit_area_dense(area, pollutant)
         if fit is None:
             return
         # BINARY SIDECAR: header (coords + enc/scale) once, then binary frames.

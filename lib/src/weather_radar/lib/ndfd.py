@@ -484,169 +484,95 @@ def _fit_column(raw, epochs, start_epoch, convert, accumulate):
 
 # --- Dense area fitting (stage 1 time + stage 2 space) ----------------------
 
+WR_NDFD_UPSAMPLE = "WR_NDFD_UPSAMPLE"
+
+
 def _upsample_factor():
     """Spatial upsample factor from WR_NDFD_UPSAMPLE (default 1 = off). Each
     native lattice cell becomes a (k x k) finer lattice. Clamped to >= 1."""
-    try:
-        k = int(os.environ.get("WR_NDFD_UPSAMPLE", "1"))
-    except (TypeError, ValueError):
-        return 1
-    return max(k, 1)
+    from . import interp
+    return interp.upsample_env(WR_NDFD_UPSAMPLE)
 
 
 def fit_area_dense(area, attribute, accumulate=False, upsample=None):
     """Like fit_area, but SPATIALLY DENSIFIES the output lattice by `upsample`
-    (WR_NDFD_UPSAMPLE if None) via a two-stage separable interpolation:
+    (WR_NDFD_UPSAMPLE if None) via the shared two-stage (time-then-space)
+    interpolation in lib.interp:
 
-      stage 1 (time)  : fit the native lattice's per-point temporal splines
-                        exactly as fit_area does (handles fill/no-data and
-                        non-uniform time knots per point).
-      stage 2 (space) : at each native time knot, evaluate those splines onto
-                        the native (lat x lon) grid and cubic-interpolate that
-                        grid onto a finer lattice; this gives every DENSE point
-                        a value series over the native knots, which is then fit
-                        with a temporal interpolator (same _fit_column path).
+      stage 1 (time)  : fit_area builds the native lattice's per-point temporal
+                        splines (handles fill/no-data and non-uniform knots,
+                        plus unit conversion and — for accumulate — the
+                        cumulative monotone integration).
+      stage 2 (space) : interp.densify_fit samples those native splines at the
+                        native knots, cubic-interpolates each knot's grid onto a
+                        finer lattice, and re-fits a temporal spline per dense
+                        point (see _dense_refit below).
 
     Returns the SAME dict shape as fit_area ({start,end,points,splines,units,
-    nonneg}) so every consumer (the ensemble, the bundle builder, the client)
-    works UNCHANGED — there are simply more points. At upsample<=1 this is a
-    thin pass-through to fit_area (identical output, no stage-2 cost).
-
-    The native lattice is a regular grid (area.map_coordinates emits i*step,
-    j*step for every (i,j)); the axes are recovered from the sampled points so
-    this does not depend on area.index_bounds (keeps the test stub simple)."""
+    nonneg}) so every consumer works UNCHANGED — just more points. At
+    upsample<=1 this is a thin pass-through to fit_area."""
     import numpy as np
+    from scipy.interpolate import CubicSpline, PchipInterpolator
+    from .area import MapCoordinate
+    from . import interp
 
     k = _upsample_factor() if upsample is None else max(int(upsample), 1)
-    if k <= 1:
-        return fit_area(area, attribute, accumulate=accumulate)
+    fit = fit_area(area, attribute, accumulate=accumulate)
+    if k <= 1 or fit is None:
+        return fit
 
-    spec = ELEMENTS.get(attribute)
-    if spec is None:
-        return None
-    grid = _load_grid(attribute)
-    if grid is None or grid["tree"] is None or not grid["frames"]:
-        return None
+    pts = fit["points"]
+    if not pts:
+        return fit
+    lats = np.array([p.lat for p in pts], dtype=float)
+    lons = np.array([p.lon for p in pts], dtype=float)
+    # Native knot epochs: fit_area's splines are keyed on absolute epoch over
+    # [start, end]; sample on an hourly grid (splines are smooth between knots).
+    span = max(1, int(fit["end"]) - int(fit["start"]))
+    n_knots = min(_DENSE_KNOT_CAP, max(2, span // 3600 + 1))
+    epochs = np.linspace(fit["start"], fit["end"], num=n_knots, dtype=float)
 
-    coords = list(area.map_coordinates)
-    if not coords:
-        return None
+    # Re-fit one dense point's already-converted/accumulated series. NO convert
+    # or cumsum here — stage 1 baked those in; we only re-spline. Accumulate
+    # keeps a MONOTONE interpolator so the cumulative total never dips.
+    def _dense_refit(values, ep):
+        v = np.asarray(values, dtype=float)
+        good = np.isfinite(v)
+        if good.sum() < 2:
+            return None
+        try:
+            if accumulate:
+                return PchipInterpolator(ep[good], v[good])
+            return CubicSpline(ep[good], v[good])
+        except Exception:
+            return None
 
-    # Native regular-lattice axes, recovered from the sampled coordinates.
-    lat_ax = np.unique(np.array([c.lat for c in coords], dtype=float))
-    lon_ax = np.unique(np.array([c.lon for c in coords], dtype=float))
-    n_lat, n_lon = lat_ax.size, lon_ax.size
-    # Need at least a 2x2 native grid to interpolate spatially; otherwise fall
-    # back to the plain (undensified) fit.
-    if n_lat < 2 or n_lon < 2:
-        return fit_area(area, attribute, accumulate=accumulate)
+    dense = interp.densify_fit(lats, lons, epochs, fit["splines"],
+                               _dense_refit, k)
+    if dense is None:
+        return fit
+    d_lats, d_lons, d_splines = dense
 
-    # Nearest-sample every native cell across all forecast hours.
-    gy, gx = np.meshgrid(lat_ax, lon_ax, indexing="ij")   # (n_lat, n_lon)
-    flat = np.column_stack([gy.ravel(), gx.ravel()])
-    _, idx = grid["tree"].query(flat, k=1)
-
-    epochs = np.array([e for e, _ in grid["frames"]], dtype=float)
-    stacked = np.vstack([v for _, v in grid["frames"]])   # (n_hours, n_cells)
-    native = stacked[:, idx]                              # (n_hours, n_lat*n_lon)
-    n_hours = native.shape[0]
-    convert = spec["convert"]
-    start_epoch = int(epochs[0])
-
-    # Dense output axes: k samples per native interval (endpoint-inclusive).
-    dense_lat = _densify_axis(lat_ax, k)
-    dense_lon = _densify_axis(lon_ax, k)
-    dgy, dgx = np.meshgrid(dense_lat, dense_lon, indexing="ij")
-    dense_query = np.column_stack([dgy.ravel(), dgx.ravel()])
-    n_dense = dense_query.shape[0]
-
-    # Stage 2 per native knot: build a (n_lat, n_lon) value grid and resample
-    # onto the dense lattice. Fill/no-data cells are neighbor-filled FIRST so
-    # the grid handed to the interpolator is complete (holes aren't allowed on
-    # a regular-grid interpolator). dense_series[h] is the dense values at hour h.
-    dense_series = np.empty((n_hours, n_dense), dtype=float)
-    for h in range(n_hours):
-        g = native[h].reshape(n_lat, n_lon).astype(float)
-        g = _fill_holes(g)                                # complete the grid
-        dense_series[h] = _resample_grid(lat_ax, lon_ax, g, dense_query)
-
-    # Stage 1 (re-fit) on the dense points: each dense column is now a complete
-    # time series over the native knots. _FILL may survive only if an entire
-    # native grid at some hour was fill (then _fill_holes left it); _fit_column
-    # masks those per point, so the dense fit degrades gracefully.
-    from .area import MapCoordinate
-    out_points = []
-    out_splines = []
-    for col in range(n_dense):
-        spline = _fit_column(dense_series[:, col], epochs, start_epoch, convert,
-                             accumulate)
-        if spline is None:
+    out_points, out_splines = [], []
+    for la, lo, sp in zip(d_lats, d_lons, d_splines):
+        if sp is None:
             continue
-        out_points.append(MapCoordinate(lat=float(dense_query[col, 0]),
-                                        lon=float(dense_query[col, 1])))
-        out_splines.append(spline)
-
+        out_points.append(MapCoordinate(lat=float(la), lon=float(lo)))
+        out_splines.append(sp)
     if not out_splines:
-        return None
+        return fit
 
     return {
-        "start": start_epoch,
-        "end": int(epochs[-1]),
+        "start": fit["start"],
+        "end": fit["end"],
         "points": out_points,
         "splines": out_splines,
-        "units": spec["units"],
-        "nonneg": spec["nonneg"],
+        "units": fit["units"],
+        "nonneg": fit["nonneg"],
     }
 
 
-def _densify_axis(axis, k):
-    """Return a finer 1-D axis with k sub-samples per native interval,
-    endpoint-inclusive and strictly increasing. k=1 returns the axis unchanged."""
-    import numpy as np
-    if k <= 1 or axis.size < 2:
-        return axis
-    segs = [np.linspace(axis[i], axis[i + 1], k + 1)[:-1]
-            for i in range(axis.size - 1)]
-    segs.append(axis[-1:])            # include the final endpoint once
-    return np.concatenate(segs)
-
-
-def _fill_holes(grid):
-    """Replace _FILL/no-data cells in a 2-D grid with nearest valid values so
-    the grid is complete for spatial interpolation. If EVERY cell is fill the
-    grid is returned unchanged (the temporal fit masks it downstream)."""
-    import numpy as np
-    g = np.array(grid, dtype=float)
-    bad = g >= (_FILL - 1.0)
-    if not bad.any():
-        return g
-    if bad.all():
-        return g
-    try:
-        from scipy.ndimage import distance_transform_edt
-        # Index of the nearest valid cell for every (bad) cell.
-        _, (ii, jj) = distance_transform_edt(bad, return_indices=True)
-        g[bad] = g[ii[bad], jj[bad]]
-    except Exception:
-        # Fallback: fill with the mean of valid cells.
-        g[bad] = float(g[~bad].mean())
-    return g
-
-
-def _resample_grid(lat_ax, lon_ax, grid, query):
-    """Cubic-resample a complete (lat x lon) grid onto `query` [[lat,lon],...].
-    Falls back to linear if this scipy lacks N-D cubic for RegularGridInterpolator."""
-    import numpy as np
-    from scipy.interpolate import RegularGridInterpolator
-    try:
-        rgi = RegularGridInterpolator((lat_ax, lon_ax), grid, method="cubic",
-                                      bounds_error=False, fill_value=None)
-        return rgi(query)
-    except (ValueError, NotImplementedError):
-        if not getattr(_resample_grid, "_warned", False):
-            logger.warning("NDFD dense: cubic RegularGridInterpolator "
-                           "unavailable; falling back to linear")
-            _resample_grid._warned = True
-        rgi = RegularGridInterpolator((lat_ax, lon_ax), grid, method="linear",
-                                      bounds_error=False, fill_value=None)
-        return rgi(query)
+# Cap on the number of temporal knots at which native splines are sampled to
+# build the dense value cube (bounds work on long horizons; NDFD is ~7 days
+# hourly-ish, so ~169 knots max).
+_DENSE_KNOT_CAP = 200

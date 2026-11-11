@@ -603,6 +603,75 @@ def fit_area(area, pollutant="pm25"):
     }
 
 
+# --- Dense (spatial) fitting: stage-1 temporal + stage-2 spatial ------------
+
+WR_AQI_UPSAMPLE = "WR_AQI_UPSAMPLE"
+
+
+def fit_area_dense(area, pollutant="pm25", upsample=None):
+    """Like fit_area, but SPATIALLY DENSIFIES the output lattice by `upsample`
+    (WR_AQI_UPSAMPLE if None) via the shared two-stage (time-then-space)
+    interpolation in lib.interp. The return shape is identical to fit_area
+    ({start,end,points,splines}, points as [lon,lat]) so predict_area /
+    grid_points and all consumers work UNCHANGED — just more points. At
+    upsample<=1 this is a thin pass-through to fit_area (no stage-2 cost).
+
+    AQI's per-point splines are keyed on absolute epoch and AQI is clamped >=0
+    at EVALUATION (predict_area), so the dense re-fit mirrors fit_area's
+    CubicSpline-over-valid-knots with no extra clamp here."""
+    import numpy as np
+    from scipy.interpolate import CubicSpline
+    from . import interp
+
+    k = interp.upsample_env(WR_AQI_UPSAMPLE) if upsample is None else max(int(upsample), 1)
+    fit = fit_area(area, pollutant)
+    if k <= 1 or fit is None:
+        return fit
+
+    pts = fit["points"]                      # [[lon,lat], ...]
+    if not pts:
+        return fit
+    lons = np.array([p[0] for p in pts], dtype=float)
+    lats = np.array([p[1] for p in pts], dtype=float)
+    epochs = _dense_epochs(fit)
+
+    def _refit(values, ep):
+        # values: dense point's interpolated series over `ep` (native knots).
+        v = np.asarray(values, dtype=float)
+        good = np.isfinite(v)
+        if good.sum() < 2:
+            return None
+        try:
+            return CubicSpline(ep[good], v[good])
+        except Exception:
+            return None
+
+    dense = interp.densify_fit(lats, lons, epochs, fit["splines"], _refit, k)
+    if dense is None:
+        return fit
+    d_lats, d_lons, d_splines = dense
+    return {
+        "start": fit["start"],
+        "end": fit["end"],
+        "points": [[float(lo), float(la)] for lo, la in zip(d_lons, d_lats)],
+        "splines": d_splines,
+    }
+
+
+# Number of temporal knots at which native splines are sampled to build the
+# dense value cube. The AQI fit doesn't carry its raw knot epochs through, so
+# we sample the window on an hourly-ish grid; cubic splines are smooth between
+# knots so this faithfully reproduces the fitted field.
+_AQI_DENSE_KNOTS = 73
+
+
+def _dense_epochs(fit):
+    import numpy as np
+    span = max(1, int(fit["end"]) - int(fit["start"]))
+    n = min(_AQI_DENSE_KNOTS, max(2, span // 3600 + 1))
+    return np.linspace(fit["start"], fit["end"], num=n, dtype=float)
+
+
 def predict_area(fit, epochs, fixed_grid=False):
     """Evaluate a fitted area (from fit_area) at the given list of epoch
     seconds.

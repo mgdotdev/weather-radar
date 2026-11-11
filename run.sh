@@ -24,6 +24,7 @@ container() {
       -e NDFD_TTL_SECONDS \
       -e NDFD_MISS_TTL_SECONDS \
       -e WR_NDFD_UPSAMPLE \
+      -e WR_AQI_UPSAMPLE \
       -e NAQFC_RECHECK_SECONDS \
       -e WR_AUTH_DIR \
       -e WR_ADMIN_PASSWORD \
@@ -55,6 +56,7 @@ server() {
           -e NDFD_TTL_SECONDS \
           -e NDFD_MISS_TTL_SECONDS \
           -e WR_NDFD_UPSAMPLE \
+          -e WR_AQI_UPSAMPLE \
           -e NAQFC_RECHECK_SECONDS \
           -e WR_AUTH_DIR \
           -e WR_ADMIN_PASSWORD \
@@ -94,6 +96,7 @@ dev() {
           -e NDFD_TTL_SECONDS \
           -e NDFD_MISS_TTL_SECONDS \
           -e WR_NDFD_UPSAMPLE \
+          -e WR_AQI_UPSAMPLE \
           -e NAQFC_RECHECK_SECONDS \
           -e WR_AUTH_DIR \
           -e WR_ADMIN_PASSWORD \
