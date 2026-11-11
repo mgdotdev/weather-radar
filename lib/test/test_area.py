@@ -19,3 +19,28 @@ class TestCoordinates:
         area = CoordinateArea(coord, 1, 1)
         assert 1 <= len(area.gridpoints) <= 16
 
+
+class TestAreaAxes:
+    """width is the LONGITUDE extent, height the LATITUDE extent (the [lon,lat]
+    convention the client uses to size a drawn/viewport box). index_bounds must
+    map each dimension to its correct axis + conversion factor; a non-square
+    box at a mid latitude makes a swap/wrong-factor obviously wrong."""
+
+    def test_nonsquare_box_maps_to_correct_axes(self):
+        import math
+        from weather_radar.lib.area import LATTICE_STEP_DEG
+        lat0 = 47.0
+        w_km, h_km = 400.0, 100.0   # width=lon extent, height=lat extent
+        area = CoordinateArea(MapCoordinate(lat0, -121.0), w_km, h_km)
+        i0, i1, j0, j1 = area.index_bounds
+        lat_span_km = (i1 - i0) * LATTICE_STEP_DEG * 110.574
+        lon_span_km = (j1 - j0) * LATTICE_STEP_DEG * 111.320 * math.cos(math.radians(lat0))
+        # Each measured span should be within ~one lattice cell of the request
+        # (floor/ceil snapping adds up to a cell per edge). The longitude span
+        # tracks width (~400), the latitude span tracks height (~100).
+        cell_km = LATTICE_STEP_DEG * 111.320 * math.cos(math.radians(lat0))
+        assert abs(lon_span_km - w_km) <= 2 * cell_km + 1, lon_span_km
+        assert abs(lat_span_km - h_km) <= 2 * LATTICE_STEP_DEG * 110.574 + 1, lat_span_km
+        # And the aspect ratio is NOT transposed: lon span clearly exceeds lat.
+        assert lon_span_km > lat_span_km
+

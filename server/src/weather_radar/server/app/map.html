@@ -1755,15 +1755,21 @@
         // its extent just reads "—". (refreshPins re-samples after the reload.)
 
         // Size the fetched area. From a drawn box: the box's own lon/lat span.
-        // Otherwise: the current viewport span. The km conversion mirrors the
-        // server geometry (width drives lon-span, height the lat-span).
+        // Otherwise: the current viewport span. width is the LONGITUDE extent
+        // (east-west span), height the LATITUDE extent (north-south span), so
+        // each span uses ITS OWN km/degree factor: longitude is cos-corrected
+        // (111.320*cos lat), latitude is a flat 110.574. This matches the
+        // server's CoordinateArea.index_bounds, which converts width via the
+        // longitude factor and height via the latitude factor.
+        const _lonKmPerDeg = 111.320 * Math.cos(lat * Math.PI / 180)
+        const _latKmPerDeg = 110.574
         if (bounds) {
-          width = Math.abs(bounds.east - bounds.west) * 110.574
-          height = Math.abs(bounds.north - bounds.south) * (111.320 * Math.cos(lat * Math.PI / 180))
+          width = Math.abs(bounds.east - bounds.west) * _lonKmPerDeg
+          height = Math.abs(bounds.north - bounds.south) * _latKmPerDeg
         } else {
           const b = map.getBounds()
-          width = Math.abs(b.getEast() - b.getWest()) * 110.574
-          height = Math.abs(b.getNorth() - b.getSouth()) * (111.320 * Math.cos(lat * Math.PI / 180))
+          width = Math.abs(b.getEast() - b.getWest()) * _lonKmPerDeg
+          height = Math.abs(b.getNorth() - b.getSouth()) * _latKmPerDeg
         }
 
         // Move the area-outline box to the newly-sized area.

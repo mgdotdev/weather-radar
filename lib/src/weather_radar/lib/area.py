@@ -580,16 +580,21 @@ class CoordinateArea:
         """Inclusive integer lattice-index rectangle (i0, i1, j0, j1) covering
         this area, on the global lattice where coord = (i*step, j*step). i is
         the latitude index, j the longitude index. Shared by map_coordinates
-        and the recursive WFO decomposition so they address the SAME cells."""
-        dx = dkm_to_dlat(self.width)
-        dy = dkm_to_dlon(self.height, self.center.lat)
-        x = self.center.lon - dx / 2
-        y = self.center.lat - dy / 2
+        and the recursive WFO decomposition so they address the SAME cells.
+
+        `width` is the LONGITUDE extent and `height` the LATITUDE extent (the
+        [lon,lat] convention the client uses when it sizes a drawn/viewport
+        box), so width converts via the longitude factor (cos-corrected) and
+        height via the latitude factor."""
+        dlon = dkm_to_dlon(self.width, self.center.lat)   # width  -> lon degrees
+        dlat = dkm_to_dlat(self.height)                   # height -> lat degrees
+        lon0 = self.center.lon - dlon / 2
+        lat0 = self.center.lat - dlat / 2
         step = LATTICE_STEP_DEG
-        i0 = math.floor(y / step)
-        i1 = math.ceil((y + dy) / step)
-        j0 = math.floor(x / step)
-        j1 = math.ceil((x + dx) / step)
+        i0 = math.floor(lat0 / step)
+        i1 = math.ceil((lat0 + dlat) / step)
+        j0 = math.floor(lon0 / step)
+        j1 = math.ceil((lon0 + dlon) / step)
         return i0, i1, j0, j1
 
     @property
