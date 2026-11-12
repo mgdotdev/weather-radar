@@ -598,6 +598,21 @@ class CoordinateArea:
         return i0, i1, j0, j1
 
     @property
+    def bounds(self):
+        """The REQUESTED geographic rectangle (w/e/s/n lon/lat) for this area —
+        the lattice extent from index_bounds. This is what the user asked for
+        (a drawn box / viewport), independent of how individual samples later
+        snap to NOAA WFO gridpoint CENTERS (which can sit outside this box and
+        would otherwise inflate/reshape the painted field). Used to clamp the
+        rendered field + area-outline box to the requested shape."""
+        i0, i1, j0, j1 = self.index_bounds
+        step = LATTICE_STEP_DEG
+        return {
+            "s": i0 * step, "n": i1 * step,
+            "w": j0 * step, "e": j1 * step,
+        }
+
+    @property
     def map_coordinates(self):
         # Generate coordinates as (integer lattice index * step) rather than by
         # repeatedly adding `step`. Integer indexing avoids floating-point

@@ -426,60 +426,11 @@ def fit_area(area, attribute, accumulate=False):
 # accumulation integration) on both the native lattice and the densified one.
 
 def _fit_column(raw, epochs, start_epoch, convert, accumulate):
-    """Fit ONE point's time series (raw values over `epochs`) to an
-    interpolator mapping absolute-epoch -> display value, or None if the series
-    can't be fit (too few valid samples). Mirrors the original fit_area loop:
-    observation mode splines the raw per-interval values (CubicSpline);
-    accumulation mode integrates a cumulative, monotone total (PchipInterpolator).
-    `raw` may contain _FILL sentinels, which are masked (obs) or treated as 0
-    contribution (accumulate)."""
-    import numpy as np
-    from scipy.interpolate import CubicSpline, PchipInterpolator
-
-    raw = np.asarray(raw, dtype=float)
-    valid = raw < (_FILL - 1.0)       # mask fill/no-data
-
-    if accumulate:
-        # Cumulative total from the window start. Fill intervals contribute
-        # 0 (no reported fall) so the running sum stays defined and monotonic
-        # across the whole window. Need at least one real sample.
-        if valid.sum() < 1:
-            return None
-        amounts = np.where(valid, raw, 0.0).astype(float)
-        if convert is not None:
-            amounts = np.array([convert(v) for v in amounts], dtype=float)
-        # Per-interval amounts are non-negative; guard any convert noise.
-        amounts = np.clip(amounts, 0.0, None)
-        cumulative = np.cumsum(amounts)
-        # Anchor a 0 at the window start so the total begins at zero and the
-        # first segment interpolates 0 -> first-interval total monotonically.
-        xe = np.concatenate(([float(start_epoch)], epochs))
-        yv = np.concatenate(([0.0], cumulative))
-        # Drop any duplicate x (e.g. first frame exactly at start) so the
-        # interpolator gets strictly increasing knots.
-        keep = np.concatenate(([True], np.diff(xe) > 0))
-        xe, yv = xe[keep], yv[keep]
-        if xe.size < 2:
-            return None
-        try:
-            # PCHIP: shape-preserving, monotone on monotone data -> the
-            # cumulative total never dips between knots (CubicSpline can).
-            return PchipInterpolator(xe, yv)
-        except Exception:
-            return None
-
-    if valid.sum() < 2:
-        return None
-    xe = epochs[valid]
-    yv = raw[valid]
-    if convert is not None:
-        yv = np.array([convert(v) for v in yv], dtype=float)
-    else:
-        yv = yv.astype(float)
-    try:
-        return CubicSpline(xe, yv)
-    except Exception:
-        return None
+    """Per-point temporal fit — delegates to the SHARED interp.fit_column so
+    NDFD/NBM/AQI fitting semantics stay identical (see lib.interp)."""
+    from . import interp
+    return interp.fit_column(raw, epochs, start_epoch, convert, accumulate,
+                             fill=_FILL)
 
 
 # --- Dense area fitting (stage 1 time + stage 2 space) ----------------------

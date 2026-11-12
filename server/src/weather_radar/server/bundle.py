@@ -109,10 +109,14 @@ def _aqi_grib_mtime(pollutant):
 
 
 def _ndfd_grid_mtime(attribute):
-    """Freshness signal for an NDFD bundle: the newest mtime of the element
-    GRIB files backing `attribute`. A bundle is stale once a newer element
-    file is downloaded. Returns 0.0 if unknown."""
+    """Freshness signal for an NDFD/NBM bundle: the newest mtime of the GRIB
+    files backing `attribute` for the active grid source. A bundle is stale
+    once a newer file is fetched. Returns 0.0 if unknown."""
     try:
+        from weather_radar.lib.models import weather_source
+        if weather_source() == "nbm":
+            from weather_radar.lib import nbm
+            return nbm.grid_mtime(attribute)
         from weather_radar.lib import ndfd
         return ndfd.grid_mtime(attribute)
     except Exception:
@@ -256,7 +260,9 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
     from weather_radar.lib.models import weather_source
     from weather_radar.lib.models.accumulation import AccumulationEnsemble
 
-    is_ndfd = weather_source() == "ndfd"
+    # True for both GRIB grid sources (NDFD, NBM): iterate the ensemble's
+    # lattice points (no /points resolution) and key freshness on grid mtime.
+    is_ndfd = weather_source() in ("ndfd", "nbm")
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
     ensemble_class = ENSEMBLE_KINDS().get(kind, AccumulationEnsemble)
@@ -415,6 +421,19 @@ def read_bundle_range(model, lat, lon, width, height, dt, kind):
             lats = [c[1] for c in coords]
             min_lon, max_lon = min(lons), max(lons)
             min_lat, max_lat = min(lats), max(lats)
+            # Clamp to the requested area rectangle (same as _field_extent) so a
+            # watched-url bundle's box matches the drawn box, not the snapped
+            # gridpoint-center cloud. Reconstruct the area from bundle meta.
+            try:
+                from weather_radar.lib.area import MapCoordinate, CoordinateArea
+                m = meta.get("meta") or {}
+                _area = CoordinateArea(MapCoordinate(m["lat"], m["lon"]),
+                                       m["width"], m["height"])
+                rb = _area.bounds
+                min_lon = max(min_lon, rb["w"]); max_lon = min(max_lon, rb["e"])
+                min_lat = max(min_lat, rb["s"]); max_lat = min(max_lat, rb["n"])
+            except Exception:
+                pass
             pad_lon = (max_lon - min_lon) * 0.05 or 0.01
             pad_lat = (max_lat - min_lat) * 0.05 or 0.01
             rng = dict(rng)

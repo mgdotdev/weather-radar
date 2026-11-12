@@ -70,12 +70,13 @@ def ENSEMBLE_KINDS():
     return ensemble_kinds()
 
 
-# True when the active weather source is NDFD (GRIB grid sampling) rather than
-# the NOAA /gridpoints JSON. NDFD ensembles sample the area's lattice points
-# directly (no WFO gridpoint resolution), so the hot series path branches on
-# this to iterate the ensemble's points instead of area.iter_gridpoints().
+# True when the active weather source samples a GRIB grid directly (NDFD or
+# NBM) rather than the NOAA /gridpoints JSON. These ensembles sample the area's
+# lattice points directly (no WFO gridpoint resolution), so the hot series path
+# branches on this to iterate the ensemble's points instead of
+# area.iter_gridpoints().
 def _is_ndfd():
-    return weather_source() == "ndfd"
+    return weather_source() in ("ndfd", "nbm")
 
 
 @router.get("/{model}/params/{param}", response_class=JSONResponse)
@@ -95,8 +96,8 @@ def models(model: str, param: str, lat: float, lon: float, time: time_t=None, dt
     coord = MapCoordinate(lat, lon)
     from datetime import timedelta
 
-    if weather_source() == "ndfd":
-        # NDFD is area/ensemble-based. Sample the point the SAME way the map
+    if weather_source() in ("ndfd", "nbm"):
+        # NDFD/NBM are area/ensemble-based. Sample the point the SAME way the map
         # does: an inverse-distance-weighted blend of the area's lattice points
         # (mirroring the client's buildField IDW), NOT just the single nearest
         # lattice point — the nearest cell may be a no-data (fill) cell that the
@@ -420,10 +421,17 @@ def ensemble_range(
 
 
 def _field_extent(ensemble, area):
-    """Bounding box (w/e/s/n lon/lat) of the area's sampled lattice points,
-    padded 5% per side to MATCH the client IDW raster's padding (buildField).
-    Returns None if no points resolve. Source-agnostic: NDFD ensembles expose
-    iter_points(); the JSON ensembles iterate resolved gridpoints."""
+    """Bounding box (w/e/s/n lon/lat) of the area's field, padded 5% per side to
+    MATCH the client IDW raster's padding (buildField). Returns None if no
+    points resolve.
+
+    CLAMPED TO THE REQUESTED RECTANGLE (area.bounds): JSON /gridpoints samples
+    snap to NOAA WFO gridpoint CENTERS that can sit OUTSIDE the drawn box, which
+    would inflate/reshape the painted field + area-outline box away from what
+    the user drew. We clamp the extent to the requested lattice rectangle so the
+    box matches the drawn shape. (For NDFD/NBM the points ARE the lattice, so the
+    clamp is a no-op.) The underlying point DATA is unchanged — only the painted
+    extent is clamped."""
     lons = []
     lats = []
     if hasattr(ensemble, "iter_points"):
@@ -446,6 +454,18 @@ def _field_extent(ensemble, area):
         return None
     min_lon, max_lon = min(lons), max(lons)
     min_lat, max_lat = min(lats), max(lats)
+    # Clamp the point-cloud bbox to the REQUESTED rectangle so snapped-outward
+    # gridpoint centers don't reshape the box. Intersect (don't expand): if the
+    # resolved cloud is smaller than the request (sparse coverage) keep the
+    # cloud; if larger (snap overshoot) clip to the request.
+    try:
+        rb = area.bounds
+        min_lon = max(min_lon, rb["w"]); max_lon = min(max_lon, rb["e"])
+        min_lat = max(min_lat, rb["s"]); max_lat = min(max_lat, rb["n"])
+    except Exception:
+        pass
+    if max_lon <= min_lon or max_lat <= min_lat:
+        return None
     # Mirror buildField: pad 5% of span per side, with a small floor when the
     # span is ~0 (single point / degenerate).
     pad_lon = (max_lon - min_lon) * 0.05 or 0.01

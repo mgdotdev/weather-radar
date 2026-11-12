@@ -45,6 +45,69 @@ def upsample_env(var_name, default=1):
     return max(k, 1)
 
 
+# Default fill/no-data sentinel for the grid sources (NDFD/NBM both use 9999).
+FILL = 9999.0
+
+
+def fit_column(raw, epochs, start_epoch, convert, accumulate, fill=FILL):
+    """SHARED stage-1 temporal fit for one lattice point — the single
+    implementation used by the NDFD, NBM, and AQI sources so their fitting
+    semantics can't drift.
+
+    Fits `raw` (values over absolute-epoch `epochs`) to an interpolator mapping
+    epoch -> display value, or None if it can't be fit:
+      * observation (accumulate=False): spline the raw per-interval/instant
+        values (CubicSpline). `fill` sentinels are masked; needs >= 2 valid.
+      * accumulation (accumulate=True): integrate a cumulative total from the
+        window start (fill intervals contribute 0), fit with a MONOTONE
+        PchipInterpolator so the running total never dips between knots. A 0 is
+        anchored at `start_epoch`. Needs >= 1 valid sample.
+    `convert` (or None) maps native GRIB value -> display units.
+    """
+    import numpy as np
+    from scipy.interpolate import CubicSpline, PchipInterpolator
+
+    raw = np.asarray(raw, dtype=float)
+    valid = raw < (fill - 1.0)       # mask fill/no-data
+
+    if accumulate:
+        # Cumulative total from the window start. Fill intervals contribute 0
+        # (no reported fall) so the running sum stays defined and monotonic.
+        if valid.sum() < 1:
+            return None
+        amounts = np.where(valid, raw, 0.0).astype(float)
+        if convert is not None:
+            amounts = np.array([convert(v) for v in amounts], dtype=float)
+        amounts = np.clip(amounts, 0.0, None)      # per-interval amounts >= 0
+        cumulative = np.cumsum(amounts)
+        # Anchor a 0 at the window start so the total begins at zero.
+        xe = np.concatenate(([float(start_epoch)], epochs))
+        yv = np.concatenate(([0.0], cumulative))
+        # Strictly increasing knots (drop a duplicate first-frame-at-start).
+        keep = np.concatenate(([True], np.diff(xe) > 0))
+        xe, yv = xe[keep], yv[keep]
+        if xe.size < 2:
+            return None
+        try:
+            # PCHIP: monotone on monotone data -> cumulative never dips.
+            return PchipInterpolator(xe, yv)
+        except Exception:
+            return None
+
+    if valid.sum() < 2:
+        return None
+    xe = epochs[valid]
+    yv = raw[valid]
+    if convert is not None:
+        yv = np.array([convert(v) for v in yv], dtype=float)
+    else:
+        yv = yv.astype(float)
+    try:
+        return CubicSpline(xe, yv)
+    except Exception:
+        return None
+
+
 def densify_axis(axis, k):
     """Return a finer 1-D axis with k sub-samples per native interval,
     endpoint-inclusive and strictly increasing. k<=1 returns axis unchanged."""

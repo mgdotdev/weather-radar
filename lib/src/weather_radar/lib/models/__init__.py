@@ -22,23 +22,37 @@ def model_from_type(model_type):
 # the WR_WEATHER_SOURCE env var; see docs/ndfd-roadmap.md.
 
 def weather_source():
-    """The configured weather data source: "ndfd" (default) or "gridpoints"."""
+    """The configured weather data source: "ndfd" (default), "nbm", or
+    "gridpoints"."""
     src = os.environ.get("WR_WEATHER_SOURCE", "ndfd").strip().lower()
-    return "gridpoints" if src == "gridpoints" else "ndfd"
+    if src == "gridpoints":
+        return "gridpoints"
+    if src == "nbm":
+        return "nbm"
+    return "ndfd"
 
 
 def ensemble_kinds():
     """Map public `kind` -> ensemble class for the CONFIGURED weather source.
 
-    ndfd (default): the GRIB-backed NDFD adapters. gridpoints: the JSON-backed
-    ObservationEnsemble / AccumulationEnsemble, which are structural drop-ins.
-    AQI is NOT here — it's a separate data path handled by its own /aqi
-    endpoints regardless of weather source."""
-    if weather_source() == "ndfd":
+    ndfd (default): the GRIB-backed NDFD adapters. nbm: the National Blend of
+    Models GRIB adapters (national grid, ~11-day horizon incl. extended-range
+    snow/qpf NDFD lacks). gridpoints: the JSON-backed ObservationEnsemble /
+    AccumulationEnsemble. All expose the SAME ensemble contract. AQI is NOT here
+    — it's a separate data path handled by its own /aqi endpoints regardless of
+    weather source."""
+    src = weather_source()
+    if src == "ndfd":
         from .ndfd_model import NDFDObservationEnsemble, NDFDAccumulationEnsemble
         return {
             "observation": NDFDObservationEnsemble,
             "accumulation": NDFDAccumulationEnsemble,
+        }
+    if src == "nbm":
+        from .nbm_model import NBMObservationEnsemble, NBMAccumulationEnsemble
+        return {
+            "observation": NBMObservationEnsemble,
+            "accumulation": NBMAccumulationEnsemble,
         }
     return {
         "observation": ObservationEnsemble,

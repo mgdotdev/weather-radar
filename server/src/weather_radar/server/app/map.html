@@ -296,6 +296,13 @@
     // once before the first render so colors/legend stay stable over time.
     // Null until fetched (then buildHeatmap falls back to the frame range).
     let globalMin = null, globalMax = null
+    // Server-provided REQUESTED-area rectangle (w/e/s/n) from the range
+    // payload's `extent`. buildField clamps its raster bounds to this so the
+    // painted heatmap (and the area-outline box fit to it) matches the drawn
+    // box, rather than the bbox of NOAA gridpoint centers that snapped outside
+    // the request. Null until the range is fetched. (For NDFD/NBM it equals
+    // the lattice, so clamping is a no-op.)
+    let fieldExtentHint = null
     // Forecast time window (epoch seconds) for the current area, from the
     // range API — the FULL available range. Null until fetched.
     let forecastStart = null, forecastEnd = null
@@ -604,6 +611,22 @@
       const padLat = (maxLat - minLat) * 0.05 || 0.01
       minLon -= padLon; maxLon += padLon; minLat -= padLat; maxLat += padLat
 
+      // Clamp the raster bounds to the server's REQUESTED-area rectangle (if
+      // provided). gridpoint centers can snap OUTSIDE the drawn box; without
+      // this the painted field + area box take the inflated point-cloud shape
+      // instead of what the user drew. We INTERSECT (never expand): the raster
+      // fills the requested rectangle, sampling from all points (incl. those
+      // just outside, which improves edge IDW). The hint is already padded
+      // server-side, so no extra pad here. No-op for NDFD/NBM (points==lattice).
+      if (fieldExtentHint) {
+        const h = fieldExtentHint
+        minLon = Math.max(minLon, h.w); maxLon = Math.min(maxLon, h.e)
+        minLat = Math.max(minLat, h.s); maxLat = Math.min(maxLat, h.n)
+        // Guard against a degenerate intersection (shouldn't happen, but keep
+        // a valid span).
+        if (!(maxLon > minLon)) { maxLon = h.e; minLon = h.w }
+        if (!(maxLat > minLat)) { maxLat = h.n; minLat = h.s }
+      }
       // Spatial bucket index over the source points so each raster cell can
       // do IDW over just its nearest-K points instead of all of them. Bucket
       // grid is sized to the point set (~a handful of points per bucket), so a
@@ -1796,6 +1819,7 @@
         // cache its data, recompute the fixed color range, then render.
         time = Math.floor(Date.now() / 1000)
         globalMin = null; globalMax = null
+        fieldExtentHint = null
         forecastStart = null; forecastEnd = null
         windowStart = null; windowEnd = null
         mapTimeZone = null
@@ -2545,6 +2569,9 @@
         if (ex && Number.isFinite(ex.w) && Number.isFinite(ex.e)
             && Number.isFinite(ex.s) && Number.isFinite(ex.n)) {
           lastFieldExtent = { w: ex.w, e: ex.e, s: ex.s, n: ex.n }
+          // Clamp the heatmap raster to this requested rectangle so snapped-
+          // outward gridpoint centers don't reshape the painted field / box.
+          fieldExtentHint = { w: ex.w, e: ex.e, s: ex.s, n: ex.n }
           updateAreaBox()
         }
         mapTimeZone = (r && r.timeZone) || null
