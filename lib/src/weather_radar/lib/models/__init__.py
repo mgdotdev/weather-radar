@@ -15,32 +15,32 @@ def model_from_type(model_type):
 
 
 # --- Weather source selection (WR_WEATHER_SOURCE) ---------------------------
-# The app can resolve weather layers from either the NDFD GRIB2 files (default)
-# or the api.weather.gov /gridpoints JSON API. Both expose the SAME
-# ensemble contract (see models.ndfd_model), so switching the source is a
-# matter of returning a different ensemble class per `kind`. Selected once by
-# the WR_WEATHER_SOURCE env var; see docs/ndfd-roadmap.md.
+# The app can resolve weather layers from the api.weather.gov /gridpoints JSON
+# API (default) or the NDFD / NBM GRIB2 files. All expose the SAME ensemble
+# contract (see models.ndfd_model), so switching the source is a matter of
+# returning a different ensemble class per `kind`. Selected once by the
+# WR_WEATHER_SOURCE env var; see docs/ndfd-roadmap.md.
 
 def weather_source():
-    """The configured weather data source: "ndfd" (default), "nbm", or
-    "gridpoints"."""
-    src = os.environ.get("WR_WEATHER_SOURCE", "ndfd").strip().lower()
-    if src == "gridpoints":
-        return "gridpoints"
+    """The configured weather data source: "gridpoints" (default), "nbm", or
+    "ndfd"."""
+    src = os.environ.get("WR_WEATHER_SOURCE", "gridpoints").strip().lower()
+    if src == "ndfd":
+        return "ndfd"
     if src == "nbm":
         return "nbm"
-    return "ndfd"
+    return "gridpoints"
 
 
 def ensemble_kinds():
     """Map public `kind` -> ensemble class for the CONFIGURED weather source.
 
-    ndfd (default): the GRIB-backed NDFD adapters. nbm: the National Blend of
-    Models GRIB adapters (national grid, ~11-day horizon incl. extended-range
-    snow/qpf NDFD lacks). gridpoints: the JSON-backed ObservationEnsemble /
-    AccumulationEnsemble. All expose the SAME ensemble contract. AQI is NOT here
-    — it's a separate data path handled by its own /aqi endpoints regardless of
-    weather source."""
+    gridpoints (default): the JSON-backed ObservationEnsemble /
+    AccumulationEnsemble (api.weather.gov /gridpoints). ndfd: the GRIB-backed
+    NDFD adapters. nbm: the National Blend of Models GRIB adapters (national
+    grid, ~11-day horizon incl. extended-range snow/qpf NDFD lacks). All expose
+    the SAME ensemble contract. AQI is NOT here — it's a separate data path
+    handled by its own /aqi endpoints regardless of weather source."""
     src = weather_source()
     if src == "ndfd":
         from .ndfd_model import NDFDObservationEnsemble, NDFDAccumulationEnsemble

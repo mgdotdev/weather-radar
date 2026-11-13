@@ -14,6 +14,50 @@ logger = logging.getLogger(__name__)
 lock = multiprocessing.Lock()
 
 
+# --- NOAA User-Agent --------------------------------------------------------
+# api.weather.gov REQUIRES a User-Agent header (requests without one are
+# blocked with 403), and NWS asks that it identify your application and include
+# a contact (website/email) so they can reach you about abusive or broken
+# usage. We build it from env so a self-hosted deployment sets its OWN contact
+# rather than shipping the author's:
+#
+#   NOAA_USER_AGENT   full override — if set, used verbatim (highest priority).
+#   WR_APP_NAME       app identifier (default "weather-radar").
+#   WR_CONTACT_EMAIL  contact email; when set, appended as "<app> (<email>)".
+#
+# With no contact configured we still send a valid UA (so requests aren't
+# blocked) but log a one-time warning, since NOAA recommends a reachable
+# contact.
+
+_DEFAULT_APP_NAME = "weather-radar"
+_ua_warned = False
+
+
+def noaa_user_agent():
+    """Return the User-Agent string to send to api.weather.gov.
+
+    Order of precedence: NOAA_USER_AGENT (verbatim) > "<WR_APP_NAME>
+    (<WR_CONTACT_EMAIL>)" > bare "<WR_APP_NAME>" (with a warning, since NWS
+    recommends a contact). See the module note above.
+    """
+    global _ua_warned
+    override = os.environ.get("NOAA_USER_AGENT")
+    if override and override.strip():
+        return override.strip()
+    app = (os.environ.get("WR_APP_NAME") or _DEFAULT_APP_NAME).strip()
+    email = (os.environ.get("WR_CONTACT_EMAIL") or "").strip()
+    if email:
+        return f"{app} ({email})"
+    if not _ua_warned:
+        logger.warning(
+            "No NOAA contact configured: set WR_CONTACT_EMAIL (or "
+            "NOAA_USER_AGENT) so api.weather.gov can reach you. Sending a "
+            "bare User-Agent %r.", app,
+        )
+        _ua_warned = True
+    return app
+
+
 class _KeyedLocks:
     """Hands out a distinct lock per key (here, per URL) so that concurrent
     requests for the *same* resource are coalesced (only one fetch happens,
@@ -205,7 +249,7 @@ class NOAAConnection:
 
     def __init__(self, url="https://api.weather.gov"):
         self.session = requests.session()
-        self.session.headers["User-Agent"] = "Michael Green, self@michaelgreen.dev"
+        self.session.headers["User-Agent"] = noaa_user_agent()
         self.url = url
         self._cache = {}
 

@@ -44,3 +44,32 @@ class TestAreaAxes:
         # And the aspect ratio is NOT transposed: lon span clearly exceeds lat.
         assert lon_span_km > lat_span_km
 
+
+class TestRequestedBounds:
+    """requested_bounds is the EXACT drawn rectangle (center ± half span, no
+    lattice snapping), used to size the user-facing area box for the gridpoints
+    source so it matches what the user drew. bounds (lattice-snapped) rounds
+    OUTWARD and so is always >= requested_bounds."""
+
+    def test_requested_bounds_matches_drawn_span(self):
+        import math
+        lat0, lon0 = 48.401829, -116.667964
+        w_km, h_km = 34.36, 36.83
+        area = CoordinateArea(MapCoordinate(lat0, lon0), w_km, h_km)
+        rb = area.requested_bounds
+        lon_km_per_deg = 111.320 * math.cos(math.radians(lat0))
+        lat_km_per_deg = 110.574
+        assert abs((rb["e"] - rb["w"]) * lon_km_per_deg - w_km) < 1e-6
+        assert abs((rb["n"] - rb["s"]) * lat_km_per_deg - h_km) < 1e-6
+        # Centered on the request.
+        assert abs((rb["w"] + rb["e"]) / 2 - lon0) < 1e-9
+        assert abs((rb["s"] + rb["n"]) / 2 - lat0) < 1e-9
+
+    def test_requested_bounds_within_lattice_bounds(self):
+        # The lattice bounds round outward, so they always contain the exact
+        # drawn rectangle.
+        area = CoordinateArea(MapCoordinate(48.401829, -116.667964), 34.36, 36.83)
+        rb, b = area.requested_bounds, area.bounds
+        assert b["w"] <= rb["w"] and b["e"] >= rb["e"]
+        assert b["s"] <= rb["s"] and b["n"] >= rb["n"]
+

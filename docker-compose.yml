@@ -1,0 +1,94 @@
+# weather-radar — Docker Compose for TrueNAS SCALE ("Install via YAML") or any
+# Compose host.
+#
+# TrueNAS note: the "Custom App → Install via YAML" flow deploys a PRE-BUILT
+# image; it does not build from a Dockerfile. Build and push the image first
+# (see README / docs), then set `image:` below to the tag you pushed. The
+# default points at GitHub Container Registry for this repo.
+#
+# Persistence: the single `/data` volume holds the NOAA cache, downloaded GRIB
+# files, the cache-writer lock, the server log, AND the minted access tokens
+# (weather-radar-tokens.json). Back it with a host path/dataset so tokens and
+# the warm cache survive restarts. The image runs as the unprivileged
+# `weather-radar` user (UID 1000), so the host path must be writable by UID
+# 1000 (on TrueNAS: set the dataset's owner/ACL accordingly, or use a dataset
+# you grant that UID write access to).
+
+services:
+  weather-radar:
+    image: ghcr.io/mgdotdev/weather-radar:latest
+    container_name: weather-radar
+    restart: unless-stopped
+
+    ports:
+      # host:container. 30050 follows the TrueNAS 300xx host-port convention in
+      # the homelab runbook; change the host side to whatever you proxy to in
+      # Nginx Proxy Manager / Caddy. The container always listens on 8000.
+      - "30050:8000"
+
+    environment:
+      # --- Worker count -----------------------------------------------------
+      WR_WORKERS: "4"
+
+      # --- Admin / access control ------------------------------------------
+      # The app is ALWAYS token-gated. To mint the first access token remotely
+      # you must set an admin password (otherwise /admin is localhost-only).
+      # Prefer the HASH (generate with `./run.sh hash_password`) so the
+      # plaintext never lives in this file. Set WR_ADMIN_SECRET to a stable
+      # random string so admin login sessions survive a restart.
+      WR_ADMIN_PASSWORD_HASH: "${WR_ADMIN_PASSWORD_HASH:-}"
+      WR_ADMIN_SECRET: "${WR_ADMIN_SECRET:-}"
+      # WR_ADMIN_PASSWORD: "${WR_ADMIN_PASSWORD:-}"   # plaintext fallback (less safe)
+      # WR_ADMIN_SESSION_TTL: "43200"                 # admin session seconds (12h default)
+
+      # --- Weather data source ---------------------------------------------
+      # gridpoints (default, api.weather.gov JSON) | ndfd | nbm (GRIB2).
+      WR_WEATHER_SOURCE: "${WR_WEATHER_SOURCE:-gridpoints}"
+
+      # --- NOAA contact (User-Agent) ---------------------------------------
+      # api.weather.gov REQUIRES a User-Agent and asks it include a contact
+      # email so NWS can reach you. Sent as "weather-radar (your@email)".
+      WR_CONTACT_EMAIL: "${WR_CONTACT_EMAIL:-}"
+      # WR_APP_NAME: "weather-radar"           # app id in the UA
+      # NOAA_USER_AGENT: ""                     # full UA override
+
+      # --- Logging ----------------------------------------------------------
+      LOG_LEVEL: "${LOG_LEVEL:-WARNING}"
+
+      # --- Optional tuning (uncomment to override image defaults) ----------
+      # NOAA_MAX_CONCURRENCY: "48"      # max simultaneous NOAA fetches (writer)
+      # WR_POLYGON_INDEX: "1"           # 0 disables the cached-polygon /points shortcut
+      # WR_NDFD_UPSAMPLE: "1"           # k>1 densifies the NDFD lattice kxk
+      # WR_AQI_UPSAMPLE: "1"
+      # WR_NBM_UPSAMPLE: "1"
+      # NDFD_SECTOR: "conus"
+      # NDFD_TTL_SECONDS: "3600"
+      # NBM_REGION: "co"
+      # NBM_TTL_SECONDS: "3600"
+
+      # CACHE_DIR / WR_AUTH_DIR / LOG_DIR default to /data in the image; leave
+      # them unless you remap the volume below.
+
+    volumes:
+      # Persist cache + tokens + logs. Replace the host side with your TrueNAS
+      # dataset path (e.g. /mnt/pool/apps/weather-radar). Must be writable by
+      # UID 1000.
+      - weather_radar_data:/data
+
+    # /health is unauthenticated; use it so the orchestrator restarts a wedged
+    # container. Python is always present in the image (no curl needed).
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  weather_radar_data:
+    # Default: a Docker-managed named volume. On TrueNAS you'll typically
+    # instead point this at a host dataset — either via the app's storage UI or
+    # by replacing the `volumes:` entry above with a bind mount, e.g.:
+    #   - /mnt/pool/apps/weather-radar:/data
+    driver: local

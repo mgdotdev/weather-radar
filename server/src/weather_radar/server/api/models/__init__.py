@@ -190,6 +190,218 @@ def _ndfd_point_series(ensemble, coord, param, dt):
     return {"type": "FeatureCollection", "features": features}
 
 
+# --- Point summary (/api/models/point) --------------------------------------
+# A compact, source-agnostic "what's the weather at this lat/lon" endpoint,
+# meant for machine consumers (Home Assistant REST sensors, scripts) rather
+# than the browser map. Unlike /{model}/params/{param} (one attribute, verbose
+# GeoJSON FeatureCollection), this returns ALL the common attributes in one
+# call as a flat JSON object of {key: {value, uom}}, with an optional `hourly`
+# array. It works across every weather source (gridpoints / ndfd / nbm) by
+# reusing the same per-source sampling the graph uses.
+
+# Public key -> (kind, kebab-case attribute). The key is the stable name a
+# consumer templates against; the attribute is the internal model param. Keys
+# are grouped by the ensemble kind that predicts them (observation = snapshot
+# values; accumulation = per-interval totals).
+_POINT_ATTRIBUTES = {
+    "temperature":               ("observation", "temperature"),
+    "dewpoint":                  ("observation", "dewpoint"),
+    "relative_humidity":         ("observation", "relative-humidity"),
+    "sky_cover":                 ("observation", "sky-cover"),
+    "wind_speed":                ("observation", "wind-speed"),
+    "wind_gust":                 ("observation", "wind-gust"),
+    "probability_of_precipitation": ("observation", "probability-of-precipitation"),
+    "quantitative_precipitation": ("accumulation", "quantitative-precipitation"),
+    "snowfall_amount":           ("accumulation", "snowfall-amount"),
+    "ice_accumulation":          ("accumulation", "ice-accumulation"),
+}
+
+
+def _point_sampler(kind, param, coord):
+    """Return (sample_fn, uom, start_dt, end_dt) for one (kind, param) at
+    `coord`, or None if the active source has no data for it.
+
+    `sample_fn(when: datetime) -> float|None` evaluates the attribute at a
+    time, source-aware: gridpoints uses the single resolved gridpoint's fitted
+    spline; ndfd/nbm uses the IDW blend of the area's lattice points (matching
+    the map / graph). Clamps to the attribute's physical range and returns None
+    when `when` is outside the forecast window or the point can't be sampled.
+    """
+    from datetime import datetime
+
+    if weather_source() in ("ndfd", "nbm"):
+        ensemble_class = ENSEMBLE_KINDS().get(kind, AccumulationEnsemble)
+        area = CoordinateArea(coord, 1, 1)
+        ensemble = ensemble_class(area, param)
+        try:
+            models = list(ensemble.iter_points())
+        except Exception:
+            return None
+        pts = []  # (d2, f, start_dt, end_dt)
+        uom = ""
+        start_dt = end_dt = None
+        for m in models:
+            try:
+                st, et, center, f, u, _x = m.model
+            except Exception:
+                continue
+            d2 = (center.lat - coord.lat) ** 2 + (center.lon - coord.lon) ** 2
+            pts.append((d2, f, st, et))
+            uom = uom or u
+            if start_dt is None or st < start_dt:
+                start_dt = st
+            if end_dt is None or et > end_dt:
+                end_dt = et
+        if not pts or start_dt is None:
+            return None
+        scored = sorted(pts, key=lambda t: t[0])[:_IDW_K]
+
+        def sample(when):
+            if when < start_dt or when > end_dt:
+                return None
+            num = den = 0.0
+            for d2, f, st, et in scored:
+                if when < st or when > et:
+                    continue
+                try:
+                    y = f((when - st).total_seconds()).item()
+                except Exception:
+                    continue
+                if y < 0:
+                    y = 0.0
+                w = 1.0 / (d2 + _IDW_EPS)
+                num += w * y
+                den += w
+            if den <= 0:
+                return None
+            return clamp_value(param, num / den)
+
+        return sample, uom, start_dt, end_dt
+
+    # gridpoints (default): resolve the single gridpoint and fit its spline.
+    model_class = model_from_type(kind)
+    try:
+        m = model_class.from_map_coordinate(coord, param)
+        start_dt, end_dt, _center, f, uom, _expiry = m.model
+    except Exception:
+        return None
+
+    def sample(when):
+        when_local = when.astimezone()
+        if when_local < start_dt or when_local > end_dt:
+            return None
+        try:
+            y = f((when_local - start_dt).total_seconds()).item()
+        except Exception:
+            return None
+        return clamp_value(param, y)
+
+    return sample, uom, start_dt, end_dt
+
+
+@router.get("/point", response_class=JSONResponse)
+def point(lat: float, lon: float, hours: int = 0, step: int = 3600,
+          attrs: str = ""):
+    """Compact current-conditions (and optional hourly) summary at a point.
+
+    Query params:
+      lat, lon  : required coordinate.
+      hours     : if >0, also include an `hourly` array covering the next
+                  `hours` hours (capped at 168 / 7 days).
+      step      : hourly sampling step in seconds (default 3600; min 600).
+      attrs     : optional comma-separated subset of attribute keys (e.g.
+                  "temperature,probability_of_precipitation"); default is all.
+
+    Returns:
+      {
+        "meta": {"lat","lon","source","generated","window":{"start","end"}},
+        "current": {"temperature": {"value": 54.2, "uom": "degF"}, ...},
+        "hourly":  [ {"time": "...", "values": {"temperature": {...}, ...}}, ... ]
+      }
+    Attributes the active source can't provide are present with a null value
+    (graceful no-op), so the response shape is stable. Values are numbers in
+    the source's native unit (`uom`); temperature is degF (the model's
+    built-in degC->degF wrapper), others are NOAA/GRIB native (e.g. PoP %,
+    QPF mm). A point outside NOAA coverage yields all-null values with a 200
+    (not a 404) so a consumer can distinguish "no coverage" from an error.
+    """
+    from datetime import datetime, timedelta
+
+    coord = MapCoordinate(lat, lon)
+    now = datetime.now()
+
+    # Resolve the requested attribute subset (default: all), preserving a
+    # stable key order. Unknown keys are ignored.
+    if attrs.strip():
+        requested = [k.strip() for k in attrs.split(",") if k.strip()]
+        keys = [k for k in _POINT_ATTRIBUTES if k in requested]
+    else:
+        keys = list(_POINT_ATTRIBUTES)
+
+    step = max(int(step or 3600), 600)
+    hours = max(0, min(int(hours or 0), 168))
+
+    # Build each attribute's sampler once, then evaluate at the needed times.
+    samplers = {}           # key -> (sample_fn, uom)
+    win_start = win_end = None
+    for key in keys:
+        kind, param = _POINT_ATTRIBUTES[key]
+        got = _point_sampler(kind, param, coord)
+        if got is None:
+            samplers[key] = None
+            continue
+        sample_fn, uom, s_dt, e_dt = got
+        samplers[key] = (sample_fn, uom)
+        # Track the intersection-ish overall window for meta (widest union).
+        if win_start is None or s_dt < win_start:
+            win_start = s_dt
+        if win_end is None or e_dt > win_end:
+            win_end = e_dt
+
+    def _eval_at(when):
+        out = {}
+        for key in keys:
+            s = samplers.get(key)
+            if s is None:
+                out[key] = {"value": None, "uom": None}
+                continue
+            sample_fn, uom = s
+            try:
+                val = sample_fn(when)
+            except Exception:
+                val = None
+            out[key] = {"value": val, "uom": uom or None}
+        return out
+
+    current = _eval_at(now)
+
+    hourly = []
+    if hours:
+        t = now
+        end = now + timedelta(hours=hours)
+        guard = 0
+        while t <= end and guard < 10000:
+            hourly.append({"time": t.astimezone().isoformat(),
+                           "values": _eval_at(t)})
+            t = t + timedelta(seconds=step)
+            guard += 1
+
+    return {
+        "meta": {
+            "lat": lat,
+            "lon": lon,
+            "source": weather_source(),
+            "generated": now.astimezone().isoformat(),
+            "window": {
+                "start": win_start.astimezone().isoformat() if win_start else None,
+                "end": win_end.astimezone().isoformat() if win_end else None,
+            },
+        },
+        "current": current,
+        "hourly": hourly,
+    }
+
+
 @router.get("/prefetch", status_code=204)
 def prefetch(lat: float, lon: float, width: float|None=None, height: float|None=None):
     coord = MapCoordinate(lat, lon)
@@ -458,8 +670,15 @@ def _field_extent(ensemble, area):
     # gridpoint centers don't reshape the box. Intersect (don't expand): if the
     # resolved cloud is smaller than the request (sparse coverage) keep the
     # cloud; if larger (snap overshoot) clip to the request.
+    #
+    # For the JSON `gridpoints` source, clamp to the EXACT drawn rectangle
+    # (`requested_bounds`) rather than the lattice-snapped `bounds`. `bounds`
+    # rounds OUTWARD to lattice lines (up to one ~2.5 km step per side), which
+    # visibly inflated the displayed area box beyond what the user drew. NDFD/
+    # NBM points ARE the lattice, so for them the clamp stays a no-op against
+    # `bounds` (using requested_bounds there could clip a legitimate edge cell).
     try:
-        rb = area.bounds
+        rb = area.requested_bounds if weather_source() == "gridpoints" else area.bounds
         min_lon = max(min_lon, rb["w"]); max_lon = min(max_lon, rb["e"])
         min_lat = max(min_lat, rb["s"]); max_lat = min(max_lat, rb["n"])
     except Exception:
@@ -468,8 +687,19 @@ def _field_extent(ensemble, area):
         return None
     # Mirror buildField: pad 5% of span per side, with a small floor when the
     # span is ~0 (single point / degenerate).
-    pad_lon = (max_lon - min_lon) * 0.05 or 0.01
-    pad_lat = (max_lat - min_lat) * 0.05 or 0.01
+    #
+    # For `gridpoints` we clamped to the EXACT drawn rectangle above, and the
+    # area-outline box is sized from this extent — so we DON'T pad here, or the
+    # displayed box would sit 5% proud of what the user drew. The client's
+    # buildField still pads its raster internally and then INTERSECTS with this
+    # (unpadded) hint, so the IDW raster is unaffected while the box matches the
+    # drawn rectangle. NDFD/NBM keep the pad (box == lattice extent + margin).
+    if weather_source() == "gridpoints":
+        pad_lon = 0.0 if (max_lon - min_lon) else 0.01
+        pad_lat = 0.0 if (max_lat - min_lat) else 0.01
+    else:
+        pad_lon = (max_lon - min_lon) * 0.05 or 0.01
+        pad_lat = (max_lat - min_lat) * 0.05 or 0.01
     return {
         "w": min_lon - pad_lon, "e": max_lon + pad_lon,
         "s": min_lat - pad_lat, "n": max_lat + pad_lat,

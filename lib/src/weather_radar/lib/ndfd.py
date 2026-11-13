@@ -205,10 +205,12 @@ def _download(element_file, time_range, force=False):
         pass  # writer unavailable -> inline fallback
 
     import requests
+    from .connection import noaa_user_agent
     os.makedirs(NDFD_DIR, exist_ok=True)
     tmp = path + ".tmp"
     try:
-        with requests.get(url, timeout=180, stream=True) as r:
+        with requests.get(url, timeout=180, stream=True,
+                          headers={"User-Agent": noaa_user_agent()}) as r:
             if not r.ok:
                 logger.warning("NDFD download %s -> HTTP %s", url, r.status_code)
                 # 404/410 = this element isn't published for this range;

@@ -426,16 +426,28 @@ def read_bundle_range(model, lat, lon, width, height, dt, kind):
             # gridpoint-center cloud. Reconstruct the area from bundle meta.
             try:
                 from weather_radar.lib.area import MapCoordinate, CoordinateArea
+                from weather_radar.lib.models import weather_source
                 m = meta.get("meta") or {}
                 _area = CoordinateArea(MapCoordinate(m["lat"], m["lon"]),
                                        m["width"], m["height"])
-                rb = _area.bounds
+                # For `gridpoints`, clamp to the EXACT drawn rectangle so the
+                # box matches what the user drew (not the lattice-snapped
+                # bounds). Matches _field_extent in the api.models router.
+                _gp = weather_source() == "gridpoints"
+                rb = _area.requested_bounds if _gp else _area.bounds
                 min_lon = max(min_lon, rb["w"]); max_lon = min(max_lon, rb["e"])
                 min_lat = max(min_lat, rb["s"]); max_lat = min(max_lat, rb["n"])
             except Exception:
-                pass
-            pad_lon = (max_lon - min_lon) * 0.05 or 0.01
-            pad_lat = (max_lat - min_lat) * 0.05 or 0.01
+                _gp = False
+            if _gp:
+                # No pad for gridpoints: the box is sized from this extent and
+                # the client re-intersects its padded raster with it, so the
+                # displayed box matches the drawn rectangle exactly.
+                pad_lon = 0.0 if (max_lon - min_lon) else 0.01
+                pad_lat = 0.0 if (max_lat - min_lat) else 0.01
+            else:
+                pad_lon = (max_lon - min_lon) * 0.05 or 0.01
+                pad_lat = (max_lat - min_lat) * 0.05 or 0.01
             rng = dict(rng)
             rng["extent"] = {
                 "w": min_lon - pad_lon, "e": max_lon + pad_lon,

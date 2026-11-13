@@ -613,6 +613,30 @@ class CoordinateArea:
         }
 
     @property
+    def requested_bounds(self):
+        """The EXACT drawn/viewport rectangle (w/e/s/n lon/lat): center ± half
+        the width/height spans, with NO snapping to the sampling lattice.
+
+        Unlike `bounds`, this does not round outward to lattice lines. Use it
+        to size the user-facing area-outline box so it matches what the user
+        actually drew — `bounds`/`index_bounds` legitimately round OUTWARD (via
+        floor/ceil) so the sample set fully covers the box, but that outward
+        snap (up to one ~2.5 km lattice step per side) would otherwise inflate
+        the displayed box beyond the drawn rectangle.
+
+        `width` is the LONGITUDE extent and `height` the LATITUDE extent (the
+        [lon,lat] convention the client uses when sizing a box), matching the
+        axis assignment in `index_bounds`."""
+        dlon = dkm_to_dlon(self.width, self.center.lat)   # width  -> lon degrees
+        dlat = dkm_to_dlat(self.height)                   # height -> lat degrees
+        return {
+            "s": self.center.lat - dlat / 2,
+            "n": self.center.lat + dlat / 2,
+            "w": self.center.lon - dlon / 2,
+            "e": self.center.lon + dlon / 2,
+        }
+
+    @property
     def map_coordinates(self):
         # Generate coordinates as (integer lattice index * step) rather than by
         # repeatedly adding `step`. Integer indexing avoids floating-point

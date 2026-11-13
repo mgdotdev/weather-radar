@@ -56,9 +56,17 @@ NBM_REGION = os.environ.get("NBM_REGION", "co")   # co=CONUS, ak, hi, pr, gu, oc
 CACHE_ROOT = os.environ.get("CACHE_DIR", "/tmp")
 NBM_DIR = os.path.join(CACHE_ROOT, "weather-radar-nbm")
 
-# A courteous UA (AWS doesn't require it, but keep parity with NWS fetches).
-NBM_USER_AGENT = os.environ.get("NBM_USER_AGENT",
-                                "weather-radar (self@michaelgreen.dev)")
+
+def _nbm_user_agent():
+    """UA for NBM fetches (AWS NOMADS). AWS doesn't require one, but we keep
+    parity with the NWS fetches and let NBM_USER_AGENT override; otherwise fall
+    back to the shared NOAA UA (WR_CONTACT_EMAIL etc.), so one contact config
+    covers every upstream."""
+    override = os.environ.get("NBM_USER_AGENT")
+    if override and override.strip():
+        return override.strip()
+    from .connection import noaa_user_agent
+    return noaa_user_agent()
 
 # NBM runs 4x/day. Try newest first, fall back.
 CYCLES = ("18", "12", "06", "00")
@@ -164,7 +172,7 @@ def _idx_url(day, cc, fhour):
 def _http_get(url, rng=None, timeout=60):
     """GET `url` (optionally a byte range), returning raw bytes or None."""
     import requests
-    headers = {"User-Agent": NBM_USER_AGENT}
+    headers = {"User-Agent": _nbm_user_agent()}
     if rng is not None:
         headers["Range"] = f"bytes={rng}"
     try:

@@ -19,6 +19,9 @@ container() {
       -e WR_STREAM_TIMING \
       -e WR_RESOLVE_TIMING \
       -e NOAA_MAX_CONCURRENCY \
+      -e NOAA_USER_AGENT \
+      -e WR_APP_NAME \
+      -e WR_CONTACT_EMAIL \
       -e WR_WEATHER_SOURCE \
       -e NDFD_SECTOR \
       -e NDFD_TTL_SECONDS \
@@ -54,6 +57,9 @@ server() {
           -e WR_STREAM_TIMING \
           -e WR_RESOLVE_TIMING \
           -e NOAA_MAX_CONCURRENCY \
+          -e NOAA_USER_AGENT \
+          -e WR_APP_NAME \
+          -e WR_CONTACT_EMAIL \
           -e WR_WEATHER_SOURCE \
           -e NDFD_SECTOR \
           -e NDFD_TTL_SECONDS \
@@ -97,6 +103,9 @@ dev() {
           -e WR_STREAM_TIMING \
           -e WR_RESOLVE_TIMING \
           -e NOAA_MAX_CONCURRENCY \
+          -e NOAA_USER_AGENT \
+          -e WR_APP_NAME \
+          -e WR_CONTACT_EMAIL \
           -e WR_WEATHER_SOURCE \
           -e NDFD_SECTOR \
           -e NDFD_TTL_SECONDS \

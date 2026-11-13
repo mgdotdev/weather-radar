@@ -156,13 +156,13 @@ class TestMissingRangeNegativeCache:
 # --- Source selection (WR_WEATHER_SOURCE) -----------------------------------
 
 class TestSourceSelection:
-    def test_default_is_ndfd(self, monkeypatch):
+    def test_default_is_gridpoints(self, monkeypatch):
         monkeypatch.delenv("WR_WEATHER_SOURCE", raising=False)
         import weather_radar.lib.models as models
-        assert models.weather_source() == "ndfd"
+        assert models.weather_source() == "gridpoints"
         kinds = models.ensemble_kinds()
-        assert kinds["observation"].__name__ == "NDFDObservationEnsemble"
-        assert kinds["accumulation"].__name__ == "NDFDAccumulationEnsemble"
+        assert kinds["observation"].__name__ == "ObservationEnsemble"
+        assert kinds["accumulation"].__name__ == "AccumulationEnsemble"
 
     def test_gridpoints_selected(self, monkeypatch):
         monkeypatch.setenv("WR_WEATHER_SOURCE", "gridpoints")
@@ -180,10 +180,10 @@ class TestSourceSelection:
         assert kinds["observation"].__name__ == "NDFDObservationEnsemble"
         assert kinds["accumulation"].__name__ == "NDFDAccumulationEnsemble"
 
-    def test_unknown_source_falls_back_to_ndfd(self, monkeypatch):
+    def test_unknown_source_falls_back_to_gridpoints(self, monkeypatch):
         monkeypatch.setenv("WR_WEATHER_SOURCE", "bogus")
         import weather_radar.lib.models as models
-        assert models.weather_source() == "ndfd"
+        assert models.weather_source() == "gridpoints"
 
 
 # --- Ensemble adapter (ObservationEnsemble contract) ------------------------

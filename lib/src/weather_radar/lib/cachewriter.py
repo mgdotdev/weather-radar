@@ -31,8 +31,10 @@ import logging
 import threading
 import tempfile
 import time
+import math
+import glob
 import concurrent.futures
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from multiprocessing.managers import BaseManager
 
 import requests
@@ -52,10 +54,25 @@ CACHE_WRITER_PORT = int(os.environ.get("CACHE_WRITER_PORT", "8137"))
 CACHE_WRITER_AUTHKEY = os.environ.get("CACHE_WRITER_AUTHKEY", "weather-radar-cache").encode()
 
 NOAA_BASE_URL = os.environ.get("NOAA_BASE_URL", "https://api.weather.gov")
-USER_AGENT = os.environ.get(
-    "NOAA_USER_AGENT", "Michael Green, self@michaelgreen.dev"
-)
 CACHE_ROOT = os.environ.get("CACHE_DIR", "/tmp")
+
+
+def _noaa_user_agent():
+    """NOAA User-Agent for the writer's session. Delegates to
+    connection.noaa_user_agent when importable as a package submodule; when
+    this module is loaded standalone (e.g. the test harness loads it by file
+    path, so relative imports can't resolve), fall back to the SAME env-driven
+    logic inline so behavior is identical."""
+    try:
+        from .connection import noaa_user_agent
+        return noaa_user_agent()
+    except (ImportError, ValueError):
+        override = os.environ.get("NOAA_USER_AGENT")
+        if override and override.strip():
+            return override.strip()
+        app = (os.environ.get("WR_APP_NAME") or "weather-radar").strip()
+        email = (os.environ.get("WR_CONTACT_EMAIL") or "").strip()
+        return f"{app} ({email})" if email else app
 
 
 # --- Path / cache-file helpers (kept independent of connection.PathObj) -----
@@ -140,6 +157,214 @@ def _write_change_marker(cache_file, content_hash):
         os.replace(tmp, marker)
     except OSError:
         pass
+
+
+# --- Local /points resolution from cached /gridpoints polygons --------------
+# Option A: before the writer issues a /points network call to api.weather.gov,
+# try to resolve the point LOCALLY against the polygons of /gridpoints docs we
+# already have on disk. Every NOAA gridpoint doc carries its cell polygon
+# (geometry.coordinates[0]); if the requested lat/lon falls inside one, that
+# gridpoint IS the point's answer (NOAA's /points -> grid mapping is just
+# "which cell contains this coordinate"). When we find a containing polygon we
+# synthesize the /points data.json ourselves and skip the network entirely.
+#
+# The index is built by scanning the on-disk /gridpoints cache and bucketing
+# each polygon by its centroid (coarse lat/lon buckets, same scheme as
+# area._POLY_INDEX). It's cached in-process and rebuilt only when the
+# gridpoints cache directory's mtime changes (a new doc was written), so the
+# scan cost is amortized across many /points resolutions. Disable with
+# WR_POLYGON_INDEX=0 (mirrors the reader-side gate in area.py).
+
+_POLY_INDEX_BUCKET_DEG = 0.25  # ~25-28 km cells; a handful of gridpoints each
+
+# How long a synthesized /points doc stays "fresh". The /points -> grid mapping
+# is effectively static (NOAA office grids don't move), so a long TTL is safe;
+# a rare re-probe costs one network /points. Overridable for testing.
+_SYNTH_POINTS_TTL_SEC = int(os.environ.get("WR_POINTS_SYNTH_TTL_SECONDS", str(7 * 24 * 3600)))
+
+# In-process polygon index: bucket (bx,by) -> list of ((gridId, x, y), ring).
+# Guarded by a lock since the writer's thread pool resolves paths concurrently.
+_poly_index = None
+_poly_index_dir_mtime = None
+_poly_index_lock = threading.Lock()
+
+
+def _gridpoints_root():
+    """Directory that holds the cached /gridpoints docs."""
+    return os.path.join(CACHE_ROOT, "api.weather.gov", "gridpoints")
+
+
+def _poly_bucket(lon, lat):
+    return (math.floor(lon / _POLY_INDEX_BUCKET_DEG),
+            math.floor(lat / _POLY_INDEX_BUCKET_DEG))
+
+
+def _ring_centroid(ring):
+    pts = ring[:-1] if len(ring) > 1 and ring[0] == ring[-1] else ring
+    n = len(pts)
+    return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
+
+
+def _point_in_ring(lon, lat, ring):
+    """Ray-casting point-in-polygon for a ring of [lon,lat] corners."""
+    pts = ring[:-1] if len(ring) > 1 and ring[0] == ring[-1] else ring
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        if (y1 > lat) != (y2 > lat):
+            xint = x1 + (lat - y1) * (x2 - x1) / (y2 - y1)
+            if lon < xint:
+                inside = not inside
+    return inside
+
+
+def _dir_mtime(root):
+    """mtime of the gridpoints tree, used to decide whether to rebuild the
+    index. We stat the top dir and its immediate WFO subdirs: a newly-written
+    gridpoint doc creates/updates a <WFO>/<x,y> dir, which bumps the WFO dir's
+    mtime. Cheap relative to re-scanning every doc."""
+    latest = 0.0
+    try:
+        latest = os.path.getmtime(root)
+    except OSError:
+        return None
+    try:
+        for wfo in os.scandir(root):
+            if wfo.is_dir():
+                try:
+                    latest = max(latest, wfo.stat().st_mtime)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return latest
+
+
+def _build_poly_index(root):
+    """Scan the on-disk /gridpoints cache and return a centroid-bucketed index
+    {bucket: [((gridId, x, y), ring), ...]}. Best-effort: unreadable/partial
+    docs are skipped."""
+    index = {}
+    # Layout: <root>/<WFO>/<x>,<y>/data.json
+    for data_file in glob.iglob(os.path.join(root, "*", "*", "data.json")):
+        try:
+            # .../gridpoints/<WFO>/<x>,<y>/data.json
+            xy_dir = os.path.dirname(data_file)
+            wfo = os.path.basename(os.path.dirname(xy_dir))
+            x_str, y_str = os.path.basename(xy_dir).split(",")
+            gid = (wfo, int(x_str), int(y_str))
+        except Exception:
+            continue
+        try:
+            with open(data_file) as f:
+                doc = json.load(f)
+            ring = doc["json"]["geometry"]["coordinates"][0]
+            clon, clat = _ring_centroid(ring)
+        except Exception:
+            continue
+        index.setdefault(_poly_bucket(clon, clat), []).append((gid, ring))
+    return index
+
+
+def _get_poly_index():
+    """Return the current polygon index, rebuilding it if the gridpoints cache
+    directory has changed since the last build. Returns {} if the cache dir is
+    absent or the feature is disabled."""
+    if os.environ.get("WR_POLYGON_INDEX", "1") == "0":
+        return {}
+    root = _gridpoints_root()
+    mtime = _dir_mtime(root)
+    if mtime is None:
+        return {}
+    global _poly_index, _poly_index_dir_mtime
+    with _poly_index_lock:
+        if _poly_index is None or _poly_index_dir_mtime != mtime:
+            _poly_index = _build_poly_index(root)
+            _poly_index_dir_mtime = mtime
+        return _poly_index
+
+
+def _parse_points_path(path):
+    """Return (lat, lon) floats for a '/points/{lat},{lon}' path, or None if it
+    isn't a resolvable /points path."""
+    p = path.lstrip("/")
+    if not p.startswith("points/"):
+        return None
+    rest = p[len("points/"):]
+    try:
+        lat_s, lon_s = rest.split(",")
+        return float(lat_s), float(lon_s)
+    except ValueError:
+        return None
+
+
+def _lookup_gridpoint(lon, lat):
+    """Return (gridId, x, y) for the cached gridpoint polygon containing
+    (lon,lat), or None. Checks the point's bucket and its 8 neighbors (a
+    polygon may straddle a bucket boundary)."""
+    index = _get_poly_index()
+    if not index:
+        return None
+    bx, by = _poly_bucket(lon, lat)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for gid, ring in index.get((bx + dx, by + dy), ()):
+                if _point_in_ring(lon, lat, ring):
+                    return gid
+    return None
+
+
+def _resolve_points_locally(path, cache_file, d):
+    """Try to satisfy a '/points/{lat},{lon}' request from cached /gridpoints
+    polygons, WITHOUT a network call. On success, synthesize and atomically
+    write the /points data.json (mirroring NOAA's shape: properties.gridId /
+    gridX / gridY, plus an Expires header so the reader's freshness check
+    works) and return True. Returns False if the point can't be resolved
+    locally (caller then falls through to the network fetch)."""
+    parsed = _parse_points_path(path)
+    if parsed is None:
+        return False
+    lat, lon = parsed
+    gid = _lookup_gridpoint(lon, lat)
+    if gid is None:
+        return False
+    wfo, gx, gy = gid
+    expires_dt = datetime.now(timezone.utc) + timedelta(seconds=_SYNTH_POINTS_TTL_SEC)
+    expires_hdr = expires_dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    payload = {
+        "headers": {
+            "Expires": expires_hdr,
+            "Content-Type": "application/geo+json",
+            # Marks this doc as writer-synthesized (vs. a real NOAA response),
+            # for debugging; readers ignore unknown headers.
+            "X-WR-Synthesized": "points-from-gridpoint",
+        },
+        "json": {
+            "properties": {
+                "gridId": wfo,
+                "gridX": gx,
+                "gridY": gy,
+            }
+        },
+    }
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, cache_file)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        _stamp_expiry(cache_file, expires_hdr)
+        logger.debug("cachewriter: resolved %s locally -> %s/%s,%s (no network)",
+                     path, wfo, gx, gy)
+        return True
+    except OSError:
+        return False
 
 
 def _is_fresh(cache_file):
@@ -315,7 +540,10 @@ class _Writer:
 
     def __init__(self):
         self._session = requests.session()
-        self._session.headers["User-Agent"] = USER_AGENT
+        # Resolve the NOAA UA here (not at import) so env configured before the
+        # writer PROCESS starts is honored. Imported lazily to keep this module
+        # independent of the connection layer (which lazily imports us).
+        self._session.headers["User-Agent"] = _noaa_user_agent()
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENCY)
         # Per-path locks so two overlapping jobs don't fetch the same URL twice.
         self._path_locks = {}
@@ -344,6 +572,12 @@ class _Writer:
         with lk:
             # Re-check inside the lock (another thread may have just written).
             if _is_fresh(cache_file) or _tombstone_valid(cache_file):
+                return True
+            # Option A: resolve /points locally from cached /gridpoints
+            # polygons before hitting the network. If the point falls inside a
+            # gridpoint we already have on disk, synthesize the /points doc and
+            # skip the api.weather.gov call entirely.
+            if _resolve_points_locally(path, cache_file, d):
                 return True
             try:
                 resp = _retry_get(self._session, url)

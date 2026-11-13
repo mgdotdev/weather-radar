@@ -192,13 +192,15 @@ def _latest_cycle():
     trying today's 12z, today's 06z, then yesterday's. Returns None if none
     reachable."""
     import requests
+    from .connection import noaa_user_agent
+    _ua = {"User-Agent": noaa_user_agent()}
     now = datetime.now(timezone.utc)
     for day_offset in (0, 1):
         day = (now - timedelta(days=day_offset)).strftime("%Y%m%d")
         for cyc in CYCLES:
             url = f"{NOMADS_BASE}/aqm.{day}/{cyc}/"
             try:
-                r = requests.get(url, timeout=15)
+                r = requests.get(url, timeout=15, headers=_ua)
                 if r.ok and f"aqm.t{cyc}z" in r.text:
                     return day, cyc
             except Exception:
@@ -298,10 +300,12 @@ def _download_grib(day, cyc, pollutant, force=False):
         pass
 
     import requests
+    from .connection import noaa_user_agent
     tmp = path + ".tmp"
     try:
         os.makedirs(NAQFC_DIR, exist_ok=True)
-        with requests.get(url, timeout=120, stream=True) as r:
+        with requests.get(url, timeout=120, stream=True,
+                          headers={"User-Agent": noaa_user_agent()}) as r:
             if not r.ok:
                 logger.warning("NAQFC download %s -> HTTP %s", url, r.status_code)
                 return path if os.path.exists(path) else None

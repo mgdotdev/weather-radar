@@ -27,5 +27,30 @@ RUN python3 -m pip install --upgrade pip \
  && python -m pip install -e ./server --no-cache-dir \
  && chown -R weather-radar /home/weather-radar
 
+# Persistent data dir (NOAA cache + GRIB files + cache-writer lock + server log
+# + minted access tokens). Created and owned by the runtime user so it's
+# writable whether or not a volume is mounted over it. Declared a VOLUME so a
+# plain `docker run` still persists it; compose/TrueNAS bind a dataset here.
+RUN mkdir -p /data && chown weather-radar /data
+VOLUME ["/data"]
+
 USER weather-radar
+
+# Default runtime config. Override any of these at `docker run`/compose time.
+# CACHE_DIR doubles as the auth-token + log dir (see WR_AUTH_DIR/LOG_DIR); mount
+# a persistent volume at /data so the NOAA cache and minted tokens survive a
+# restart. WR_WORKERS controls the uvicorn worker count.
+ENV CACHE_DIR=/data \
+    WR_AUTH_DIR=/data \
+    LOG_DIR=/data \
+    WR_WORKERS=4
+
+EXPOSE 8000
+
+# Start the API server. `--factory` matches run.sh: server() builds the FastAPI
+# app (installing access control + spawning the single cache-writer/scheduler
+# via the leader lock). JSON exec form (so SIGTERM reaches the process for a
+# clean shutdown) wrapping `sh -c` + `exec` so ${WR_WORKERS} is still expanded
+# at runtime while uvicorn becomes PID 1.
+CMD ["sh", "-c", "exec python -m uvicorn weather_radar.server.__main__:server --factory --workers ${WR_WORKERS} --host 0.0.0.0 --port 8000"]
 

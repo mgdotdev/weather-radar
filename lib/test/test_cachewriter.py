@@ -211,3 +211,108 @@ class TestContentChangeMarker:
         # No marker written. Fallback must hash the body and match.
         assert not os.path.exists(cw._change_marker(cache_file))
         assert cw._read_existing_hash(cache_file) == cw._content_hash(payload)
+
+
+class TestLocalPointsResolution:
+    """Option A: the writer resolves /points/{lat},{lon} locally from cached
+    /gridpoints polygons, synthesizing the /points doc and skipping the
+    network. These exercise the helpers directly (no writer process / network),
+    the same pattern as TestContentChangeMarker."""
+
+    def _load_cw(self, monkeypatch, cache_dir):
+        monkeypatch.setenv("CACHE_DIR", cache_dir)
+        fake = types.ModuleType("requests")
+        exc = types.ModuleType("requests.exceptions")
+        exc.ConnectionError = type("ConnectionError", (Exception,), {})
+        exc.Timeout = type("Timeout", (Exception,), {})
+        fake.exceptions = exc
+        fake.session = lambda: None
+        monkeypatch.setitem(sys.modules, "requests", fake)
+        here = os.path.dirname(__file__)
+        src = os.path.abspath(os.path.join(
+            here, "..", "src", "weather_radar", "lib", "cachewriter.py"))
+        spec = importlib.util.spec_from_file_location("cw_points_under_test", src)
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, "cw_points_under_test", mod)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _seed_gridpoint(self, cw, wfo, x, y, ring):
+        """Write a cached /gridpoints doc carrying `ring` as its cell polygon."""
+        _url, d, cache_file = cw._tempfile_for(f"/gridpoints/{wfo}/{x},{y}")
+        os.makedirs(d, exist_ok=True)
+        doc = {
+            "headers": {"Expires": "Wed, 01 Jan 2099 00:00:00 GMT"},
+            "json": {"geometry": {"type": "Polygon", "coordinates": [ring]}},
+        }
+        with open(cache_file, "w") as f:
+            json.dump(doc, f)
+
+    @staticmethod
+    def _square(lon0, lat0, size):
+        return [[lon0, lat0], [lon0 + size, lat0], [lon0 + size, lat0 + size],
+                [lon0, lat0 + size], [lon0, lat0]]
+
+    def test_point_inside_cached_polygon_resolves_without_network(self, monkeypatch):
+        cache_dir = tempfile.mkdtemp()
+        cw = self._load_cw(monkeypatch, cache_dir)
+        # A cached gridpoint whose polygon is a 0.05deg square.
+        self._seed_gridpoint(cw, "OTX", 164, 91, self._square(-116.70, 47.75, 0.05))
+
+        # A point inside that square. _fetch_one would normally network-fetch;
+        # here we drive the local resolver directly.
+        path = "/points/47.76,-116.68"
+        _url, d, cache_file = cw._tempfile_for(path)
+        assert cw._resolve_points_locally(path, cache_file, d) is True
+
+        # The synthesized /points doc is on disk, fresh, and carries the grid.
+        assert os.path.isfile(cache_file)
+        assert cw._is_fresh(cache_file)
+        doc = json.load(open(cache_file))
+        props = doc["json"]["properties"]
+        assert (props["gridId"], props["gridX"], props["gridY"]) == ("OTX", 164, 91)
+
+    def test_point_outside_any_polygon_is_not_resolved(self, monkeypatch):
+        cache_dir = tempfile.mkdtemp()
+        cw = self._load_cw(monkeypatch, cache_dir)
+        self._seed_gridpoint(cw, "OTX", 164, 91, self._square(-116.70, 47.75, 0.05))
+        # Far from the only cached polygon -> falls through to the network.
+        path = "/points/40.0,-100.0"
+        _url, d, cache_file = cw._tempfile_for(path)
+        assert cw._resolve_points_locally(path, cache_file, d) is False
+        assert not os.path.isfile(cache_file)
+
+    def test_disabled_by_env(self, monkeypatch):
+        cache_dir = tempfile.mkdtemp()
+        cw = self._load_cw(monkeypatch, cache_dir)
+        self._seed_gridpoint(cw, "OTX", 164, 91, self._square(-116.70, 47.75, 0.05))
+        monkeypatch.setenv("WR_POLYGON_INDEX", "0")
+        path = "/points/47.76,-116.68"
+        _url, d, cache_file = cw._tempfile_for(path)
+        # Even though the point is inside a cached polygon, the index is off.
+        assert cw._resolve_points_locally(path, cache_file, d) is False
+        assert not os.path.isfile(cache_file)
+
+    def test_index_rebuilds_when_new_gridpoint_cached(self, monkeypatch):
+        cache_dir = tempfile.mkdtemp()
+        cw = self._load_cw(monkeypatch, cache_dir)
+        self._seed_gridpoint(cw, "OTX", 164, 91, self._square(-116.70, 47.75, 0.05))
+
+        # Point inside a not-yet-cached neighboring cell: initially unresolved.
+        path = "/points/47.72,-116.74"
+        _url, d, cache_file = cw._tempfile_for(path)
+        assert cw._resolve_points_locally(path, cache_file, d) is False
+
+        # Cache the neighbor; the dir mtime bumps, so the index rebuilds and
+        # the same point now resolves locally.
+        time.sleep(0.02)
+        self._seed_gridpoint(cw, "OTX", 163, 90, self._square(-116.75, 47.70, 0.05))
+        assert cw._resolve_points_locally(path, cache_file, d) is True
+        doc = json.load(open(cache_file))
+        props = doc["json"]["properties"]
+        assert (props["gridId"], props["gridX"], props["gridY"]) == ("OTX", 163, 90)
+
+    def test_non_points_path_ignored(self, monkeypatch):
+        cw = self._load_cw(monkeypatch, tempfile.mkdtemp())
+        assert cw._parse_points_path("/gridpoints/OTX/1,2") is None
+        assert cw._parse_points_path("/points/47.1,-116.2") == (47.1, -116.2)
