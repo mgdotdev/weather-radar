@@ -47,10 +47,12 @@ services:
 
       # --- NOAA contact (User-Agent) ---------------------------------------
       # api.weather.gov REQUIRES a User-Agent and asks it include a contact
-      # email so NWS can reach you. Sent as "weather-radar (your@email)".
+      # email so NWS can reach you. Sent as "weather-radar (your@email)". The
+      # same email also identifies the app to Nominatim (address search).
       WR_CONTACT_EMAIL: "${WR_CONTACT_EMAIL:-}"
       # WR_APP_NAME: "weather-radar"           # app id in the UA
-      # NOAA_USER_AGENT: ""                     # full UA override
+      # NOAA_USER_AGENT: ""                     # full NOAA UA override
+      # GEOCODE_USER_AGENT: ""                  # full Nominatim UA override
 
       # --- Logging ----------------------------------------------------------
       LOG_LEVEL: "${LOG_LEVEL:-WARNING}"

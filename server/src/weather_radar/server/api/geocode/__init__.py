@@ -19,6 +19,7 @@ cache further reduces upstream calls.
 """
 
 import logging
+import os
 import threading
 import time
 
@@ -29,9 +30,41 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/geocode")
 
-# Upstream provider + identifying UA (Nominatim requires a real contact).
+# Upstream provider.
 _NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-_USER_AGENT = "weather-radar (self-hosted); Michael Green, self@michaelgreen.dev"
+
+
+# Identifying User-Agent. Nominatim's usage policy requires a valid UA that
+# identifies the application and carries a contact. Built from env so a
+# self-hosted deployment supplies its OWN contact (shared with the NOAA UA):
+#
+#   GEOCODE_USER_AGENT  full override — if set, used verbatim (highest prio).
+#   WR_APP_NAME         app identifier (default "weather-radar").
+#   WR_CONTACT_EMAIL    contact; appended as "<app> (self-hosted); <email>".
+#
+# With no contact configured we still send a valid UA but log a one-time
+# warning, since the policy asks for a reachable contact.
+_geocode_ua_warned = False
+
+
+def _user_agent():
+    """Return the Nominatim User-Agent. See the note above for precedence."""
+    global _geocode_ua_warned
+    override = os.environ.get("GEOCODE_USER_AGENT")
+    if override and override.strip():
+        return override.strip()
+    app = (os.environ.get("WR_APP_NAME") or "weather-radar").strip()
+    email = (os.environ.get("WR_CONTACT_EMAIL") or "").strip()
+    if email:
+        return f"{app} (self-hosted); {email}"
+    if not _geocode_ua_warned:
+        logger.warning(
+            "No geocode contact configured: set WR_CONTACT_EMAIL (or "
+            "GEOCODE_USER_AGENT) so Nominatim can reach you. Sending a bare "
+            "User-Agent %r.", app,
+        )
+        _geocode_ua_warned = True
+    return f"{app} (self-hosted)"
 
 # Upstream request timeout (seconds). A geocode is interactive, so fail fast
 # rather than hanging the user's pin drop.
@@ -130,7 +163,7 @@ def geocode(q: str = "", limit: int = 1, viewbox: str = "", bounded: int = 0):
         resp = requests.get(
             _NOMINATIM_URL,
             params=params,
-            headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+            headers={"User-Agent": _user_agent(), "Accept": "application/json"},
             timeout=_TIMEOUT,
         )
     except requests.RequestException:

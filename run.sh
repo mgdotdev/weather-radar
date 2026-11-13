@@ -22,6 +22,7 @@ container() {
       -e NOAA_USER_AGENT \
       -e WR_APP_NAME \
       -e WR_CONTACT_EMAIL \
+      -e GEOCODE_USER_AGENT \
       -e WR_WEATHER_SOURCE \
       -e NDFD_SECTOR \
       -e NDFD_TTL_SECONDS \
@@ -60,6 +61,7 @@ server() {
           -e NOAA_USER_AGENT \
           -e WR_APP_NAME \
           -e WR_CONTACT_EMAIL \
+          -e GEOCODE_USER_AGENT \
           -e WR_WEATHER_SOURCE \
           -e NDFD_SECTOR \
           -e NDFD_TTL_SECONDS \
@@ -106,6 +108,7 @@ dev() {
           -e NOAA_USER_AGENT \
           -e WR_APP_NAME \
           -e WR_CONTACT_EMAIL \
+          -e GEOCODE_USER_AGENT \
           -e WR_WEATHER_SOURCE \
           -e NDFD_SECTOR \
           -e NDFD_TTL_SECONDS \
