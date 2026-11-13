@@ -79,6 +79,55 @@ _cache = {}
 _cache_lock = threading.Lock()
 
 
+# --- Upstream rate limit ----------------------------------------------------
+# Nominatim's usage policy caps us at an ABSOLUTE MAXIMUM of 1 request/second.
+# This gate serializes the actual upstream calls (cache HITS never reach it) so
+# consecutive Nominatim requests are spaced >= _MIN_INTERVAL apart regardless
+# of how fast clients type. An interactive geocode can therefore wait briefly
+# for a slot; if the backlog would mean waiting longer than _MAX_WAIT, we give
+# up with a 503 rather than queueing unboundedly (a pin-drop should fail fast,
+# not hang).
+#
+# CAVEAT: this is PER WORKER PROCESS. uvicorn runs several workers, each with
+# its own gate, so the global rate can be up to (workers x 1/s). For a
+# self-hosted homelab instance with a handful of users that stays comfortably
+# within tolerance; if you run many workers and want a hard global cap, front
+# the proxy with a shared limiter (e.g. Redis) or run your own Nominatim.
+_MIN_INTERVAL = float(os.environ.get("GEOCODE_MIN_INTERVAL", "1.0"))  # seconds
+_MAX_WAIT = float(os.environ.get("GEOCODE_MAX_WAIT", "3.0"))          # seconds
+
+
+class _RateGate:
+    """Serializes upstream calls to at most one per `min_interval` seconds.
+
+    `acquire(max_wait)` blocks until the next slot is available, reserves it,
+    and returns True; returns False immediately if the slot is further out than
+    `max_wait` (so the caller can shed load instead of queueing). Thread-safe.
+    """
+
+    def __init__(self, min_interval):
+        self._min_interval = min_interval
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0  # monotonic epoch of the next permitted call
+
+    def acquire(self, max_wait):
+        with self._lock:
+            now = time.monotonic()
+            wait = self._next_allowed - now
+            if wait > max_wait:
+                return False
+            # Reserve this slot (and push the next one out) BEFORE sleeping, so
+            # concurrent callers serialize instead of all grabbing "now".
+            start = max(now, self._next_allowed)
+            self._next_allowed = start + self._min_interval
+        if wait > 0:
+            time.sleep(wait)
+        return True
+
+
+_rate_gate = _RateGate(_MIN_INTERVAL)
+
+
 def _cache_get(key):
     now = time.time()
     with _cache_lock:
@@ -150,6 +199,14 @@ def geocode(q: str = "", limit: int = 1, viewbox: str = "", bounded: int = 0):
     cached = _cache_get(cache_key)
     if cached is not None:
         return JSONResponse({"results": cached})
+
+    # Cache MISS -> we must hit Nominatim. Enforce the <=1 req/s upstream cap
+    # (cache hits above bypass this, since they make no upstream call). If the
+    # rate-limit backlog would make an interactive geocode wait too long, shed
+    # the request with 503 rather than queueing unboundedly.
+    if not _rate_gate.acquire(_MAX_WAIT):
+        logger.info("geocode rate-limited (upstream slot > %.1fs out)", _MAX_WAIT)
+        return JSONResponse({"error": "rate_limited"}, status_code=503)
 
     # `requests` ships with the lib package (installed in the same venv).
     import requests

@@ -156,9 +156,10 @@
     <div id="pins"></div>
 
     <!-- Address search box. Opened from the right-click menu's "Drop pin by
-         address…"; typing shows a live autocomplete list of geocoded matches,
-         and selecting one drops a pin and pans to it. Hidden until opened.
-         Glassy (translucent + backdrop blur), large, centered in the window. -->
+         address…"; typing shows a list of geocoded matches (the query is sent
+         only after a 1s pause, per Nominatim's <=1 req/s policy), and selecting
+         one drops a pin and pans to it. Hidden until opened. Glassy
+         (translucent + backdrop blur), large, centered in the window. -->
     <div id="addrSearchPanel" style="position:fixed; z-index:106; top:50%;
       left:50%; transform:translate(-50%,-50%); display:none;
       width:min(640px,92vw);
@@ -1422,6 +1423,9 @@
       let addrSelected = -1     // committed selection; >=0 freezes the list
       let addrSeq = 0           // guards against out-of-order async responses
       let addrDebounce = null
+      // Wait this long after the LAST keystroke before querying the geocoder,
+      // to honor Nominatim's <=1 req/s policy (see the input handler below).
+      const ADDR_DEBOUNCE_MS = 1000
 
       function openAddrSearch() {
         addrPanel.style.display = "block"
@@ -1547,8 +1551,14 @@
           addrSeq++                        // cancel any in-flight response
           return
         }
-        // Debounce so we send ~one request per typing pause (Nominatim-friendly).
-        addrDebounce = setTimeout(() => runAddrSearch(q), 350)
+        // Debounce a full second from the LAST keystroke before querying, to
+        // respect Nominatim's <=1 req/s policy (the server enforces this too,
+        // but gating the client keeps us from even attempting a burst while
+        // typing). Show "Searching…" immediately so the wait has feedback;
+        // the request only fires once typing pauses for ADDR_DEBOUNCE_MS.
+        addrSeq++                          // cancel any in-flight response now
+        addrStatus.textContent = "Searching…"
+        addrDebounce = setTimeout(() => runAddrSearch(q), ADDR_DEBOUNCE_MS)
       })
 
       // Drop the committed selection (but keep the box open + the suggestions

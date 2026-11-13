@@ -60,6 +60,8 @@ services:
       # --- Optional tuning (uncomment to override image defaults) ----------
       # NOAA_MAX_CONCURRENCY: "48"      # max simultaneous NOAA fetches (writer)
       # WR_POLYGON_INDEX: "1"           # 0 disables the cached-polygon /points shortcut
+      # GEOCODE_MIN_INTERVAL: "1.0"     # Nominatim upstream rate cap (sec/request)
+      # GEOCODE_MAX_WAIT: "3.0"         # max wait for a geocode slot before 503
       # WR_NDFD_UPSAMPLE: "1"           # k>1 densifies the NDFD lattice kxk
       # WR_AQI_UPSAMPLE: "1"
       # WR_NBM_UPSAMPLE: "1"
