@@ -110,21 +110,26 @@ class AccumulationModel:
         end_time = data[-1][0]
         # A null value means "no accumulation reported for this interval", so
         # treat it as 0 when summing. (Summing a None would raise TypeError and
-        # silently drop the whole gridpoint.) Values are scaled to the display
-        # unit as they're summed.
-        model_data = [
-            ((a-start_time).total_seconds(),
-             sum((d[1] or 0) for d in data[:i+1]) * factor)
-            for i, (a, _) in enumerate(data)
-        ]
+        # silently drop the whole gridpoint.) Per-interval amounts are clamped
+        # to >= 0 (accumulation is physically non-negative; a stray negative
+        # would make the cumulative total non-monotone) and scaled to the
+        # display unit, then accumulated into a running total.
+        cumulative = 0.0
+        model_data = []
+        for i, (a, _) in enumerate(data):
+            amount = max((data[i][1] or 0), 0) * factor
+            cumulative += amount
+            model_data.append(((a - start_time).total_seconds(), cumulative))
         model_data = list(zip(*model_data))
         x, y = model_data
-        # `make_interp_spline` returns a BSpline that *interpolates* the given
-        # (time, cumulative-precip) points. Using `BSpline(x, y, k=3)` directly
-        # is incorrect: it treats `x` as the knot vector and `y` as spline
-        # coefficients, so the resulting curve does not pass through the data
-        # and yields meaningless accumulation values.
-        model = interpolate.make_interp_spline(x, y, k=3)
+        # Fit a MONOTONE interpolator. The cumulative series is non-decreasing
+        # by construction, but a plain cubic spline (make_interp_spline) can
+        # OVERSHOOT and dip between knots, producing a spurious negative slope —
+        # i.e. a cumulative snowfall graph that goes DOWN. PchipInterpolator is
+        # shape-preserving: monotone on monotone data, so dx/dt stays >= 0.
+        # This matches the GRIB accumulation path (lib.interp.fit_series /
+        # lib.nbm), which already uses PCHIP for exactly this reason.
+        model = interpolate.PchipInterpolator(x, y)
         return start_time, end_time, center_coordinate, model, units, expiry
 
     def predict(self, time, verbose=False):
