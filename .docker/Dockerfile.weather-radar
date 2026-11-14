@@ -52,5 +52,13 @@ EXPOSE 8000
 # via the leader lock). JSON exec form (so SIGTERM reaches the process for a
 # clean shutdown) wrapping `sh -c` + `exec` so ${WR_WORKERS} is still expanded
 # at runtime while uvicorn becomes PID 1.
-CMD ["sh", "-c", "exec python -m uvicorn weather_radar.server.__main__:server --factory --workers ${WR_WORKERS} --host 0.0.0.0 --port 8000"]
+#
+# --proxy-headers + --forwarded-allow-ips: this runs behind a reverse proxy
+# (NPM/Caddy) that terminates TLS and sets X-Forwarded-Proto / X-Forwarded-For.
+# Honoring them lets the app see the real client IP and know the request came
+# in over HTTPS. WR_FORWARDED_ALLOW_IPS bounds which upstream hop is trusted
+# (default "*" — fine when the app is only reachable via the proxy on a private
+# network; set it to the proxy's IP to be strict).
+ENV WR_FORWARDED_ALLOW_IPS="*"
+CMD ["sh", "-c", "exec python -m uvicorn weather_radar.server.__main__:server --factory --workers ${WR_WORKERS} --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips \"${WR_FORWARDED_ALLOW_IPS}\""]
 
