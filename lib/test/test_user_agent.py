@@ -26,8 +26,8 @@ class TestNoaaUserAgent:
 
     def test_app_and_email(self, monkeypatch):
         assert _ua(monkeypatch, WR_APP_NAME="weather-radar",
-                   WR_CONTACT_EMAIL="self@michaelgreen.dev") \
-            == "weather-radar (self@michaelgreen.dev)"
+                   WR_CONTACT_EMAIL="you@example.com") \
+            == "weather-radar (you@example.com)"
 
     def test_email_only_uses_default_app(self, monkeypatch):
         assert _ua(monkeypatch, WR_CONTACT_EMAIL="a@b.com") \

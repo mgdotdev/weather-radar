@@ -30,8 +30,8 @@ class TestGeocodeUserAgent:
                    WR_CONTACT_EMAIL="ignored@x") == "myapp/2.0 (c@x)"
 
     def test_app_and_email(self, monkeypatch):
-        assert _ua(monkeypatch, WR_CONTACT_EMAIL="self@michaelgreen.dev") \
-            == "weather-radar (self-hosted); self@michaelgreen.dev"
+        assert _ua(monkeypatch, WR_CONTACT_EMAIL="you@example.com") \
+            == "weather-radar (self-hosted); you@example.com"
 
     def test_custom_app_and_email(self, monkeypatch):
         assert _ua(monkeypatch, WR_APP_NAME="wx", WR_CONTACT_EMAIL="a@b.com") \
