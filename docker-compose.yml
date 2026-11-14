@@ -17,13 +17,20 @@
 services:
   weather-radar:
     image: ghcr.io/mgdotdev/weather-radar:latest
+    # Build locally when the image above isn't present (so `docker compose up`
+    # works straight from a checkout). To deploy a PRE-BUILT image (e.g. the
+    # TrueNAS "Install via YAML" flow, which does not build), run
+    # `docker compose build` then `docker push` the `image:` tag and reference
+    # that tag instead.
+    build:
+      context: .
+      dockerfile: .docker/Dockerfile.weather-radar
     container_name: weather-radar
     restart: unless-stopped
 
     ports:
-      # host:container. 30050 follows the TrueNAS 300xx host-port convention in
-      # the homelab runbook; change the host side to whatever you proxy to in
-      # Nginx Proxy Manager / Caddy. The container always listens on 8000.
+      # host:container. The container always listens on 8000; map it to any
+      # free host port you'll point your reverse proxy at.
       - "30050:8000"
 
     environment:

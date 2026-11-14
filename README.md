@@ -11,62 +11,84 @@ and interpolation methods for functionalizing data across time and space.
 This is still a work in progress! MVP will be a precipitation model, but expect
 the supported models to expand.
 
-## Deploying with Docker Compose (TrueNAS "Install via YAML")
+## Running with Docker Compose
 
-The repo ships a `docker-compose.yml` and `.env.example` for a container
-deployment. TrueNAS SCALE's "Custom App → Install via YAML" flow runs a
-**pre-built image** (it does not build from the Dockerfile), so the steps are:
-build the image, push it to a registry, then install the compose YAML pointing
-at that tag.
+The repo ships a `docker-compose.yml` and `.env.example`. The image self-starts
+the server (uvicorn `--factory`, `WR_WORKERS` workers) and listens on port 8000.
+All state — the NOAA cache, downloaded GRIB files, the server log, and the
+minted access tokens — lives under `/data`, so mount a persistent volume there
+to keep tokens and the warm cache across restarts.
 
-### 1. Build and push the image
+### 1. Configure
 
 ```bash
-# From the repo root. Tag for your registry (default compose target is GHCR).
-docker build -t ghcr.io/mgdotdev/weather-radar:latest -f .docker/Dockerfile.weather-radar .
-echo "$GHCR_TOKEN" | docker login ghcr.io -u mgdotdev --password-stdin
-docker push ghcr.io/mgdotdev/weather-radar:latest
+cp .env.example .env
 ```
 
-The image self-starts the server (uvicorn `--factory`, `WR_WORKERS` workers)
-and exposes port 8000. All state (NOAA cache, GRIB files, minted access
-tokens, log) lives under `/data` — mount a persistent dataset there.
+Fill in `.env`:
 
-### 2. Generate the admin credentials
+- `WR_CONTACT_EMAIL` — your email. api.weather.gov requires a User-Agent and
+  asks that it include a contact; it's sent as `weather-radar (your@email)`.
+- `WR_ADMIN_PASSWORD_HASH` and `WR_ADMIN_SECRET` — see below.
+
+### 2. Generate admin credentials
 
 The app is always access-token gated, and the first token can only be minted
 from the password-protected `/admin` page. Generate a password hash and a
-session secret:
+stable session secret:
 
 ```bash
-./run.sh hash_password                       # -> WR_ADMIN_PASSWORD_HASH=scrypt$...
-python -c "import secrets; print(secrets.token_hex(32))"   # -> WR_ADMIN_SECRET
+./run.sh hash_password                                      # -> WR_ADMIN_PASSWORD_HASH=scrypt$...
+python -c "import secrets; print(secrets.token_hex(32))"    # -> WR_ADMIN_SECRET
 ```
 
-### 3. Install on TrueNAS
-
-Paste the contents of `docker-compose.yml` into **Apps → Custom App → Install
-via YAML**, then:
-
-- Set `image:` to the tag you pushed.
-- Fill `WR_ADMIN_PASSWORD_HASH` and `WR_ADMIN_SECRET` in the `environment:`
-  block (TrueNAS may not read a `.env` file).
-- Point the `/data` volume at a dataset writable by **UID 1000** (the image's
-  `weather-radar` user), e.g. replace the named volume with
-  `- /mnt/pool/apps/weather-radar:/data`.
-- Adjust the published host port (`30050:8000` by default) to match your
-  reverse-proxy config.
-
-Then wire it into the homelab the usual way (Caddy on the VPS, a Nginx Proxy
-Manager proxy host, and an AdGuard DNS rewrite for `weather.vancleave.io`).
-
-### Run it anywhere else
+### 3. Start
 
 ```bash
-cp .env.example .env    # fill in the admin hash/secret
 docker compose up -d
 ```
 
-`/health` is unauthenticated for liveness checks; everything under `/api/` and
-the map UI require the access token (`?token=` or the `X-Access-Token` header).
+Then open `/admin`, sign in with your admin password, and mint an access token.
+
+### Notes
+
+- **Persistence:** back `/data` with a host path or named volume. The image
+  runs as the unprivileged `weather-radar` user (UID 1000), so a bind-mounted
+  host path must be writable by UID 1000.
+- **Access control:** `/health` is unauthenticated (for liveness checks);
+  everything under `/api/` and the map UI require the access token, supplied as
+  `?token=...` or the `X-Access-Token` header.
+- **Reverse proxy:** the app speaks plain HTTP on 8000 with no TLS of its own.
+  Put it behind a reverse proxy to terminate HTTPS. No WebSocket support is
+  needed (streams use chunked HTTP responses).
+
+### Building and publishing the image
+
+`docker compose up` builds the image locally (from
+`.docker/Dockerfile.weather-radar`) when it isn't already present, so a plain
+checkout runs with no extra steps.
+
+To publish a pre-built image to a registry — e.g. for a host that installs from
+a registry tag rather than building — build and push the `image:` tag:
+
+```bash
+docker compose build
+docker push ghcr.io/mgdotdev/weather-radar:latest
+```
+
+Change the `image:` field in `docker-compose.yml` to your own registry/tag
+first if you're not pushing to the default.
+
+## Configuration
+
+Key environment variables (see `.env.example` for the full list):
+
+| Variable | Purpose |
+| --- | --- |
+| `WR_CONTACT_EMAIL` | Contact email sent in the NOAA / Nominatim User-Agent. |
+| `WR_ADMIN_PASSWORD_HASH` | scrypt hash gating the `/admin` token-management page. |
+| `WR_ADMIN_SECRET` | Stable key signing admin sessions (survives restarts). |
+| `WR_WEATHER_SOURCE` | `gridpoints` (default), `ndfd`, or `nbm`. |
+| `WR_WORKERS` | uvicorn worker count. |
+| `CACHE_DIR` / `WR_AUTH_DIR` / `LOG_DIR` | State locations (default `/data`). |
 
