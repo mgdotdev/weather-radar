@@ -116,6 +116,11 @@
             <button id="pinSizeDown" title="Smaller pins" class="ctlbtn">−</button>
             <span id="pinSizeLabel" class="ctlval">1.00×</span>
             <button id="pinSizeUp" title="Larger pins" class="ctlbtn">+</button>
+
+            <span style="font-size:11px; color:#555;">Legend size</span>
+            <button id="legendSizeDown" title="Smaller legend" class="ctlbtn">−</button>
+            <span id="legendSizeLabel" class="ctlval">1.00×</span>
+            <button id="legendSizeUp" title="Larger legend" class="ctlbtn">+</button>
           </div>
           <label style="display:flex; align-items:center; margin-top:8px;
               font-size:11px; color:#555; cursor:pointer;">
@@ -1144,6 +1149,46 @@
         else u.searchParams.set("pinSize", String(pinSize))
         history.replaceState(null, "", u.toString())
         applyPinSize()
+      }
+
+      // Legend size: a scale multiplier applied (as a CSS transform:scale) to
+      // the whole legend panel, stepped via the Settings +/- buttons and
+      // persisted in the URL (`legendSize=`). Scales from the panel's TOP-LEFT
+      // corner (transform-origin 0 0) so its anchored position (style.left/top,
+      // set by the drag handler) doesn't drift as it grows/shrinks.
+      const LEGEND_SIZE_MIN = 0.5, LEGEND_SIZE_MAX = 3.0, LEGEND_SIZE_STEP = 0.25
+      let legendSize = (() => {
+        const v = parseFloat(new URL(window.location.href).searchParams.get("legendSize"))
+        return Number.isFinite(v) ? Math.max(LEGEND_SIZE_MIN, Math.min(v, LEGEND_SIZE_MAX)) : 1.0
+      })()
+      function applyLegendSize() {
+        const el = document.getElementById("legend")
+        if (el) {
+          el.style.transformOrigin = "0 0"
+          el.style.transform = `scale(${legendSize})`
+        }
+        const lbl = document.getElementById("legendSizeLabel")
+        if (lbl) lbl.textContent = legendSize.toFixed(2) + "×"
+        // The time scrubber positions its handles from scWidth() (which now
+        // divides out this scale). Re-render so a resize repositions them to
+        // match the new box width instead of leaving them where the old width
+        // put them.
+        try {
+          if (typeof renderScrubber === "function") {
+            if (typeof scrubberReady !== "undefined" && scrubberReady) renderScrubber()
+            else if (typeof renderScrubberPlaceholder === "function") renderScrubberPlaceholder()
+          }
+        } catch (_) {}
+      }
+      function setLegendSize(scale) {
+        // Snap to the step grid (avoids float drift) and clamp to range.
+        const snapped = Math.round(scale / LEGEND_SIZE_STEP) * LEGEND_SIZE_STEP
+        legendSize = Math.max(LEGEND_SIZE_MIN, Math.min(snapped, LEGEND_SIZE_MAX))
+        const u = new URL(window.location.href)
+        if (Math.abs(legendSize - 1.0) < 1e-9) u.searchParams.delete("legendSize")
+        else u.searchParams.set("legendSize", String(legendSize))
+        history.replaceState(null, "", u.toString())
+        applyLegendSize()
       }
 
       function serializePins() {
@@ -3098,7 +3143,15 @@
       }
 
       function scWidth() {
-        const w = scrubberEl.getBoundingClientRect().width || 200
+        // getBoundingClientRect() returns the ON-SCREEN width, which includes
+        // any CSS transform:scale from the legend-size control. The scrubber's
+        // handle/playhead positions are set in the SVG's OWN (unscaled) user
+        // units — the transform then scales those too. So divide the rect
+        // width back down by the legend scale to recover the unscaled width;
+        // otherwise the scale is applied twice and the playhead/handles slide
+        // past the right edge of the box.
+        const scale = (typeof legendSize === "number" && legendSize > 0) ? legendSize : 1
+        const w = (scrubberEl.getBoundingClientRect().width / scale) || 200
         return Math.max(1, w - 2 * SC_PAD)
       }
       // epoch (within forecast range) -> x pixel, and inverse.
@@ -3292,7 +3345,9 @@
         ["stepUp", () => stepContour(+1)],
         ["stepDown", () => stepContour(-1)],
         ["pinSizeUp", () => setPinSize(pinSize + PIN_SIZE_STEP)],
-        ["pinSizeDown", () => setPinSize(pinSize - PIN_SIZE_STEP)]].forEach(([id, fn]) => {
+        ["pinSizeDown", () => setPinSize(pinSize - PIN_SIZE_STEP)],
+        ["legendSizeUp", () => setLegendSize(legendSize + LEGEND_SIZE_STEP)],
+        ["legendSizeDown", () => setLegendSize(legendSize - LEGEND_SIZE_STEP)]].forEach(([id, fn]) => {
         const btn = document.getElementById(id)
         btn.addEventListener("pointerdown", (e) => e.stopPropagation())
         btn.addEventListener("click", (e) => { e.stopPropagation(); fn() })
@@ -3300,6 +3355,7 @@
       setPlaybackSpeed(playbackSpeed) // initialize the label
       setDt(dt) // initialize the dt label
       applyPinSize() // initialize the pin-size label (and size any restored pins)
+      applyLegendSize() // initialize the legend-size label + scale
 
       // "Show area box" checkbox: reflects/controls the area-outline layer's
       // visibility (persisted via ?areaBox=0). Initialize from state, apply to
@@ -3487,7 +3543,11 @@
       })
       el.addEventListener("pointermove", (e) => {
         if (!dragging) return
-        const maxX = window.innerWidth - el.offsetWidth, maxY = window.innerHeight - el.offsetHeight
+        // Clamp against the legend's ON-SCREEN size (getBoundingClientRect
+        // reflects any transform:scale from the legend-size control), so a
+        // scaled-up legend still can't be dragged off-screen.
+        const r = el.getBoundingClientRect()
+        const maxX = window.innerWidth - r.width, maxY = window.innerHeight - r.height
         el.style.left = Math.max(0, Math.min(e.clientX - offsetX, maxX)) + "px"
         el.style.top = Math.max(0, Math.min(e.clientY - offsetY, maxY)) + "px"
       })
