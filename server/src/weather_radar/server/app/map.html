@@ -123,6 +123,12 @@
             <input type="checkbox" id="showAreaBox" checked
               style="cursor:pointer; margin:0 0 0 auto; width:22px; height:22px;">
           </label>
+          <label style="display:flex; align-items:center; margin-top:8px;
+              font-size:11px; color:#555; cursor:pointer;">
+            <span>Lock legend &amp; pins</span>
+            <input type="checkbox" id="lockLayout"
+              style="cursor:pointer; margin:0 0 0 auto; width:22px; height:22px;">
+          </label>
         </div>
       </div>
     </div>
@@ -154,6 +160,15 @@
 
     <!-- Container for dropped pin labels (positioned over the map in JS). -->
     <div id="pins"></div>
+
+    <!-- Overlay for the dashed connector lines drawn from each pin's marker
+         tip to its (draggable) info box. Full-viewport, fixed, and
+         non-interactive (pointer-events:none) so it never intercepts clicks or
+         map drags; sits just BELOW the pin markers/boxes (z-index 100 vs 101)
+         so the connector tucks behind them. Line endpoints are updated each
+         frame in refreshPins(). -->
+    <svg id="pinLines" style="position:fixed; left:0; top:0; width:100vw;
+      height:100vh; pointer-events:none; z-index:100; overflow:visible;"></svg>
 
     <!-- Address search box. Opened from the right-click menu's "Drop pin by
          address…"; typing shows a list of geocoded matches (the query is sent
@@ -958,6 +973,28 @@
       applyAreaBoxVisibility()
     }
 
+    // Whether the legend panel and all pins (markers + info boxes) are locked
+    // in place — i.e. not draggable. Persisted in the URL (`locked=1`). When
+    // locked, the legend/marker/box drag handlers bail out on pointerdown and
+    // the grab cursors are suppressed. The pin cursor refresh is handled by
+    // refreshPinLockCursors() (assigned once pins exist, inside map load).
+    let layoutLocked =
+      new URL(window.location.href).searchParams.get("locked") === "1"
+    let refreshPinLockCursors = () => {}
+    function applyLockLayout() {
+      const legendEl = document.getElementById("legend")
+      if (legendEl) legendEl.style.cursor = layoutLocked ? "default" : "move"
+      refreshPinLockCursors()
+    }
+    function setLockLayout(on) {
+      layoutLocked = !!on
+      const u = new URL(window.location.href)
+      if (layoutLocked) u.searchParams.set("locked", "1")
+      else u.searchParams.delete("locked")
+      history.replaceState(null, "", u.toString())
+      applyLockLayout()
+    }
+
     map.on("load", async () => {
       // Heatmap overlay uses a raster `image` source, created lazily on the
       // first heatmap frame (MapLibre image sources require a valid image +
@@ -1037,7 +1074,24 @@
       // updated each frame and repositioned on map move. Persisted in the URL
       // (`pins=lat,lon;lat,lon;...`) so a refresh restores them.
       const pinsContainer = document.getElementById("pins")
+      const pinLinesSvg = document.getElementById("pinLines")
+      const SVG_NS = "http://www.w3.org/2000/svg"
       let pins = [] // [{ lat, lon, name, marker, info, ... }]
+      // Refresh the lock-dependent affordances on every pin to match the
+      // current lock state: the marker/box grab cursors, the editable-name
+      // cursor/tooltip, and the × delete button's visibility (hidden when
+      // locked, so a locked pin can't be renamed or deleted).
+      refreshPinLockCursors = () => {
+        for (const p of pins) {
+          if (p.marker) p.marker.style.cursor = layoutLocked ? "default" : "grab"
+          if (p.info) p.info.style.cursor = layoutLocked ? "default" : "grab"
+          if (p.nameEl) {
+            p.nameEl.style.cursor = layoutLocked ? "default" : "text"
+            p.nameEl.title = layoutLocked ? "" : "Click to rename"
+          }
+          if (p.closeBtn) p.closeBtn.style.display = layoutLocked ? "none" : ""
+        }
+      }
       // Monotonic counter for default pin names ("Pin 1", "Pin 2", …). Never
       // decremented on delete, so names stay unique within a session.
       let pinCounter = 0
@@ -1100,8 +1154,22 @@
           u.searchParams.set("pins", pins.map(p =>
             `${p.lat.toFixed(5)},${p.lon.toFixed(5)},${encodeURIComponent(p.name || "")}`
           ).join(";"))
+          // Dragged info-box offsets, in a SEPARATE positional param so the
+          // `pins` format stays backward-compatible. One entry per pin (same
+          // order): "dx,dy" (the 1x-scale offset from the marker tip to the
+          // box's bottom-left anchor) for a box the user has moved, or EMPTY
+          // for an unmoved box (which uses the default placement). Omit the
+          // param entirely when no box has been moved.
+          if (pins.some(p => p.boxMoved)) {
+            u.searchParams.set("pinBoxes", pins.map(p =>
+              p.boxMoved ? `${Math.round(p.boxDX)},${Math.round(p.boxDY)}` : ""
+            ).join(";"))
+          } else {
+            u.searchParams.delete("pinBoxes")
+          }
         } else {
           u.searchParams.delete("pins")
+          u.searchParams.delete("pinBoxes")
         }
         history.replaceState(null, "", u.toString())
       }
@@ -1119,7 +1187,7 @@
         return pins.find(p => samePinLoc(p, probe)) || null
       }
 
-      function addPin(plat, plon, persist = true, name = null) {
+      function addPin(plat, plon, persist = true, name = null, boxOffset = null) {
         // Idempotent: a pin already at this location (to serialized precision)
         // isn't duplicated. Return the existing pin so callers can still act on
         // it (e.g. pan to it).
@@ -1220,10 +1288,33 @@
         info.appendChild(fcBtn)
         info.appendChild(graphBtn)
 
-        const pin = { lat: plat, lon: plon, name: pinName, marker, info, infoText, nameEl }
+        // Dashed connector line from the marker tip to the info box. Lives in
+        // the shared SVG overlay (below the markers/boxes). Its endpoints are
+        // recomputed every frame in refreshPins().
+        const line = document.createElementNS(SVG_NS, "line")
+        line.setAttribute("stroke", "rgba(30,30,30,0.85)")
+        line.setAttribute("stroke-width", "1.5")
+        line.setAttribute("stroke-dasharray", "4 3")
+        line.setAttribute("stroke-linecap", "round")
+        pinLinesSvg.appendChild(line)
+
+        // Per-pin info-box offset (screen px, at 1x pinSize), measured from the
+        // marker tip to the box's anchored (bottom-left) corner. Defaults to
+        // the standard upper-right placement; set to a custom value once the
+        // user drags the box. `boxMoved` tracks whether the user has taken
+        // manual control (so the box keeps its own offset instead of snapping
+        // back to the default as the map/zoom changes). A restored `boxOffset`
+        // {dx,dy} (from the URL) seeds a moved box so it comes back in place.
+        const hasOffset = boxOffset && Number.isFinite(boxOffset.dx) && Number.isFinite(boxOffset.dy)
+        const pin = { lat: plat, lon: plon, name: pinName, marker, info, infoText, nameEl, closeBtn,
+          line,
+          boxDX: hasOffset ? boxOffset.dx : INFO_DX,
+          boxDY: hasOffset ? boxOffset.dy : INFO_DY,
+          boxMoved: !!hasOffset }
 
         // Inline rename: swap the name label for a text input on click.
         function beginRename(ev) {
+          if (layoutLocked) return   // locked: pin text isn't editable
           if (ev) ev.stopPropagation()
           const input = document.createElement("input")
           input.type = "text"
@@ -1254,7 +1345,7 @@
         const remove = (ev) => {
           ev.stopPropagation()
           const i = pins.indexOf(pin)
-          if (i >= 0) { marker.remove(); info.remove(); pins.splice(i, 1); serializePins() }
+          if (i >= 0) { marker.remove(); info.remove(); if (pin.line) pin.line.remove(); pins.splice(i, 1); serializePins() }
         }
         // Marker dragging: press and move the pin glyph to reposition it.
         // (Removal is the × button's job — clicking the marker does NOT delete.)
@@ -1262,6 +1353,7 @@
         marker.style.touchAction = "none"
         let dragging = false
         marker.addEventListener("pointerdown", (ev) => {
+          if (layoutLocked) return   // locked: pins are fixed in place
           ev.stopPropagation()   // don't let the map start a pan
           ev.preventDefault()
           dragging = true
@@ -1290,6 +1382,71 @@
         marker.addEventListener("pointerup", endDrag)
         marker.addEventListener("pointercancel", endDrag)
 
+        // Info-box dragging: press and move the box itself to reposition it
+        // relative to the pin. The dashed connector keeps it tied to the
+        // marker tip. Dragging starts only from the box background — the name
+        // (rename), × (delete), 📈/🌡 (graph/forecast) children all
+        // stopPropagation on their own pointer/click events, so grabbing them
+        // won't start a box drag.
+        info.title = "Drag to move this box"
+        info.style.touchAction = "none"
+        info.style.cursor = "grab"
+        let boxDragging = false
+        let boxGrabX = 0, boxGrabY = 0        // pointer offset within the box
+        info.addEventListener("pointerdown", (ev) => {
+          if (layoutLocked) return   // locked: boxes are fixed in place
+          // Don't start a drag when grabbing an interactive child (name =
+          // rename, × = delete, 📈/🌡 = graph/forecast, or the rename input).
+          // Let those receive their own pointer/click events normally.
+          if (ev.target === nameEl || ev.target === closeBtn ||
+              ev.target === graphBtn || ev.target === fcBtn ||
+              (ev.target && ev.target.tagName === "INPUT")) {
+            return
+          }
+          ev.stopPropagation()   // don't let the map start a pan
+          ev.preventDefault()
+          boxDragging = true
+          // Remember where inside the box the user grabbed, so the box doesn't
+          // jump its corner to the pointer on the first move.
+          const r = info.getBoundingClientRect()
+          boxGrabX = ev.clientX - r.left
+          boxGrabY = ev.clientY - r.top
+          try { info.setPointerCapture(ev.pointerId) } catch (_) {}
+          info.style.cursor = "grabbing"
+        })
+        info.addEventListener("pointermove", (ev) => {
+          if (!boxDragging) return
+          ev.stopPropagation()
+          const rect = mapContainer.getBoundingClientRect()
+          // Marker tip (the pin point) in viewport px.
+          const pt = map.project([pin.lon, pin.lat])
+          const tipX = rect.left + pt.x, tipY = rect.top + pt.y
+          // Desired box top-left so the grabbed point tracks the pointer.
+          const boxLeft = ev.clientX - boxGrabX
+          const boxTop = ev.clientY - boxGrabY
+          // The box is anchored at its bottom-left corner (transform-origin
+          // 0% 100%, translate(0,-100%)): style.left/top are that corner, and
+          // the box is drawn UP from there. So its top edge sits one scaled
+          // box-height above the anchor. Convert the desired top-left back to
+          // the anchor (bottom-left) and store as a 1x offset from the tip.
+          const boxH = info.getBoundingClientRect().height
+          const anchorX = boxLeft
+          const anchorY = boxTop + boxH
+          pin.boxDX = (anchorX - tipX) / pinSize
+          pin.boxDY = (anchorY - tipY) / pinSize
+          pin.boxMoved = true
+          refreshPins()
+        })
+        const endBoxDrag = (ev) => {
+          if (!boxDragging) return
+          boxDragging = false
+          try { info.releasePointerCapture(ev.pointerId) } catch (_) {}
+          info.style.cursor = "grab"
+          serializePins()        // persist the box's new offset to the URL
+        }
+        info.addEventListener("pointerup", endBoxDrag)
+        info.addEventListener("pointercancel", endBoxDrag)
+
         closeBtn.addEventListener("click", remove)
         graphBtn.addEventListener("click", (ev) => {
           ev.stopPropagation()
@@ -1304,6 +1461,7 @@
         pinsContainer.appendChild(info)
         pins.push(pin)
         applyPinSize()  // size the new marker/info to the current scale
+        refreshPinLockCursors()  // reflect current lock state on the new pin
         if (persist) serializePins()
         refreshPins()
         return pin
@@ -1320,7 +1478,6 @@
       const INFO_DX = 14, INFO_DY = -14
       function refreshPins() {
         const rect = mapContainer.getBoundingClientRect()
-        const dx = INFO_DX * pinSize, dy = INFO_DY * pinSize
         for (const p of pins) {
           const pt = map.project([p.lon, p.lat])
           const x = rect.left + pt.x, y = rect.top + pt.y
@@ -1330,31 +1487,105 @@
           const v = sampleAt(p.lon, p.lat)
           const valueText = v === null ? "—" : `${v.toFixed(1)}${latestUnits ? " " + latestUnits : ""}`
           p.infoText.innerHTML = `${modelLabel}: ${valueText}<br>${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}`
-          p.info.style.left = (x + dx) + "px"
-          p.info.style.top = (y + dy) + "px"
+          // Box offset: either the user's dragged offset or the default
+          // upper-right placement, both scaled with pinSize so the gap keeps
+          // clearing the (larger) marker as the pin grows.
+          const odx = (p.boxMoved ? p.boxDX : INFO_DX) * pinSize
+          const ody = (p.boxMoved ? p.boxDY : INFO_DY) * pinSize
+          const ax = x + odx, ay = y + ody   // box anchor (bottom-left corner)
+          p.info.style.left = ax + "px"
+          p.info.style.top = ay + "px"
           p.info.style.transform = `translate(0,-100%) scale(${pinSize})`
+
+          // Dashed connector: from the marker tip to the EDGE of the box
+          // (not its corner/center), so the line stops cleanly at the box
+          // border instead of running underneath and clipping into it. We
+          // find where the segment from the tip toward the box center crosses
+          // the box rectangle, and end the line there. SVG coords are
+          // viewport-relative (the overlay is fixed at 0,0 filling the
+          // viewport), matching the fixed positioning of the marker/box.
+          if (p.line) {
+            const r = p.info.getBoundingClientRect()
+            // End the line at the box border along the tip->center direction.
+            const end = segmentRectEntry(x, y, r.left, r.top, r.right, r.bottom)
+            p.line.setAttribute("x1", x)
+            p.line.setAttribute("y1", y)
+            p.line.setAttribute("x2", end.x)
+            p.line.setAttribute("y2", end.y)
+          }
         }
       }
 
+      // Given a start point (sx,sy) OUTSIDE an axis-aligned rectangle, return
+      // the point where the segment from the start toward the rectangle's
+      // CENTER first touches the rectangle's border. Used to stop the pin
+      // connector at the box edge so it doesn't clip into the box. Falls back
+      // to the center if the start is inside the rect (degenerate; shouldn't
+      // happen since the box is offset from the tip).
+      function segmentRectEntry(sx, sy, left, top, right, bottom) {
+        const cx = (left + right) / 2, cy = (top + bottom) / 2
+        const dx = cx - sx, dy = cy - sy
+        if (dx === 0 && dy === 0) return { x: cx, y: cy }
+        // Parametric point: (sx,sy) + t*(dx,dy), t in [0,1] reaches the center.
+        // Find the smallest t>0 at which the segment crosses a border line
+        // AND the crossing lies within the border's span.
+        let best = 1  // default: center (t=1)
+        // Vertical borders (x = left or x = right).
+        for (const bx of [left, right]) {
+          if (dx !== 0) {
+            const t = (bx - sx) / dx
+            if (t > 0 && t < best) {
+              const yAt = sy + t * dy
+              if (yAt >= top - 0.5 && yAt <= bottom + 0.5) best = t
+            }
+          }
+        }
+        // Horizontal borders (y = top or y = bottom).
+        for (const by of [top, bottom]) {
+          if (dy !== 0) {
+            const t = (by - sy) / dy
+            if (t > 0 && t < best) {
+              const xAt = sx + t * dx
+              if (xAt >= left - 0.5 && xAt <= right + 0.5) best = t
+            }
+          }
+        }
+        return { x: sx + best * dx, y: sy + best * dy }
+      }
+
       // Restore pins from the URL on load. Format per pin: lat,lon[,encName]
-      // (name optional for backward compat with older 2-field URLs).
+      // (name optional for backward compat with older 2-field URLs). Dragged
+      // info-box offsets ride in a parallel positional `pinBoxes` param
+      // ("dx,dy" per pin, empty for unmoved), matched up by index.
       ;(() => {
-        const raw = new URL(window.location.href).searchParams.get("pins")
+        const sp = new URL(window.location.href).searchParams
+        const raw = sp.get("pins")
         if (!raw) return
-        for (const part of raw.split(";")) {
+        const boxesRaw = sp.get("pinBoxes")
+        const boxParts = boxesRaw ? boxesRaw.split(";") : []
+        const parts = raw.split(";")
+        parts.forEach((part, i) => {
           const fields = part.split(",")
           const la = Number(fields[0]), lo = Number(fields[1])
           let nm = null
           if (fields.length >= 3) {
             try { nm = decodeURIComponent(fields.slice(2).join(",")) } catch (_) { nm = fields.slice(2).join(",") }
           }
-          if (Number.isFinite(la) && Number.isFinite(lo)) addPin(la, lo, false, nm)
-        }
+          // Parallel box offset for this pin, if present and non-empty.
+          let boxOffset = null
+          const bp = boxParts[i]
+          if (bp) {
+            const bf = bp.split(",")
+            const dx = Number(bf[0]), dy = Number(bf[1])
+            if (Number.isFinite(dx) && Number.isFinite(dy)) boxOffset = { dx, dy }
+          }
+          if (Number.isFinite(la) && Number.isFinite(lo)) addPin(la, lo, false, nm, boxOffset)
+        })
       })()
 
       // Remove every pin (DOM + state) and clear them from the URL.
       function clearPins() {
-        for (const p of pins) { p.marker.remove(); p.info.remove() }
+        for (const p of pins) { p.marker.remove(); p.info.remove(); if (p.line) p.line.remove() }
         pins = []
         serializePins()
       }
@@ -3086,6 +3317,23 @@
         })
       })()
 
+      // "Lock legend & pins" checkbox: toggles whether the legend panel and
+      // all pins (markers + info boxes) can be dragged (persisted via
+      // ?locked=1). Initialize from state, apply (sets cursors + legend), and
+      // wire the toggle. stopPropagation so interacting with it doesn't start
+      // a legend drag.
+      ;(function setupLockLayoutToggle() {
+        const cb = document.getElementById("lockLayout")
+        if (!cb) return
+        cb.checked = layoutLocked
+        applyLockLayout()
+        cb.addEventListener("pointerdown", (e) => e.stopPropagation())
+        cb.addEventListener("change", (e) => {
+          e.stopPropagation()
+          setLockLayout(cb.checked)
+        })
+      })()
+
       // Legend tabs: switch between the Controls and Settings panels.
       ;(function setupLegendTabs() {
         const tabs = {
@@ -3230,6 +3478,7 @@
       if (!el) return
       let dragging = false, offsetX = 0, offsetY = 0
       el.addEventListener("pointerdown", (e) => {
+        if (layoutLocked) return   // locked: legend is fixed in place
         dragging = true
         const rect = el.getBoundingClientRect()
         offsetX = e.clientX - rect.left; offsetY = e.clientY - rect.top
