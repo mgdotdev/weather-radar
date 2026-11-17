@@ -5,6 +5,24 @@
 </head>
 
 <body style="height: 100vh; width: 100vw; margin: 0px; padding: 0px;">
+	<!-- Editable page title over the graph. Click to edit (commit on
+	     Enter/blur, cancel on Escape); DRAG the body to move it; drag the
+	     bottom-right grip to resize the font. Title text, position, and size
+	     all persist in the URL (?title=, ?titleX=/titleY=, ?titleSize=). -->
+	<div id="pageTitle" title="Click to edit · drag to move"
+	     style="position: fixed; top: 10px; left: 14px; z-index: 10;
+	            font-family: sans-serif; font-size: 20px; font-weight: 600;
+	            color: #222; cursor: text; max-width: 80vw; padding: 2px 16px 6px 4px;
+	            border-radius: 4px; background: rgba(255,255,255,0.6);
+	            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+	            user-select: none; touch-action: none;">
+	  <span id="pageTitleText"></span>
+	  <!-- Resize grip (bottom-right). Drag to change the title font size. -->
+	  <span id="pageTitleGrip" title="Drag to resize"
+	        style="position: absolute; right: 2px; bottom: 1px; width: 12px;
+	               height: 12px; cursor: nwse-resize; opacity: 0.45;
+	               line-height: 1; font-size: 11px; user-select: none;">◢</span>
+	</div>
 	<div id='graph' style="height: 100vh; width: 100vw; margin: 0px; padding: 0px;"/>
 </body>
 <script>
@@ -28,6 +46,201 @@
       } catch (_) {}
       return _fetch.call(this, input, init);
     };
+  })();
+
+  // ---- Editable, movable, resizable page title --------------------------
+  // • Click the title to edit inline (Enter/blur commits, Escape cancels).
+  // • Drag the body to move it.
+  // • Drag the bottom-right grip to resize the font.
+  // Everything persists in the URL (history.replaceState, so no navigation)
+  // and is restored on load:
+  //   ?title=   the text
+  //   ?titleX=  ?titleY=   position (viewport px, top-left corner)
+  //   ?titleSize=          font size (px)
+  (function () {
+    const el = document.getElementById("pageTitle");
+    const textEl = document.getElementById("pageTitleText");
+    const grip = document.getElementById("pageTitleGrip");
+    if (!el || !textEl) return;
+    const DEFAULT_TITLE = "Untitled graph";
+    const SIZE_MIN = 10, SIZE_MAX = 96, SIZE_DEFAULT = 20;
+
+    const sp = () => new URL(window.location.href).searchParams;
+
+    function readTitle() {
+      const t = sp().get("title");
+      return (t && t.trim()) ? t : "";
+    }
+    function readNum(key) {
+      const v = parseFloat(sp().get(key));
+      return Number.isFinite(v) ? v : null;
+    }
+    // Persist any subset of {title, x, y, size}; null/undefined clears a key.
+    function persist({ title, x, y, size } = {}) {
+      const u = new URL(window.location.href);
+      const set = (k, v, keep) => {
+        if (v === undefined) return;                 // leave untouched
+        if (v === null || !keep(v)) u.searchParams.delete(k);
+        else u.searchParams.set(k, String(v));
+      };
+      if (title !== undefined) {
+        const t = (title || "").trim();
+        if (t) u.searchParams.set("title", t); else u.searchParams.delete("title");
+      }
+      set("titleX", x, (n) => Number.isFinite(n));
+      set("titleY", y, (n) => Number.isFinite(n));
+      set("titleSize", size, (n) => Number.isFinite(n) && Math.abs(n - SIZE_DEFAULT) > 0.01);
+      history.replaceState(null, "", u.toString());
+    }
+
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(v, hi)); }
+
+    // Apply persisted position/size to the element (called on load + after
+    // move/resize). Position falls back to the default top-left corner.
+    function applyLayout() {
+      const size = clamp(readNum("titleSize") || SIZE_DEFAULT, SIZE_MIN, SIZE_MAX);
+      el.style.fontSize = size + "px";
+      const x = readNum("titleX");
+      const y = readNum("titleY");
+      if (x !== null && y !== null) {
+        // Keep it on-screen even if the window shrank since it was saved.
+        const maxX = Math.max(0, window.innerWidth - el.offsetWidth);
+        const maxY = Math.max(0, window.innerHeight - el.offsetHeight);
+        el.style.left = clamp(x, 0, maxX) + "px";
+        el.style.top = clamp(y, 0, maxY) + "px";
+      }
+    }
+
+    function render() {
+      const t = readTitle();
+      textEl.textContent = t || DEFAULT_TITLE;
+      el.style.opacity = t ? "1" : "0.5";   // dim the placeholder
+      if (t) document.title = t;
+      applyLayout();
+    }
+
+    // ---- Inline edit -----------------------------------------------------
+    let editing = false;
+    function beginEdit() {
+      if (editing) return;
+      editing = true;
+      const input = document.createElement("input");
+      input.type = "text";
+      input.value = readTitle();
+      input.placeholder = DEFAULT_TITLE;
+      // Edit IN PLACE: the input lives INSIDE the fixed-positioned #pageTitle
+      // div (which keeps its position/size), replacing just the text span —
+      // so the title stays exactly where it is and the graph isn't displaced.
+      // Sized in em so it tracks the title's current font-size.
+      input.style.cssText =
+        "font-family: inherit; font-size: inherit; font-weight: inherit;" +
+        "color: #222; border: 1px solid #bbb; border-radius: 4px;" +
+        "padding: 0 3px; box-sizing: border-box; background: #fff;" +
+        "min-width: 6em; width: 14em; max-width: 70vw; vertical-align: baseline;";
+      const commit = (save) => {
+        if (!input.parentNode) return;   // guard double-commit (Enter + blur)
+        if (save) persist({ title: input.value });
+        input.remove();
+        textEl.style.display = "";       // restore the text span
+        grip.style.display = "";         // restore the resize grip
+        editing = false;
+        render();
+      };
+      input.addEventListener("keydown", (e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") { e.preventDefault(); commit(true); }
+        else if (e.key === "Escape") { e.preventDefault(); commit(false); }
+      });
+      // A pointerdown inside the input shouldn't bubble to the div's move
+      // handler (which would otherwise try to start a drag).
+      input.addEventListener("pointerdown", (e) => e.stopPropagation());
+      input.addEventListener("blur", () => commit(true));
+      // Swap the text span for the input, in place, inside #pageTitle.
+      textEl.style.display = "none";
+      grip.style.display = "none";
+      el.insertBefore(input, textEl);
+      input.focus();
+      input.select();
+    }
+
+    // ---- Drag to MOVE (body) vs click to EDIT ----------------------------
+    // Distinguish a click (edit) from a drag (move): only treat it as a drag
+    // once the pointer moves past a small threshold; a release below the
+    // threshold is a click and opens the editor.
+    const DRAG_THRESHOLD = 4;
+    let moveActive = false, moved = false, grabDX = 0, grabDY = 0, downX = 0, downY = 0;
+    el.addEventListener("pointerdown", (ev) => {
+      if (editing) return;
+      if (ev.target === grip) return;   // the grip handles its own (resize)
+      ev.preventDefault();
+      moveActive = true; moved = false;
+      const r = el.getBoundingClientRect();
+      grabDX = ev.clientX - r.left;
+      grabDY = ev.clientY - r.top;
+      downX = ev.clientX; downY = ev.clientY;
+      try { el.setPointerCapture(ev.pointerId); } catch (_) {}
+    });
+    el.addEventListener("pointermove", (ev) => {
+      if (!moveActive) return;
+      if (!moved) {
+        // Only start moving (and switch the cursor) once the pointer has
+        // travelled past the threshold from where it went down, so a small
+        // jitter during a click doesn't count as a drag.
+        if (Math.abs(ev.clientX - downX) < DRAG_THRESHOLD &&
+            Math.abs(ev.clientY - downY) < DRAG_THRESHOLD) return;
+        moved = true;
+        el.style.cursor = "grabbing";
+      }
+      const nx = ev.clientX - grabDX, ny = ev.clientY - grabDY;
+      const maxX = Math.max(0, window.innerWidth - el.offsetWidth);
+      const maxY = Math.max(0, window.innerHeight - el.offsetHeight);
+      el.style.left = clamp(nx, 0, maxX) + "px";
+      el.style.top = clamp(ny, 0, maxY) + "px";
+    });
+    const endMove = (ev) => {
+      if (!moveActive) return;
+      moveActive = false;
+      el.style.cursor = "text";
+      try { el.releasePointerCapture(ev.pointerId); } catch (_) {}
+      if (moved) {
+        const r = el.getBoundingClientRect();
+        persist({ x: Math.round(r.left), y: Math.round(r.top) });
+      } else {
+        beginEdit();   // no drag => treat as a click
+      }
+    };
+    el.addEventListener("pointerup", endMove);
+    el.addEventListener("pointercancel", endMove);
+
+    // ---- Drag the grip to RESIZE (font size) -----------------------------
+    let resizeActive = false, startY = 0, startSize = SIZE_DEFAULT;
+    grip.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();               // don't start a move / edit
+      resizeActive = true;
+      startY = ev.clientY;
+      startSize = clamp(readNum("titleSize") || SIZE_DEFAULT, SIZE_MIN, SIZE_MAX);
+      try { grip.setPointerCapture(ev.pointerId); } catch (_) {}
+    });
+    grip.addEventListener("pointermove", (ev) => {
+      if (!resizeActive) return;
+      // Dragging DOWN grows the font (1px drag ~= 0.5px font).
+      const next = clamp(startSize + (ev.clientY - startY) * 0.5, SIZE_MIN, SIZE_MAX);
+      el.style.fontSize = next + "px";
+    });
+    const endResize = (ev) => {
+      if (!resizeActive) return;
+      resizeActive = false;
+      try { grip.releasePointerCapture(ev.pointerId); } catch (_) {}
+      const size = Math.round(parseFloat(el.style.fontSize) || SIZE_DEFAULT);
+      persist({ size });
+      // Re-clamp position in case the taller/shorter box now overflows.
+      applyLayout();
+    };
+    grip.addEventListener("pointerup", endResize);
+    grip.addEventListener("pointercancel", endResize);
+
+    render();
   })();
 
   let layout = {}

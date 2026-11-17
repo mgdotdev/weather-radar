@@ -283,35 +283,39 @@
     })();
 
     // ---- Config (from the server) ------------------------------------------
-    const model = {{weather_model}}
-    const kind = "{{kind}}"
+    // NOTE: the model-specific values below start from the server-rendered
+    // template, but are MUTABLE (`let`) so the model can be switched live
+    // (see switchModel) without a full page reload. The view/playback vars
+    // (lat/lon/width/height/dt) are independent of the model.
+    let model = {{weather_model}}
+    let kind = "{{kind}}"
     let lat = {{starting_latitude}}
     let lon = {{starting_longitude}}
     let width = {{width}}
     let height = {{height}}
     let dt = {{dt}}
-    const colorRamp = {{contour_color_ramp}}
+    let colorRamp = {{contour_color_ramp}}
     // Available models for the in-legend selector, and the current one.
     const modelOptions = {{model_options}}
-    const currentModel = "{{current_model}}"
+    let currentModel = "{{current_model}}"
     // Human-readable name for the active model (e.g. "Snowfall Amount" rather
     // than the kebab-case "snowfall-amount"), used in the pin/cursor readouts.
-    // Prefer the server-provided label from modelOptions; fall back to
-    // title-casing the kebab key so an unmapped model still reads sensibly.
-    const modelLabel = (() => {
-      const opt = (modelOptions || []).find(o => o.value === model)
+    // Recomputed on a model switch (see computeModelLabel / switchModel).
+    function computeModelLabel() {
+      const opt = (modelOptions || []).find(o => o.value === currentModel || o.value === model)
       if (opt && opt.label) return opt.label
       return String(model).split("-")
         .map(w => w ? w[0].toUpperCase() + w.slice(1) : w).join(" ")
-    })()
+    }
+    let modelLabel = computeModelLabel()
     // Overlay type chosen by the server for this model: "isoband" (filled
     // d3-contour bands + lines) or "heatmap" (a continuous intensity wash
     // whose opacity scales with value). Both consume the same IDW raster.
-    const renderType = "{{render_type}}"
+    let renderType = "{{render_type}}"
     // Per-model heatmap opacity multiplier (server-provided): dense/continuous
     // fields (temperature, sky, AQI) are dimmed so the basemap shows through;
     // sparse fields (snow/precip) stay fully opaque where present. 1.0 = no dim.
-    const heatmapOpacity = {{heatmap_opacity}}
+    let heatmapOpacity = {{heatmap_opacity}}
     // Isoband (contour) rendering was dropped — every model renders as a
     // heatmap wash. This is forced true so the contour branches are never
     // taken, regardless of what renderType says.
@@ -320,7 +324,23 @@
     // sampled server-side (no NOAA /points prefetch, no bundle). When true the
     // client fetches the /aqi/* endpoints instead of the NOAA ensemble ones;
     // the frame wire format is identical, so rendering/scrubbing is unchanged.
-    const isAqi = kind === "aqi"
+    // Mutable (follows `kind`) so a model switch flips the data path live.
+    let isAqi = kind === "aqi"
+    // Outer-scope hook for live model switching. The real implementation is
+    // assigned inside map.on("load") (where the data-reload machinery lives);
+    // the in-legend model <select> calls this so it can switch models WITHOUT
+    // a full page reload. Falls back to a hard navigation if (somehow) called
+    // before the map finished loading.
+    let switchModel = async (newModel) => {
+      const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
+      for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
+                       "from", "to", "t", "pins", "pinBoxes", "pinSize",
+                       "legendSize", "areaBox", "locked"]) {
+        const v = new URL(window.location.href).searchParams.get(k)
+        if (v !== null) u.searchParams.set(k, v)
+      }
+      window.location.assign(u.toString())
+    }
     // Contour interval: the value delta between adjacent contour lines
     // (e.g. 1.0, 0.5, 2.0 degrees). Configurable live in the legend.
     let contourStep = {{contour_step}}
@@ -469,7 +489,11 @@
     }
 
     // ---- Color ramp ---------------------------------------------------------
-    const rampStops = (() => {
+    // Parsed [{pos,r,g,b}] stops derived from `colorRamp`. MUTABLE + rebuilt by
+    // rebuildRampStops() because `colorRamp` changes on a live model switch
+    // (see switchModel); the heatmap painter (rampRgbAt) reads these, so they
+    // must track the active model's ramp or the raster keeps the old colors.
+    function computeRampStops() {
       const stops = []
       for (let i = 0; i < colorRamp.length; i += 2) {
         const m = String(colorRamp[i + 1]).match(/rgba?\(([^)]+)\)/)
@@ -477,7 +501,9 @@
         stops.push({ pos: colorRamp[i], r: p[0], g: p[1], b: p[2] })
       }
       return stops
-    })()
+    }
+    let rampStops = computeRampStops()
+    function rebuildRampStops() { rampStops = computeRampStops() }
     function rampColorAt(t) {
       t = Math.max(0, Math.min(1, t))
       let a = rampStops[0], b = rampStops[rampStops.length - 1]
@@ -2176,6 +2202,107 @@
         // Stream the new area's window into the cache in the background.
         fillCache()
       }
+
+      // Switch the active model/param (e.g. temperature -> AQI) LIVE, without a
+      // full page reload. Fetches the new model's server config (styling, kind,
+      // attribute), swaps the client state + data path, resets the color range
+      // / caches / scrubber window (a different model has a different forecast
+      // range), updates the URL, then reloads the range + current frame for the
+      // SAME area. Mirrors loadArea's reset/reload, minus the area re-measure.
+      switchModel = async (newModel) => {
+        if (!newModel || newModel === currentModel) return
+        let cfg
+        try {
+          const resp = await fetch(`/map/models/${encodeURIComponent(newModel)}/config`,
+            { headers: { "Accept": "application/json" } })
+          if (!resp.ok) throw new Error(`config ${resp.status}`)
+          cfg = await resp.json()
+        } catch (err) {
+          // Couldn't fetch config — fall back to a hard navigation so the
+          // switch still happens (just with a reload).
+          console.error("model switch config fetch failed; reloading:", err)
+          const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
+          for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
+                           "pins", "pinBoxes", "pinSize", "legendSize", "areaBox", "locked"]) {
+            const v = new URL(window.location.href).searchParams.get(k)
+            if (v !== null) u.searchParams.set(k, v)
+          }
+          window.location.assign(u.toString())
+          return
+        }
+
+        // --- Swap model state + data path -----------------------------------
+        currentModel = cfg.model
+        model = cfg.attribute          // API calls key off the attribute
+        kind = cfg.kind
+        isAqi = kind === "aqi"
+        colorRamp = cfg.color_ramp
+        renderType = cfg.render_type
+        heatmapOpacity = cfg.heatmap_opacity
+        modelLabel = computeModelLabel()
+        // Rebuild the parsed ramp stops from the new ramp — the heatmap raster
+        // painter (rampRgbAt) reads these, so without this the overlay would
+        // keep the PREVIOUS model's colors even though the legend bar changed.
+        rebuildRampStops()
+        // Adopt the new model's seed contour step + auto-scale (the step
+        // auto-scales to the new range on first frame when autoStep is on).
+        contourStep = cfg.contour_step
+        autoStep = cfg.auto_step
+
+        // Repaint the legend gradient for the new ramp immediately (the numeric
+        // min/mid/max refresh when the new range loads via updateLegend).
+        document.getElementById("legendBar").style.background = legendGradientCss()
+
+        // --- URL: point at the new model, drop the old scrubber window ------
+        // Rewrite the PATH to /map/models/<newModel>/ (via replaceState, so no
+        // navigation) and clear the model-specific scrubber state so the new
+        // model's own forecast window takes over.
+        const u = new URL(window.location.href)
+        u.pathname = `/map/models/${encodeURIComponent(newModel)}/`
+        u.searchParams.delete("from")
+        u.searchParams.delete("to")
+        u.searchParams.delete("t")
+        u.searchParams.delete("kind")    // kind is derived from the model
+        u.searchParams.delete("step")    // adopt the new model's seed step
+        history.replaceState(null, "", u.toString())
+
+        // --- Reset range/caches/scrubber, then reload (same area) -----------
+        time = Math.floor(Date.now() / 1000)
+        globalMin = null; globalMax = null
+        fieldExtentHint = null
+        forecastStart = null; forecastEnd = null
+        windowStart = null; windowEnd = null
+        mapTimeZone = null
+        scrubberReady = false
+        loadGeneration += 1
+        loading = true
+        apiClient.clear()
+        lastFeatures = []
+        _idwPlan = null
+        if (heatReady) showHeatmap({ empty: true })
+        showSpinner("Loading data…")
+        try {
+          if (isAqi) {
+            await fetchGlobalRange()
+          } else {
+            const bundled = await prefetchWithProgress()
+            if (!bundled) await fetchGlobalRange()
+          }
+          time = clampToForecast(time)
+          showSpinner("Rendering…")
+          await loadFrame(time)
+        } catch (err) {
+          console.error("model switch load failed:", err)
+        } finally {
+          loading = false
+          hideSpinner()
+          tickRunning = false
+          setPaused(false)
+          scheduleNext()
+        }
+        fillCache()
+        refreshPins()   // re-sample pins against the new model's field
+      }
       document.getElementById("ctxCenterHere").addEventListener("click", () => {
         if (!menuLngLat) return
         const target = { lat: menuLngLat.lat, lon: menuLngLat.lng }
@@ -3513,18 +3640,15 @@
         e.stopPropagation()
         const newModel = sel.value
         if (!newModel || newModel === currentModel) return
-        const cur = new URL(window.location.href)
-        const next = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
-        // Carry over everything that isn't model-specific: the view
-        // (lat/lon/width/height/zoom), playback (dt/speed and the scrubber
-        // window from/to/t), and session state (dropped pins, pin size). Only
-        // the model itself and its derived styling change.
-        for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
-                         "from", "to", "t", "pins", "pinSize", "areaBox"]) {
-          const v = cur.searchParams.get(k)
-          if (v !== null) next.searchParams.set(k, v)
-        }
-        window.location.assign(next.toString())
+        // Live switch (no full page reload). switchModel fetches the new
+        // model's config, swaps the data path + styling, and reloads the
+        // range + current frame for the same area. It also rewrites the URL
+        // path to /map/models/<newModel>/ so a later refresh is consistent.
+        // (switchModel itself falls back to a hard navigation if the config
+        // fetch fails or if it's somehow called before the map loaded.)
+        Promise.resolve(switchModel(newModel)).catch((err) => {
+          console.error("model switch failed:", err)
+        })
       })
     })()
 

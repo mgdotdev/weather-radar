@@ -323,29 +323,7 @@ def map(model: str, width: float = _DEFAULT_WIDTH, height: float = _DEFAULT_HEIG
     # params). The data layer converts to the camelCase NOAA attribute only
     # when reading the gridpoint (see models.utils.to_camel_case), so nothing
     # here needs to convert.
-    profile = _profile(model) or {**DEFAULT_PROFILE, "attribute": model}
-    # The data kind (which ensemble fetches the attribute) is derived from the
-    # model's profile. An explicit `kind` query param may still override it.
-    kind = kind or profile["kind"]
-    # The NOAA attribute to actually read. This is usually the same as the
-    # dropdown/URL `model` key, but differs for the per-interval rate variants
-    # (e.g. model "precipitation-rate" reads attribute
-    # "quantitative-precipitation" as an observation). All API calls the client
-    # makes use this attribute (it's injected as the JS `model` var below), so
-    # the GeoJSON property key and the client's readout stay in sync; `model`
-    # (the URL key) is preserved separately for the dropdown selection.
-    attribute = profile["attribute"]
-    # Overlay type: isobands by default, heatmap for the rate layers. An
-    # explicit `render` query param may override the profile default.
-    render_type = render or profile["render"]
-    if render_type not in (_RENDER_ISOBAND, _RENDER_HEATMAP):
-        render_type = _RENDER_ISOBAND
-    # Contour interval: the value delta between adjacent contour lines. When
-    # the user hasn't specified `step`, the client auto-scales it to the data's
-    # global range (auto_step=True); the profile value is only a seed/fallback.
-    auto_step = step is None
-    step = profile["contour_step"] if step is None else step
-    step = max(0.1, min(float(step), 100.0))
+    cfg = _model_config(model, kind=kind, step=step, render=render)
     # Playback speed multiplier: higher = faster animation (shorter interval
     # between frames). Clamped to a sensible range. Max matches the client's
     # speed ladder (SPEED_STEPS tops out at 50x) so a persisted ?speed= value
@@ -363,21 +341,71 @@ def map(model: str, width: float = _DEFAULT_WIDTH, height: float = _DEFAULT_HEIG
     html = template.render({
         "starting_longitude": lon,
         "starting_latitude": lat,
-        "weather_model": f"\"{attribute}\"",
+        "weather_model": f"\"{cfg['attribute']}\"",
         "width": width,
         "height": height,
         "dt": dt,
-        "kind": kind,
-        "contour_step": step,
-        "auto_step": "true" if auto_step else "false",
+        "kind": cfg["kind"],
+        "contour_step": cfg["contour_step"],
+        "auto_step": "true" if cfg["auto_step"] else "false",
         "playback_speed": speed,
-        "contour_color_ramp": json.dumps(profile["color_ramp"]),
-        "heatmap_opacity": profile.get("opacity", 1.0),
+        "contour_color_ramp": json.dumps(cfg["color_ramp"]),
+        "heatmap_opacity": cfg["heatmap_opacity"],
         "model_options": json.dumps(model_options),
         "current_model": model,
-        "render_type": render_type,
+        "render_type": cfg["render_type"],
     })
     return html
+
+
+def _model_config(model, kind=None, step=None, render=None):
+    """Compute the per-model rendering config shared by the map template and
+    the JSON `config` endpoint. Returns a plain dict of the model-specific
+    values the client needs to render a model (attribute, kind, styling), so a
+    client can SWITCH models without a full page reload by fetching this.
+
+    `kind`/`step`/`render` optionally override the model's profile defaults
+    (same semantics as the `map` query params)."""
+    profile = _profile(model) or {**DEFAULT_PROFILE, "attribute": model}
+    # The data kind (which ensemble fetches the attribute) comes from the
+    # profile; an explicit `kind` override may still win.
+    resolved_kind = kind or profile["kind"]
+    # The NOAA attribute to actually read (may differ from the URL key for the
+    # per-interval rate variants); all API calls use this attribute.
+    attribute = profile["attribute"]
+    # Overlay type: heatmap for every model now (isobands dropped), but an
+    # explicit `render` override is still honored/validated.
+    render_type = render or profile["render"]
+    if render_type not in (_RENDER_ISOBAND, _RENDER_HEATMAP):
+        render_type = _RENDER_ISOBAND
+    # Contour interval seed. When the user hasn't specified `step`, the client
+    # auto-scales it to the data's global range (auto_step=True).
+    auto_step = step is None
+    resolved_step = profile["contour_step"] if step is None else step
+    resolved_step = max(0.1, min(float(resolved_step), 100.0))
+    # Human-readable label (matches the selector option label).
+    label = profile.get("label", "Value")
+    return {
+        "model": model,
+        "attribute": attribute,
+        "kind": resolved_kind,
+        "label": label,
+        "render_type": render_type,
+        "contour_step": resolved_step,
+        "auto_step": auto_step,
+        "color_ramp": profile["color_ramp"],
+        "heatmap_opacity": profile.get("opacity", 1.0),
+    }
+
+
+@router.get("/map/models/{model}/config")
+def map_model_config(model: str, kind: str = None, step: float = None,
+                     render: str = None):
+    """Per-model rendering config as JSON, so the client can switch models
+    live (no full page reload). Mirrors the model-specific values baked into
+    the map template by the `map` route — attribute, kind, label, render type,
+    contour step/auto-step, color ramp, and heatmap opacity."""
+    return _model_config(model, kind=kind, step=step, render=render)
 
 
 @router.get("/admin", response_class=HTMLResponse)
