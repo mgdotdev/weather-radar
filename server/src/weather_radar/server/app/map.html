@@ -335,7 +335,7 @@
       const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
       for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
                        "from", "to", "t", "pins", "pinBoxes", "pinSize",
-                       "legendSize", "areaBox", "locked"]) {
+                       "legendSize", "legendX", "legendY", "areaBox", "locked"]) {
         const v = new URL(window.location.href).searchParams.get(k)
         if (v !== null) u.searchParams.set(k, v)
       }
@@ -2223,7 +2223,8 @@
           console.error("model switch config fetch failed; reloading:", err)
           const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
           for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
-                           "pins", "pinBoxes", "pinSize", "legendSize", "areaBox", "locked"]) {
+                           "pins", "pinBoxes", "pinSize", "legendSize",
+                           "legendX", "legendY", "areaBox", "locked"]) {
             const v = new URL(window.location.href).searchParams.get(k)
             if (v !== null) u.searchParams.set(k, v)
           }
@@ -3652,10 +3653,43 @@
       })
     })()
 
-    // Make the legend draggable.
+    // Make the legend draggable. Its position persists in the URL
+    // (?legendX=&legendY=, top-left viewport px) so a refresh/shared link keeps
+    // where you put it; restored on load (clamped into the viewport).
     ;(function makeLegendDraggable() {
       const el = document.getElementById("legend")
       if (!el) return
+
+      // Restore a persisted position (clamped so a smaller window can't park
+      // it off-screen). The legend starts hidden (display:none) and is shown
+      // on map load; measure against its scaled on-screen size.
+      function restoreLegendPos() {
+        const p = new URL(window.location.href).searchParams
+        const x = parseFloat(p.get("legendX")), y = parseFloat(p.get("legendY"))
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return
+        const r = el.getBoundingClientRect()
+        const maxX = Math.max(0, window.innerWidth - r.width)
+        const maxY = Math.max(0, window.innerHeight - r.height)
+        el.style.left = Math.max(0, Math.min(x, maxX)) + "px"
+        el.style.top = Math.max(0, Math.min(y, maxY)) + "px"
+      }
+      function persistLegendPos() {
+        const r = el.getBoundingClientRect()
+        const u = new URL(window.location.href)
+        u.searchParams.set("legendX", String(Math.round(r.left)))
+        u.searchParams.set("legendY", String(Math.round(r.top)))
+        history.replaceState(null, "", u.toString())
+      }
+      // The legend is hidden until map load; restore once it's visible so
+      // getBoundingClientRect() has real dimensions to clamp against.
+      if (el.style.display !== "none") restoreLegendPos()
+      else {
+        const obs = new MutationObserver(() => {
+          if (el.style.display !== "none") { restoreLegendPos(); obs.disconnect() }
+        })
+        obs.observe(el, { attributes: true, attributeFilter: ["style"] })
+      }
+
       let dragging = false, offsetX = 0, offsetY = 0
       el.addEventListener("pointerdown", (e) => {
         if (layoutLocked) return   // locked: legend is fixed in place
@@ -3675,7 +3709,12 @@
         el.style.left = Math.max(0, Math.min(e.clientX - offsetX, maxX)) + "px"
         el.style.top = Math.max(0, Math.min(e.clientY - offsetY, maxY)) + "px"
       })
-      el.addEventListener("pointerup", (e) => { dragging = false; el.releasePointerCapture(e.pointerId) })
+      el.addEventListener("pointerup", (e) => {
+        if (!dragging) return
+        dragging = false
+        el.releasePointerCapture(e.pointerId)
+        persistLegendPos()   // save the new position to the URL
+      })
     })()
   </script>
 </html>
