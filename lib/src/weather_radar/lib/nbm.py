@@ -79,47 +79,68 @@ NBM_TTL_SECONDS = int(os.environ.get("NBM_TTL_SECONDS", "3600"))
 # Negative-cache window for a (cycle, hour, element) that 404s / has no record.
 NBM_MISS_TTL_SECONDS = int(os.environ.get("NBM_MISS_TTL_SECONDS", "3600"))
 
-# Forecast hours to sample, per element TYPE:
-#  * instantaneous (TMP, WIND, ...): hourly through day 3, 3-hourly to ~7 days.
-#  * accumulation  (ASNOW, APCP):    a MIXED-cadence disjoint tiling —
-#    1-HOUR blocks for f1..f48 then 6-HOUR blocks for f54..f180. NBM publishes
-#    accumulation as contiguous blocks ending at each forecast hour; the
-#    1-hour blocks (0-1, 1-2, ...) are available only through ~f48, and only
-#    6-hour blocks (..-54, 54-60, ...) exist beyond that. Taking the 1-hour
-#    blocks early and 6-hour blocks late tiles [0,180] with NO overlap and NO
-#    gap (verified against the .idx), so the cumulative storm total is exact —
-#    AND the series now starts at f1 (init+1h) with hourly resolution over the
-#    first two days, instead of the old 6-hourly-only schedule that began at f6
-#    and discarded the first six hours.
-def _instant_hours():
-    hrs = list(range(1, 73))                 # hourly, days 1-3
-    hrs += list(range(75, 181, 3))           # 3-hourly, days 4-7 (to f180)
-    return hrs
+# Forecast hours to sample. We take EVERY forecast hour NBM publishes for the
+# cycle (discovered from the bucket listing; see _published_hours), so each
+# point's temporal spline gets as many knots as the product offers:
+#  * instantaneous (TMP, WIND, ...): every published hour. For NBM v5 CONUS
+#    that's hourly f1..f48, 3-hourly to f192, 6-hourly to f264 (108 hours).
+#  * accumulation (ASNOW, APCP): the finest gap-free tiling of the published
+#    blocks — 1-HOUR blocks through the leading hourly run (f1..f48), then
+#    6-HOUR blocks (48-54, 54-60, ...) out to the last hour. Only 6-hour blocks
+#    tile past f48 (the 3-hourly files carry either no block or an isolated
+#    1-hour one that can't be summed), so this is the most knots a correct
+#    cumulative total can have (verified against the .idx).
+# Elements published at fewer hours (e.g. VIS stops at f78) simply miss the
+# rest; a per-hour miss is negative-cached and skipped.
 
+# Fallback schedule (verified NBM v5 CONUS) for when the listing is
+# unavailable: hourly to f48, 3-hourly to f192, 6-hourly to f264.
+_DEFAULT_HOURS = (list(range(1, 49)) + list(range(51, 193, 3))
+                  + list(range(198, 265, 6)))
 
-# Accumulation tiling boundary: 1-hour blocks are published through this fhour;
-# beyond it only 6-hour blocks exist. (NBM ASNOW/APCP; verified via the idx.)
+# Default accumulation tiling boundary (end of the hourly run) and the block
+# length used past it. The live boundary is derived from the published hours.
 ACCUM_HOURLY_MAX = 48
-ACCUM_CADENCE = 6                            # hours per block in the 6-hourly tail
+ACCUM_CADENCE = 6                            # hours per block past the hourly run
 
 
-def _accum_hours():
-    # Hourly 1..48 (1-hour blocks), then 6-hourly 54..180 (6-hour blocks).
-    # Together these tile [0,180] disjointly with no gaps/overlaps.
-    hourly = list(range(1, ACCUM_HOURLY_MAX + 1))
-    six = list(range(ACCUM_HOURLY_MAX + ACCUM_CADENCE, 181, ACCUM_CADENCE))
-    return hourly + six
+def _instant_hours(hours=None):
+    """Instantaneous schedule: every published forecast hour."""
+    return sorted(set(_DEFAULT_HOURS if hours is None else hours))
 
 
-def _accum_interval_for(fhour):
-    """The accumulation block LENGTH (hours) to request for a given accum
-    fhour: 1h while hourly blocks are published (fhour <= ACCUM_HOURLY_MAX),
-    else 6h. Matches the disjoint tiling produced by _accum_hours()."""
-    return 1 if fhour <= ACCUM_HOURLY_MAX else ACCUM_CADENCE
+def _accum_schedule(hours=None):
+    """[(fhour, block_hours)] tiling [0, H] contiguously with the finest
+    accumulation blocks available: 1-hour blocks while the published hours run
+    hourly from f1, then ACCUM_CADENCE-hour blocks while those end on a
+    published hour. Stops at the first gap so blocks never overlap or skip."""
+    hset = set(_DEFAULT_HOURS if hours is None else hours)
+    out = []
+    t = 0
+    while (t + 1) in hset:
+        out.append((t + 1, 1))
+        t += 1
+    while (t + ACCUM_CADENCE) in hset:
+        out.append((t + ACCUM_CADENCE, ACCUM_CADENCE))
+        t += ACCUM_CADENCE
+    return out
 
 
-def _forecast_hours(accumulate):
-    return _accum_hours() if accumulate else _instant_hours()
+def _accum_hours(hours=None):
+    return [fh for fh, _ in _accum_schedule(hours)]
+
+
+def _accum_interval_for(fhour, hours=None):
+    """The accumulation block LENGTH (hours) to request for an accum fhour in
+    the schedule derived from `hours` (default: the fallback schedule)."""
+    for fh, length in _accum_schedule(hours):
+        if fh == fhour:
+            return length
+    return ACCUM_CADENCE
+
+
+def _forecast_hours(accumulate, hours=None):
+    return _accum_hours(hours) if accumulate else _instant_hours(hours)
 
 
 # Back-compat: default (instantaneous) schedule. Tests may override.
@@ -190,20 +211,69 @@ def _idx_url(day, cc, fhour):
     return _file_url(day, cc, fhour) + ".idx"
 
 
-def _http_get(url, rng=None, timeout=60):
-    """GET `url` (optionally a byte range), returning raw bytes or None."""
-    import requests
+_HTTP_SESSION = None
+_HTTP_SESSION_LOCK = threading.Lock()
+_HTTP_ATTEMPTS = 3
+
+
+def _session():
+    """One shared keep-alive HTTP session for NBM .idx / record GETs.
+
+    Reusing pooled connections means a load of ~100 small .idx files opens a
+    handful of connections (and does a handful of DNS lookups) instead of one
+    per file — a burst of fresh lookups is what trips a single home-LAN
+    resolver ("Temporary failure in name resolution")."""
+    global _HTTP_SESSION
+    with _HTTP_SESSION_LOCK:
+        if _HTTP_SESSION is None:
+            import requests
+            from requests.adapters import HTTPAdapter
+            s = requests.Session()
+            n = max(_IDX_CONCURRENCY, 4) + 2
+            adapter = HTTPAdapter(pool_connections=n, pool_maxsize=n,
+                                  max_retries=0)
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+            _HTTP_SESSION = s
+        return _HTTP_SESSION
+
+
+def _http_fetch(url, rng=None, timeout=60):
+    """GET `url` (optionally a byte range) with retries for TRANSIENT failures.
+
+    Returns (status, content):
+      ("ok", bytes)       200 / 206
+      ("missing", None)   403 / 404 / 410 — the object really isn't there
+      ("error", None)     network/DNS error, timeout, 429/5xx, or any other
+                          unexpected status, after retrying
+    Callers negative-cache only "missing"; an "error" is retried next load."""
     headers = {"User-Agent": _nbm_user_agent()}
     if rng is not None:
         headers["Range"] = f"bytes={rng}"
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout)
-    except Exception:
-        logger.warning("NBM GET failed %s", url, exc_info=True)
-        return None
-    if r.status_code in (200, 206):
-        return r.content
-    return None
+    last = None
+    for attempt in range(_HTTP_ATTEMPTS):
+        try:
+            r = _session().get(url, headers=headers, timeout=timeout)
+        except Exception as e:
+            last = type(e).__name__
+        else:
+            if r.status_code in (200, 206):
+                return "ok", r.content
+            if r.status_code in (403, 404, 410):
+                return "missing", None
+            last = f"HTTP {r.status_code}"
+            if r.status_code < 500 and r.status_code != 429:
+                break                         # other 4xx: retrying won't help
+        if attempt < _HTTP_ATTEMPTS - 1:
+            time.sleep(0.5 * (attempt + 1))
+    logger.warning("NBM GET failed %s (%s)", url, last)
+    return "error", None
+
+
+def _http_get(url, rng=None, timeout=60):
+    """GET `url` (optionally a byte range), returning raw bytes or None."""
+    status, content = _http_fetch(url, rng=rng, timeout=timeout)
+    return content if status == "ok" else None
 
 
 def _cycle_available(day, cc):
@@ -237,6 +307,68 @@ def latest_cycle(force=False):
     return None
 
 
+# --- Published forecast hours (bucket listing) ------------------------------
+
+_HOURS_CACHE = {}        # (day, cc) -> (fetched_at, [fhours])
+_HOURS_LOCK = threading.Lock()
+
+
+def _list_published_hours(day, cc):
+    """Forecast hours with a published .idx for this cycle + region, from the
+    S3 bucket listing (ListObjectsV2, paginated). None if the listing isn't
+    available (e.g. a mirror without S3 listing) or is empty."""
+    import html
+    import requests
+    prefix = f"blend.{day}/{cc}/core/blend.t{cc}z.core.f"
+    pat = re.compile(rf"\.f(\d{{3}})\.{re.escape(NBM_REGION)}\.grib2\.idx$")
+    hours = set()
+    token = None
+    try:
+        for _ in range(50):                       # page cap (~1000 keys/page)
+            params = {"list-type": "2", "prefix": prefix}
+            if token:
+                params["continuation-token"] = token
+            r = requests.get(NBM_BASE + "/", params=params, timeout=30,
+                             headers={"User-Agent": _nbm_user_agent()})
+            if not r.ok:
+                return None
+            for key in re.findall(r"<Key>([^<]+)</Key>", r.text):
+                m = pat.search(key)
+                if m:
+                    hours.add(int(m.group(1)))
+            m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>",
+                          r.text)
+            if not m:
+                break
+            token = html.unescape(m.group(1))
+    except Exception as e:
+        logger.warning("NBM bucket listing failed for %s/%s (%s)", day, cc,
+                       type(e).__name__)
+        return None
+    return sorted(hours) or None
+
+
+def _published_hours(day, cc):
+    """Every forecast hour NBM has published for (day, cc), refreshed at most
+    every NBM_CYCLE_RECHECK_SECONDS (a fresh cycle is still uploading its later
+    hours, so the list grows for a while). Falls back to the verified default
+    schedule when the listing is unavailable."""
+    key = (day, cc)
+    now = time.time()
+    with _HOURS_LOCK:
+        hit = _HOURS_CACHE.get(key)
+    if hit is not None and now - hit[0] < _CYCLE_RECHECK_SECONDS:
+        return hit[1]
+    hours = _list_published_hours(day, cc)
+    if not hours:
+        if hit is not None:
+            return hit[1]                         # keep the last good listing
+        return list(_DEFAULT_HOURS)
+    with _HOURS_LOCK:
+        _HOURS_CACHE[key] = (now, hours)
+    return hours
+
+
 # --- Negative cache for missing (cycle, hour, element) records --------------
 
 _MISSING = {}
@@ -265,17 +397,24 @@ def _mark_missing(key):
 _IDX_CACHE = {}           # idx_url -> (mtime_fetched, [lines])
 _IDX_LOCK = threading.Lock()
 
+# Returned by _fetch_idx_lines when the .idx couldn't be fetched because of a
+# transient problem (network/DNS/5xx), as opposed to None = it doesn't exist.
+_TRANSIENT = object()
+
 
 def _fetch_idx_lines(day, cc, fhour):
-    """Return the .idx lines for one hour (cached in-process briefly)."""
+    """Return the .idx lines for one hour (cached in-process briefly), None if
+    the .idx doesn't exist, or _TRANSIENT if it couldn't be fetched right now."""
     url = _idx_url(day, cc, fhour)
     with _IDX_LOCK:
         hit = _IDX_CACHE.get(url)
     if hit is not None and time.time() - hit[0] < NBM_TTL_SECONDS:
         return hit[1]
-    data = _http_get(url)
-    if data is None:
+    status, data = _http_fetch(url)
+    if status == "missing":
         return None
+    if status != "ok" or data is None:
+        return _TRANSIENT
     lines = data.decode("utf-8", "replace").splitlines()
     with _IDX_LOCK:
         _IDX_CACHE[url] = (time.time(), lines)
@@ -353,6 +492,8 @@ def _resolve_record_spec(day, cc, fhour, var, level, want_interval=None):
     the body. Returns one of:
       ("fresh", path)              already on disk & fresh — no fetch needed
       ("miss",  path_or_None)      negative-cached / idx missing — skip
+      ("retry", path_or_None)      idx unreachable right now (transient) —
+                                   skip this pass, NOT negative-cached
       ("fetch", {url,path,rng})    needs fetching (the byte range to GET)
     Used by the batched loader so all record bodies can be fetched
     concurrently in the writer; the per-record idx read still happens here."""
@@ -363,6 +504,8 @@ def _resolve_record_spec(day, cc, fhour, var, level, want_interval=None):
     if _missing_recent(key):
         return ("miss", path if os.path.exists(path) else None)
     lines = _fetch_idx_lines(day, cc, fhour)
+    if lines is _TRANSIENT:
+        return ("retry", path if os.path.exists(path) else None)
     if lines is None:
         _mark_missing(key)
         return ("miss", path if os.path.exists(path) else None)
@@ -407,6 +550,8 @@ def _ensure_record(day, cc, fhour, var, level, want_interval=None):
         return path if os.path.exists(path) else None
 
     lines = _fetch_idx_lines(day, cc, fhour)
+    if lines is _TRANSIENT:
+        return path if os.path.exists(path) else None   # retry next load
     if lines is None:
         _mark_missing(key)
         return path if os.path.exists(path) else None
@@ -453,8 +598,10 @@ def _ensure_record(day, cc, fhour, var, level, want_interval=None):
     except Exception:
         pass  # writer unavailable -> inline fallback below
 
-    data = _http_get(url, rng=range_header)
-    if not data or data[:4] != b"GRIB":
+    status, data = _http_fetch(url, rng=range_header)
+    if status == "error":
+        return path if os.path.exists(path) else None   # transient: retry later
+    if status != "ok" or not data or data[:4] != b"GRIB":
         _mark_missing(key)
         return path if os.path.exists(path) else None
 
@@ -507,10 +654,13 @@ def _parse_record(path, want_index=True):
 
 
 def _load_grid(attribute):
-    """Fetch (idx+range) and parse all forecast-hour records for `attribute`
-    from the latest cycle; build the KDTree once and the (epoch, values) frame
-    list. Memoized per attribute keyed on (cycle, n_frames). Returns the dict
-    or None."""
+    """Fetch (idx+range) and parse every published forecast-hour record for
+    `attribute` from the latest cycle; build the grid index once and the
+    (epoch, values) frame list. Memoized per attribute, keyed on the cycle AND
+    the fetch plan (so a cycle first loaded mid-upload is rebuilt once more of
+    its hours are published). Returns the dict or None."""
+    import concurrent.futures
+
     spec = ELEMENTS.get(attribute)
     if spec is None:
         return None
@@ -520,30 +670,45 @@ def _load_grid(attribute):
     day, cc = cyc
     var, level = spec["var"], spec["level"]
     accum = spec.get("accum", False)
-    hours = _forecast_hours(accum)
+    published = _published_hours(day, cc)
+    if accum:
+        plan = _accum_schedule(published)            # [(fhour, block_hours)]
+    else:
+        plan = [(fh, None) for fh in _instant_hours(published)]
+    if not plan:
+        return None
 
-    cache_key = (day, cc, attribute)
+    cache_key = (day, cc, attribute, len(plan), plan[-1][0])
     with _GRID_CACHE_LOCK:
         cached = _GRID_CACHE.get(attribute)
-        if cached is not None and cached["key"] == cache_key:
+        if (cached is not None and cached["key"] == cache_key
+                and (cached.get("retry_at") is None
+                     or time.time() < cached["retry_at"])):
             return cached
 
     tree = None
     frames = []
 
-    # Resolve each record to a fetch spec (idx read only; no body download).
+    # Resolve each record to a fetch spec (idx read only; no body download),
+    # several hours at a time — a cold load reads ~100 small .idx files.
     # Records already fresh on disk need no fetch; the rest are fetched
     # CONCURRENTLY in the single writer process via one ensure_binary_many RPC
-    # (MAX_CONCURRENCY-wide) instead of one blocking RPC per record.
+    # instead of one blocking RPC per record.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_IDX_CONCURRENCY) as ex:
+        resolved = list(ex.map(
+            lambda p: _resolve_record_spec(day, cc, p[0], var, level, p[1]), plan))
     ready_paths = []     # fresh-on-disk records to parse
     fetch_specs = []     # {url,path,rng,key} needing a body fetch
-    for fhour in hours:
-        want = _accum_interval_for(fhour) if accum else None
-        kind, payload = _resolve_record_spec(day, cc, fhour, var, level, want)
+    n_skipped = 0        # hours skipped for a TRANSIENT reason (retry soon)
+    for kind, payload in resolved:
         if kind == "fresh":
             ready_paths.append(payload)
         elif kind == "fetch":
             fetch_specs.append(payload)
+        elif kind == "retry":
+            n_skipped += 1
+            if payload:                 # an older copy on disk beats a gap
+                ready_paths.append(payload)
         # "miss" -> skip (negative-cached / absent)
 
     if fetch_specs:
@@ -562,6 +727,8 @@ def _load_grid(attribute):
                 p = s["path"]
                 if ok and os.path.exists(p) and _validate_grib(p, s["key"]):
                     ready_paths.append(p)
+                elif not ok:
+                    n_skipped += 1
                 # NOTE: do NOT _mark_missing on a failed fetch here. A failure
                 # at this stage is almost always TRANSIENT (network/DNS/timeout
                 # on a burst of concurrent range GETs), not a genuine "record
@@ -578,8 +745,7 @@ def _load_grid(attribute):
         if not did_batch:
             # Writer unavailable: fall back to the per-record path (which has
             # its own inline-download fallback).
-            for fhour in hours:
-                want = _accum_interval_for(fhour) if accum else None
+            for fhour, want in plan:
                 p = _ensure_record(day, cc, fhour, var, level, want_interval=want)
                 if p and os.path.exists(p):
                     ready_paths.append(p)
@@ -611,12 +777,29 @@ def _load_grid(attribute):
         seen.add(epoch)
         deduped.append((epoch, vals))
 
-    result = {"key": cache_key, "tree": tree, "frames": deduped}
+    # Cycle init (f000) epoch: the cumulative-total anchor for accumulation.
+    init = int(datetime.strptime(day, "%Y%m%d")
+               .replace(hour=int(cc), tzinfo=timezone.utc).timestamp())
+    result = {"key": cache_key, "tree": tree, "frames": deduped, "init": init,
+              # A grid with hours skipped for transient reasons is only kept
+              # briefly, so those hours are retried instead of staying missing
+              # for the rest of the cycle.
+              "retry_at": (time.time() + _INCOMPLETE_RETRY_SECONDS
+                           if n_skipped else None)}
     with _GRID_CACHE_LOCK:
         _GRID_CACHE[attribute] = result
-    logger.warning("NBM parsed %s: %d frames (cycle %s/%s)",
-                   attribute, len(deduped), day, cc)
+    if n_skipped:
+        logger.warning("NBM parsed %s: %d frames (cycle %s/%s), %d hour(s) "
+                       "unavailable right now; retrying in %ds", attribute,
+                       len(deduped), day, cc, n_skipped, _INCOMPLETE_RETRY_SECONDS)
+    else:
+        logger.warning("NBM parsed %s: %d frames (cycle %s/%s)",
+                       attribute, len(deduped), day, cc)
     return result
+
+
+_IDX_CONCURRENCY = int(os.environ.get("NBM_IDX_CONCURRENCY", "8"))
+_INCOMPLETE_RETRY_SECONDS = int(os.environ.get("NBM_INCOMPLETE_RETRY_SECONDS", "60"))
 
 
 def grid_mtime(attribute):
@@ -630,7 +813,7 @@ def grid_mtime(attribute):
         return 0.0
     day, cc = cyc
     var = spec["var"]
-    hours = _forecast_hours(spec.get("accum", False))
+    hours = _forecast_hours(spec.get("accum", False), _published_hours(day, cc))
     newest = 0.0
     for fhour in hours:
         p = _record_path(day, cc, fhour, var)
@@ -722,20 +905,19 @@ def fit_area(area, attribute, accumulate=False):
     series = np.vstack([v[idx] for _, v in grid["frames"]])
 
     convert = spec["convert"]
-    # For ACCUMULATION, anchor the cumulative zero at the first block's START
-    # (the cycle init), not at the first SAMPLED epoch (the first block's END).
-    # epochs[0] is the end of the first block; its length is _accum_interval_for
-    # of the first accum fhour (1h under the mixed-cadence schedule), so the
-    # window/zero-anchor start is epochs[0] - that length. This makes the series
-    # begin at init (f000) and the first block ramp from 0, recovering the
-    # previously-dropped opening hours. For OBSERVATION, the first epoch is the
-    # value's own time, so start stays at epochs[0].
+    # For ACCUMULATION, anchor the cumulative zero at the cycle init (f000) —
+    # the start of the first block — not at the first SAMPLED epoch (the first
+    # block's end), so the series begins at init and the first block ramps
+    # from 0. The grid records the init epoch; a grid without it (tests) falls
+    # back to "first epoch minus the first block's length". For OBSERVATION,
+    # the first epoch is the value's own time, so start stays at epochs[0].
     if accumulate:
-        # First block's length comes from the accumulation schedule's first
-        # fhour (1h under the mixed-cadence tiling); init = first epoch - that.
-        first_fhour = _accum_hours()[0]
-        first_block_h = _accum_interval_for(first_fhour)
-        start_epoch = int(epochs[0]) - first_block_h * 3600
+        init = grid.get("init")
+        if init is not None and init < epochs[0]:
+            start_epoch = int(init)
+        else:
+            first_block_h = _accum_interval_for(_accum_hours()[0])
+            start_epoch = int(epochs[0]) - first_block_h * 3600
     else:
         start_epoch = int(epochs[0])
     out_points = []
@@ -759,6 +941,10 @@ def fit_area(area, attribute, accumulate=False):
         "splines": out_splines,
         "units": spec["units"],
         "nonneg": spec["nonneg"],
+        # The times the data actually exists at (plus the zero anchor for an
+        # accumulation), so a re-fit can use exactly these as knots.
+        "knots": (np.concatenate(([float(start_epoch)], epochs))
+                  if accumulate and start_epoch < epochs[0] else epochs),
     }
     if block is not None:
         fit["block"] = {"block": block, "positions": np.asarray(kept)}
@@ -785,9 +971,16 @@ def fit_area_dense(area, attribute, accumulate=False, upsample=None):
     pts = fit["points"]
     if not pts:
         return fit
-    span = max(1, int(fit["end"]) - int(fit["start"]))
-    n_knots = min(_DENSE_KNOT_CAP, max(2, span // 3600 + 1))
-    epochs = np.linspace(fit["start"], fit["end"], num=n_knots, dtype=float)
+    # Re-fit at the ACTUAL forecast times (every published hour) rather than an
+    # evenly spaced grid: exact at every data point, and no cap that would thin
+    # out the hourly opening days over the full ~11-day horizon.
+    knots = fit.get("knots")
+    if knots is not None and np.asarray(knots).size >= 2:
+        epochs = np.unique(np.asarray(knots, dtype=float))
+    else:
+        span = max(1, int(fit["end"]) - int(fit["start"]))
+        n_knots = min(_DENSE_KNOT_CAP, max(2, span // 3600 + 1))
+        epochs = np.linspace(fit["start"], fit["end"], num=n_knots, dtype=float)
 
     def _refit(values, ep):
         v = np.asarray(values, dtype=float)

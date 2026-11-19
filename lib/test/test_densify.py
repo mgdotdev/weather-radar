@@ -99,12 +99,20 @@ class TestDensifyBlock:
         assert interp.densify_block((3, 3), np.asarray([]), EPOCHS, [], _fit_fn,
                                     2, _identity_latlon) is None
 
-    def test_small_block_uses_smooth_fallback(self):
-        """A 3x3 block can't use cubic; the linear + smooth path must still
-        produce a full, finite field."""
-        sp, pos = _block(3, 3, lambda r, c: 5.0 if (r, c) == (1, 1) else 0.0)
+    def test_small_block_linear_fallback_is_exact_at_cells(self):
+        """A 3x3 block can't use cubic; the linear fallback must keep every
+        native cell's value exactly (no smoothing) and interpolate between."""
+        k = 9
+        field = lambda r, c: 5.0 if (r, c) == (1, 1) else 0.0
+        sp, pos = _block(3, 3, field)
         lats, lons, dense = interp.densify_block(
-            (3, 3), pos, EPOCHS, sp, _fit_fn, 9, _identity_latlon)
+            (3, 3), pos, EPOCHS, sp, _fit_fn, k, _identity_latlon)
         vals = np.array([float(d(0.0)) for d in dense])
         assert np.all(np.isfinite(vals))
-        assert len(np.unique(np.round(vals, 3))) > 10   # a gradient, not terraces
+        n_dc = (3 - 1) * k + 1
+        for r in range(3):
+            for c in range(3):
+                assert vals[(r * k) * n_dc + (c * k)] == pytest.approx(field(r, c))
+        # Half-way from the peak to an edge cell: linear -> exactly half.
+        assert vals[(1 * k) * n_dc + (k + k // 2)] == pytest.approx(
+            5.0 * (1 - (k // 2) / k))

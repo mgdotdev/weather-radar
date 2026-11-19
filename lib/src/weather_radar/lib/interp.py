@@ -145,25 +145,22 @@ _cubic_warned = False
 
 def _resample_grid(lat_ax, lon_ax, grid, query):
     """Cubic-resample a complete (lat x lon) grid onto `query` [[lat,lon],...].
-    Returns (values, used_linear) where used_linear is True when this scipy
-    couldn't do cubic (e.g. the grid has < 4 points in a dimension) and fell
-    back to linear — the caller can then de-facet the (piecewise-linear) result
-    with a light smooth, since linear interpolation on a COARSE lattice shows
-    hard terraces/striations between rows."""
+    Falls back to linear when cubic isn't possible (scipy needs >= 4 points per
+    dimension, so small grids). Both are exact at the native grid points."""
     global _cubic_warned
     from scipy.interpolate import RegularGridInterpolator
     try:
         rgi = RegularGridInterpolator((lat_ax, lon_ax), grid, method="cubic",
                                       bounds_error=False, fill_value=None)
-        return rgi(query), False
+        return rgi(query)
     except (ValueError, NotImplementedError):
         if not _cubic_warned:
             logger.warning("densify: cubic RegularGridInterpolator unavailable "
-                           "(small grid?); linear + smooth fallback")
+                           "(small grid?); falling back to linear")
             _cubic_warned = True
         rgi = RegularGridInterpolator((lat_ax, lon_ax), grid, method="linear",
                                       bounds_error=False, fill_value=None)
-        return rgi(query), True
+        return rgi(query)
 
 
 def densify_fit(lats, lons, epochs, native_splines, fit_fn, k):
@@ -248,38 +245,14 @@ def _densify_series(native_grid, ax0, ax1, k):
 
     dense_ax0 = densify_axis(ax0, k)
     dense_ax1 = densify_axis(ax1, k)
-    n_d0, n_d1 = dense_ax0.size, dense_ax1.size
     d0, d1 = np.meshgrid(dense_ax0, dense_ax1, indexing="ij")
     query = np.column_stack([d0.ravel(), d1.ravel()])
-
-    # When the native grid is too small for cubic resampling, scipy falls
-    # back to LINEAR, which leaves hard piecewise-linear terraces between the
-    # (few, coarse) rows/cols — visible as striations on the painted field. In
-    # that case we lightly Gaussian-smooth each dense knot grid to blend the
-    # facets. The blur radius scales with the upsample factor k (so it spans
-    # roughly one native cell's worth of dense samples) and is only applied on
-    # the linear-fallback path — the cubic path is already smooth and untouched.
-    try:
-        from scipy.ndimage import gaussian_filter
-    except Exception:
-        gaussian_filter = None
-    smooth_sigma = max(0.5, k / 3.0)
 
     n_hours = native_grid.shape[0]
     dense_series = np.empty((n_hours, query.shape[0]), dtype=float)
     for h in range(n_hours):
         g = _fill_holes(native_grid[h])
-        vals, used_linear = _resample_grid(ax0, ax1, g, query)
-        if used_linear and gaussian_filter is not None:
-            # Reshape to the dense 2-D grid, smooth, re-flatten (row-major,
-            # matching the meshgrid(indexing="ij") ravel order).
-            try:
-                vals = gaussian_filter(
-                    vals.reshape(n_d0, n_d1), sigma=smooth_sigma,
-                    mode="nearest").ravel()
-            except Exception:
-                pass
-        dense_series[h] = vals
+        dense_series[h] = _resample_grid(ax0, ax1, g, query)
     return dense_series, dense_ax0, dense_ax1
 
 
