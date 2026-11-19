@@ -81,14 +81,19 @@ class NBMObservationEnsemble:
                 "features": list(self.iter_predict(time, verbose=verbose))}
 
     def value_range(self, samples: int = 24):
-        from datetime import datetime
+        from datetime import datetime, timezone
         self._ensure_fit()
         if not self._fit or not self._models:
             return None
         vmin = vmax = None
         units = self._fit["units"]
-        start = datetime.fromtimestamp(self._fit["start"])
-        end = datetime.fromtimestamp(self._fit["end"])
+        # UTC-AWARE datetimes from the fit's epoch bounds. Emitting UTC (not a
+        # naive server-local stamp) keeps the window start/end unambiguous so
+        # the client localizes them to the user's zone (see the graph/map
+        # "send UTC, localize in browser" convention). `total` is a duration,
+        # so the zone doesn't affect it.
+        start = datetime.fromtimestamp(self._fit["start"], tz=timezone.utc)
+        end = datetime.fromtimestamp(self._fit["end"], tz=timezone.utc)
         total = (end - start).total_seconds()
         if total <= 0:
             return None

@@ -27,8 +27,11 @@ PIPELINE (mirrors lib/ndfd.py):
      bucket. For each forecast hour in FORECAST_HOURS, fetch that hour's `.idx`,
      locate the DETERMINISTIC record for the element (empty trailing field — no
      `prob`/`% level`), and HTTP-Range fetch just that record to disk.
-  2. Parse each single-message record with eccodes; build a cKDTree over the
-     grid's lat/lon ONCE (constant across hours) for bulk nearest sampling.
+  2. Parse each single-message record with eccodes; build a grid index ONCE
+     (constant across hours) for bulk nearest sampling. The index projects
+     lat/lon with pyproj and computes the cell by arithmetic (O(1), no per-cell
+     arrays; see lib.gridindex), falling back to a cKDTree over the grid's
+     lat/lon only if the projection can't be validated.
   3. For an area, nearest-sample every lattice point across all fetched hours,
      fit a per-point CubicSpline over (epoch -> value), convert native GRIB
      units to display units. Accumulation elements (ASNOW/APCP) are per-interval
@@ -66,7 +69,7 @@ def _nbm_user_agent():
     if override and override.strip():
         return override.strip()
     from .connection import noaa_user_agent
-    return noaa_user_agent()
+    return noaa_user_agent(warn=False)
 
 # NBM runs 4x/day. Try newest first, fall back.
 CYCLES = ("18", "12", "06", "00")
@@ -78,23 +81,41 @@ NBM_MISS_TTL_SECONDS = int(os.environ.get("NBM_MISS_TTL_SECONDS", "3600"))
 
 # Forecast hours to sample, per element TYPE:
 #  * instantaneous (TMP, WIND, ...): hourly through day 3, 3-hourly to ~7 days.
-#  * accumulation  (ASNOW, APCP):    a strict 6-HOUR cadence. NBM publishes
-#    accumulation as CONTIGUOUS 6-hour blocks ending at each 6-hourly forecast
-#    hour (0-6, 6-12, 18-24, ..., 66-72, 90-96, ...). Sampling every 6h and
-#    taking each block's amount tiles the window with NO overlap and NO gap, so
-#    the cumulative storm total is exact. (Shorter 1-hour sub-blocks exist only
-#    at early hours and do NOT tile the whole window — summing them undercounts.)
+#  * accumulation  (ASNOW, APCP):    a MIXED-cadence disjoint tiling —
+#    1-HOUR blocks for f1..f48 then 6-HOUR blocks for f54..f180. NBM publishes
+#    accumulation as contiguous blocks ending at each forecast hour; the
+#    1-hour blocks (0-1, 1-2, ...) are available only through ~f48, and only
+#    6-hour blocks (..-54, 54-60, ...) exist beyond that. Taking the 1-hour
+#    blocks early and 6-hour blocks late tiles [0,180] with NO overlap and NO
+#    gap (verified against the .idx), so the cumulative storm total is exact —
+#    AND the series now starts at f1 (init+1h) with hourly resolution over the
+#    first two days, instead of the old 6-hourly-only schedule that began at f6
+#    and discarded the first six hours.
 def _instant_hours():
     hrs = list(range(1, 73))                 # hourly, days 1-3
     hrs += list(range(75, 181, 3))           # 3-hourly, days 4-7 (to f180)
     return hrs
 
 
-ACCUM_CADENCE = 6                            # hours per accumulation block
+# Accumulation tiling boundary: 1-hour blocks are published through this fhour;
+# beyond it only 6-hour blocks exist. (NBM ASNOW/APCP; verified via the idx.)
+ACCUM_HOURLY_MAX = 48
+ACCUM_CADENCE = 6                            # hours per block in the 6-hourly tail
 
 
 def _accum_hours():
-    return list(range(ACCUM_CADENCE, 181, ACCUM_CADENCE))   # 6,12,...,180
+    # Hourly 1..48 (1-hour blocks), then 6-hourly 54..180 (6-hour blocks).
+    # Together these tile [0,180] disjointly with no gaps/overlaps.
+    hourly = list(range(1, ACCUM_HOURLY_MAX + 1))
+    six = list(range(ACCUM_HOURLY_MAX + ACCUM_CADENCE, 181, ACCUM_CADENCE))
+    return hourly + six
+
+
+def _accum_interval_for(fhour):
+    """The accumulation block LENGTH (hours) to request for a given accum
+    fhour: 1h while hourly blocks are published (fhour <= ACCUM_HOURLY_MAX),
+    else 6h. Matches the disjoint tiling produced by _accum_hours()."""
+    return 1 if fhour <= ACCUM_HOURLY_MAX else ACCUM_CADENCE
 
 
 def _forecast_hours(accumulate):
@@ -327,6 +348,52 @@ def _is_fresh(path):
         return False
 
 
+def _resolve_record_spec(day, cc, fhour, var, level, want_interval=None):
+    """Resolve one (hour, element) record to a fetch spec WITHOUT downloading
+    the body. Returns one of:
+      ("fresh", path)              already on disk & fresh — no fetch needed
+      ("miss",  path_or_None)      negative-cached / idx missing — skip
+      ("fetch", {url,path,rng})    needs fetching (the byte range to GET)
+    Used by the batched loader so all record bodies can be fetched
+    concurrently in the writer; the per-record idx read still happens here."""
+    path = _record_path(day, cc, fhour, var)
+    if _is_fresh(path):
+        return ("fresh", path)
+    key = _miss_key(day, cc, fhour, var)
+    if _missing_recent(key):
+        return ("miss", path if os.path.exists(path) else None)
+    lines = _fetch_idx_lines(day, cc, fhour)
+    if lines is None:
+        _mark_missing(key)
+        return ("miss", path if os.path.exists(path) else None)
+    rng = _find_record_range(lines, var, level, want_interval, fhour)
+    if rng is None:
+        _mark_missing(key)
+        return ("miss", path if os.path.exists(path) else None)
+    start, end = rng
+    range_header = f"{start}-{end}" if end is not None else f"{start}-"
+    return ("fetch", {"url": _file_url(day, cc, fhour), "path": path,
+                      "rng": range_header, "key": key})
+
+
+def _validate_grib(path, key):
+    """Post-fetch: confirm `path` holds a GRIB record; if not, drop it and
+    negative-cache `key`. Returns the path on success, else None."""
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except OSError:
+        magic = b""
+    if magic == b"GRIB":
+        return path
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    _mark_missing(key)
+    return None
+
+
 def _ensure_record(day, cc, fhour, var, level, want_interval=None):
     """Ensure one (hour, element) GRIB record is on disk; return its path or
     None. Uses the .idx + HTTP Range to fetch ONLY that record. For
@@ -349,7 +416,44 @@ def _ensure_record(day, cc, fhour, var, level, want_interval=None):
         return path if os.path.exists(path) else None
     start, end = rng
     range_header = f"{start}-{end}" if end is not None else f"{start}-"
-    data = _http_get(_file_url(day, cc, fhour), rng=range_header)
+    url = _file_url(day, cc, fhour)
+
+    # Preferred: the single cache-writer process owns the write (atomic, no
+    # cross-worker races), consistent with the AQI/NDFD/gridpoints paths. NBM
+    # uses age-based TTL freshness (S3 Expires isn't used), so stamp_expires=
+    # False keeps mtime at write time; force=True because our _is_fresh above
+    # already gated the refetch. The record is fetched via the HTTP byte range.
+    try:
+        from . import cachewriter
+        ua = _nbm_user_agent()
+        ok = cachewriter.ensure_binary(
+            url, path, force=True, rng=range_header,
+            headers={"User-Agent": ua}, stamp_expires=False)
+        if ok and os.path.exists(path):
+            # Validate it's a GRIB record (a bad range could yield non-GRIB).
+            try:
+                with open(path, "rb") as f:
+                    magic = f.read(4)
+            except OSError:
+                magic = b""
+            if magic == b"GRIB":
+                return path
+            # Non-GRIB payload: drop it and negative-cache.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            _mark_missing(key)
+            return None
+        # Writer reachable but produced no file -> treat as a miss.
+        if not os.path.exists(path):
+            _mark_missing(key)
+            return None
+        return path
+    except Exception:
+        pass  # writer unavailable -> inline fallback below
+
+    data = _http_get(url, rng=range_header)
     if not data or data[:4] != b"GRIB":
         _mark_missing(key)
         return path if os.path.exists(path) else None
@@ -372,28 +476,32 @@ _GRID_CACHE = {}          # attribute -> {"key", "tree", "frames":[(epoch,vals)]
 _GRID_CACHE_LOCK = threading.Lock()
 
 
-def _parse_record(path):
-    """Parse one single-message NBM GRIB2 record into (tree_or_None, epoch,
-    values). The tree is built from the message's lat/lon arrays."""
+def _parse_record(path, want_index=True):
+    """Parse one single-message NBM GRIB2 record into (index_or_None, epoch,
+    values). The grid index (lat/lon -> flat cell index; see lib.gridindex) is
+    only built when `want_index` — the grid is identical for every record, so
+    callers need it from just the FIRST parsed record and pass False after
+    that (building it per record was pure waste)."""
     import numpy as np
     import eccodes as ec
-    from scipy.spatial import cKDTree
+    from .gridindex import index_from_message, uniform_scan_values
 
     with open(path, "rb") as f:
         gid = ec.codes_grib_new_from_file(f)
         if gid is None:
             return None, None, None
         try:
-            lats = np.asarray(ec.codes_get_array(gid, "latitudes"))
-            lons = np.asarray(ec.codes_get_array(gid, "longitudes"))
-            lons = np.where(lons > 180, lons - 360, lons)
-            tree = cKDTree(np.column_stack([lats, lons]))
-            vals = np.asarray(ec.codes_get_values(gid), dtype=float)
+            index = index_from_message(gid) if want_index else None
+            # NBM uses alternating-row scanning: put the values into the
+            # uniform layout the grid index expects (see uniform_scan_values).
+            vals = uniform_scan_values(
+                np.asarray(ec.codes_get_values(gid), dtype=float),
+                lambda k: ec.codes_get(gid, k))
             vd = ec.codes_get(gid, "validityDate")
             vt = ec.codes_get(gid, "validityTime")
             dt = datetime(vd // 10000, (vd // 100) % 100, vd % 100,
                           vt // 100, vt % 100, tzinfo=timezone.utc)
-            return tree, int(dt.timestamp()), vals
+            return index, int(dt.timestamp()), vals
         finally:
             ec.codes_release(gid)
 
@@ -413,7 +521,6 @@ def _load_grid(attribute):
     var, level = spec["var"], spec["level"]
     accum = spec.get("accum", False)
     hours = _forecast_hours(accum)
-    want = ACCUM_CADENCE if accum else None
 
     cache_key = (day, cc, attribute)
     with _GRID_CACHE_LOCK:
@@ -423,12 +530,68 @@ def _load_grid(attribute):
 
     tree = None
     frames = []
+
+    # Resolve each record to a fetch spec (idx read only; no body download).
+    # Records already fresh on disk need no fetch; the rest are fetched
+    # CONCURRENTLY in the single writer process via one ensure_binary_many RPC
+    # (MAX_CONCURRENCY-wide) instead of one blocking RPC per record.
+    ready_paths = []     # fresh-on-disk records to parse
+    fetch_specs = []     # {url,path,rng,key} needing a body fetch
     for fhour in hours:
-        path = _ensure_record(day, cc, fhour, var, level, want_interval=want)
+        want = _accum_interval_for(fhour) if accum else None
+        kind, payload = _resolve_record_spec(day, cc, fhour, var, level, want)
+        if kind == "fresh":
+            ready_paths.append(payload)
+        elif kind == "fetch":
+            fetch_specs.append(payload)
+        # "miss" -> skip (negative-cached / absent)
+
+    if fetch_specs:
+        ua = _nbm_user_agent()
+        did_batch = False
+        try:
+            from . import cachewriter
+            # NBM: age-TTL freshness (stamp_expires=False), force=True since
+            # _resolve_record_spec already gated on _is_fresh.
+            batch = [{"url": s["url"], "path": s["path"], "force": True,
+                      "rng": s["rng"], "headers": {"User-Agent": ua},
+                      "stamp_expires": False} for s in fetch_specs]
+            oks = cachewriter.ensure_binary_many(batch)
+            did_batch = True
+            for s, ok in zip(fetch_specs, oks):
+                p = s["path"]
+                if ok and os.path.exists(p) and _validate_grib(p, s["key"]):
+                    ready_paths.append(p)
+                # NOTE: do NOT _mark_missing on a failed fetch here. A failure
+                # at this stage is almost always TRANSIENT (network/DNS/timeout
+                # on a burst of concurrent range GETs), not a genuine "record
+                # doesn't exist" (that's caught earlier in _resolve_record_spec
+                # via the idx). Negative-caching a transient failure would leave
+                # a hole in the forecast for NBM_MISS_TTL_SECONDS; instead we
+                # just skip it this pass so the next load retries it.
+        except cachewriter.WriterUnavailable:
+            did_batch = False
+        except Exception:
+            logger.warning("NBM batched fetch failed; falling back to serial",
+                           exc_info=True)
+            did_batch = False
+        if not did_batch:
+            # Writer unavailable: fall back to the per-record path (which has
+            # its own inline-download fallback).
+            for fhour in hours:
+                want = _accum_interval_for(fhour) if accum else None
+                p = _ensure_record(day, cc, fhour, var, level, want_interval=want)
+                if p and os.path.exists(p):
+                    ready_paths.append(p)
+
+    # Parse every ready record into a frame (dedup paths first).
+    for path in dict.fromkeys(ready_paths):
         if not path or not os.path.exists(path):
             continue
         try:
-            t, epoch, vals = _parse_record(path)
+            # The grid index is identical for every record: build it from the
+            # first one that parses, skip it for the rest.
+            t, epoch, vals = _parse_record(path, want_index=(tree is None))
         except Exception:
             logger.warning("NBM parse failed for %s", path, exc_info=True)
             continue
@@ -490,11 +653,45 @@ def _fit_column(raw, epochs, start_epoch, convert, accumulate):
                              fill=_FILL)
 
 
+def _area_block(index, area):
+    """The block of native grid cells covering the area's box, using the grid
+    index's box query. Returns:
+      a GridBlock          -> use exactly these cells
+      _NO_OVERLAP          -> the box is outside the grid (no data there)
+      None                 -> box query unavailable (KD-tree index, or an area
+                              without bounds); caller falls back to the
+                              nearest-cell lattice."""
+    box_cells = getattr(index, "box_cells", None)
+    if box_cells is None:
+        return None
+    try:
+        b = area.requested_bounds
+    except AttributeError:
+        return None
+    try:
+        block = box_cells(b["s"], b["n"], b["w"], b["e"])
+    except Exception:
+        logger.warning("NBM box query failed; falling back to the lattice",
+                       exc_info=True)
+        return None
+    return _NO_OVERLAP if block is None else block
+
+
+_NO_OVERLAP = object()
+
+
 def fit_area(area, attribute, accumulate=False):
-    """Resolve an area's NBM field into per-lattice-point splines over the
-    forecast series (epoch -> display value). Same return shape as
-    ndfd.fit_area: {start, end, points:[MapCoordinate], splines:[...],
-    units, nonneg} or None. Points with < 2 valid samples are dropped."""
+    """Resolve an area's NBM field into per-cell splines over the forecast
+    series (epoch -> display value). Same return shape as ndfd.fit_area:
+    {start, end, points:[MapCoordinate], splines:[...], units, nonneg} or None.
+    Points with < 2 valid samples are dropped.
+
+    With the pyproj grid index, the points are the ACTUAL NBM grid cells in the
+    block covering the area's box (no nearest-neighbor resampling, so no
+    duplicated cells), and the fit also carries a "block" entry so
+    fit_area_dense can densify in grid space. With the KD-tree fallback, the
+    points are the area's lat/lon lattice snapped to the nearest cell (the
+    previous behavior)."""
     import numpy as np
     from .area import MapCoordinate
 
@@ -505,31 +702,57 @@ def fit_area(area, attribute, accumulate=False):
     if grid is None or grid["tree"] is None or not grid["frames"]:
         return None
 
-    coords = list(area.map_coordinates)
-    if not coords:
+    block = _area_block(grid["tree"], area)
+    if block is _NO_OVERLAP:
         return None
-
-    pts = np.array([[c.lat, c.lon] for c in coords])
-    _, idx = grid["tree"].query(pts, k=1)
+    if block is not None:
+        idx = block.flat
+        pt_lats, pt_lons = block.lats, block.lons
+    else:
+        coords = list(area.map_coordinates)
+        if not coords:
+            return None
+        pts = np.array([[c.lat, c.lon] for c in coords])
+        _, idx = grid["tree"].query(pts, k=1)
+        pt_lats, pt_lons = pts[:, 0], pts[:, 1]
 
     epochs = np.array([e for e, _ in grid["frames"]], dtype=float)
-    stacked = np.vstack([v for _, v in grid["frames"]])
-    series = stacked[:, idx]
+    # Gather only the selected cells from each frame. (Stacking whole frames
+    # first would copy every ~3.7M-cell grid for every fit.)
+    series = np.vstack([v[idx] for _, v in grid["frames"]])
 
     convert = spec["convert"]
-    start_epoch = int(epochs[0])
+    # For ACCUMULATION, anchor the cumulative zero at the first block's START
+    # (the cycle init), not at the first SAMPLED epoch (the first block's END).
+    # epochs[0] is the end of the first block; its length is _accum_interval_for
+    # of the first accum fhour (1h under the mixed-cadence schedule), so the
+    # window/zero-anchor start is epochs[0] - that length. This makes the series
+    # begin at init (f000) and the first block ramp from 0, recovering the
+    # previously-dropped opening hours. For OBSERVATION, the first epoch is the
+    # value's own time, so start stays at epochs[0].
+    if accumulate:
+        # First block's length comes from the accumulation schedule's first
+        # fhour (1h under the mixed-cadence tiling); init = first epoch - that.
+        first_fhour = _accum_hours()[0]
+        first_block_h = _accum_interval_for(first_fhour)
+        start_epoch = int(epochs[0]) - first_block_h * 3600
+    else:
+        start_epoch = int(epochs[0])
     out_points = []
     out_splines = []
+    kept = []          # block position (row-major) of each kept point
     for col in range(series.shape[1]):
         sp = _fit_column(series[:, col], epochs, start_epoch, convert, accumulate)
         if sp is None:
             continue
-        out_points.append(MapCoordinate(lat=coords[col].lat, lon=coords[col].lon))
+        out_points.append(MapCoordinate(lat=float(pt_lats[col]),
+                                        lon=float(pt_lons[col])))
         out_splines.append(sp)
+        kept.append(col)
 
     if not out_splines:
         return None
-    return {
+    fit = {
         "start": start_epoch,
         "end": int(epochs[-1]),
         "points": out_points,
@@ -537,6 +760,9 @@ def fit_area(area, attribute, accumulate=False):
         "units": spec["units"],
         "nonneg": spec["nonneg"],
     }
+    if block is not None:
+        fit["block"] = {"block": block, "positions": np.asarray(kept)}
+    return fit
 
 
 WR_NBM_UPSAMPLE = "WR_NBM_UPSAMPLE"
@@ -559,8 +785,6 @@ def fit_area_dense(area, attribute, accumulate=False, upsample=None):
     pts = fit["points"]
     if not pts:
         return fit
-    lats = np.array([p.lat for p in pts], dtype=float)
-    lons = np.array([p.lon for p in pts], dtype=float)
     span = max(1, int(fit["end"]) - int(fit["start"]))
     n_knots = min(_DENSE_KNOT_CAP, max(2, span // 3600 + 1))
     epochs = np.linspace(fit["start"], fit["end"], num=n_knots, dtype=float)
@@ -576,7 +800,17 @@ def fit_area_dense(area, attribute, accumulate=False, upsample=None):
         except Exception:
             return None
 
-    dense = interp.densify_fit(lats, lons, epochs, fit["splines"], _refit, k)
+    blk = fit.get("block")
+    if blk is not None:
+        # Native NBM cells: densify in grid (row, col) space, where the block
+        # is a regular grid.
+        block = blk["block"]
+        dense = interp.densify_block(block.shape, blk["positions"], epochs,
+                                     fit["splines"], _refit, k, block.latlon)
+    else:
+        lats = np.array([p.lat for p in pts], dtype=float)
+        lons = np.array([p.lon for p in pts], dtype=float)
+        dense = interp.densify_fit(lats, lons, epochs, fit["splines"], _refit, k)
     if dense is None:
         return fit
     d_lats, d_lons, d_splines = dense

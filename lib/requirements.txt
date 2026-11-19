@@ -3,3 +3,4 @@ requests
 scipy
 numpy
 eccodes
+pyproj==3.7.2

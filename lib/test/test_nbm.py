@@ -121,11 +121,26 @@ class TestIdxRecordRange:
 
 
 class TestForecastSchedules:
-    def test_accumulation_uses_6h_cadence(self):
+    def test_accumulation_mixed_cadence_tiles_window(self):
         hrs = nbm._forecast_hours(accumulate=True)
-        # Strict 6-hour contiguous cadence so blocks tile with no gap/overlap.
-        assert hrs[0] == 6
-        assert all((b - a) == 6 for a, b in zip(hrs, hrs[1:]))
+        # New design: 1-hour blocks through ACCUM_HOURLY_MAX, then 6-hour
+        # blocks to f180. Starts at f1 (init+1h) so the opening hours aren't
+        # dropped.
+        assert hrs[0] == 1
+        assert hrs[-1] == 180
+        # The per-fhour block lengths must tile [0,180] with NO gap/overlap:
+        # each block is (fhour - interval, fhour); consecutive blocks abut.
+        blocks = [(fh - nbm._accum_interval_for(fh), fh) for fh in hrs]
+        prev = 0
+        for a, b in blocks:
+            assert a == prev, f"gap/overlap: block {a}-{b} after {prev}"
+            assert b > a
+            prev = b
+        assert prev == 180
+        # 1-hour early, 6-hour late, with the switch at ACCUM_HOURLY_MAX.
+        assert nbm._accum_interval_for(1) == 1
+        assert nbm._accum_interval_for(nbm.ACCUM_HOURLY_MAX) == 1
+        assert nbm._accum_interval_for(nbm.ACCUM_HOURLY_MAX + nbm.ACCUM_CADENCE) == 6
 
     def test_instantaneous_is_hourly_early(self):
         hrs = nbm._forecast_hours(accumulate=False)
@@ -225,3 +240,224 @@ class TestSourceSelection:
         kinds = ensemble_kinds()
         assert kinds["observation"] is NBMObservationEnsemble
         assert kinds["accumulation"] is NBMAccumulationEnsemble
+
+
+class TestLoadGridIndexBuiltOnce:
+    """The grid index is identical for every record, so _load_grid must ask
+    _parse_record to build it for the FIRST parsed record only (it used to
+    build a ~3.7M-point KD-tree for every record and keep just the first)."""
+
+    def test_index_requested_only_for_first_record(self, monkeypatch, tmp_path):
+        hours = [1, 2, 3, 4]
+        files = {}
+        for h in hours:
+            p = tmp_path / f"rec{h}.grib2"
+            p.write_bytes(b"GRIB")
+            files[h] = str(p)
+
+        monkeypatch.setattr(nbm, "_GRID_CACHE", {})
+        monkeypatch.setattr(nbm, "latest_cycle", lambda force=False: ("20261111", "12"))
+        monkeypatch.setattr(nbm, "_forecast_hours", lambda accumulate: hours)
+        monkeypatch.setattr(
+            nbm, "_resolve_record_spec",
+            lambda day, cc, fh, var, level, want=None: ("fresh", files[fh]))
+
+        sentinel = object()
+        calls = []
+
+        def fake_parse(path, want_index=True):
+            fh = int(path.split("rec")[1].split(".")[0])
+            calls.append((fh, want_index))
+            return (sentinel if want_index else None, 1_000_000 + fh * 3600,
+                    np.array([float(fh)]))
+
+        monkeypatch.setattr(nbm, "_parse_record", fake_parse)
+
+        grid = nbm._load_grid("temperature")
+        assert grid["tree"] is sentinel
+        assert [w for _, w in sorted(calls)] == [True, False, False, False]
+        assert len(grid["frames"]) == 4
+
+
+# --- Box extraction (real pyproj grid index on a small synthetic grid) ------
+
+class _BoxArea:
+    """An area that only exposes the box (the block path never needs the
+    lat/lon lattice)."""
+    def __init__(self, s, n, w, e):
+        self.requested_bounds = {"s": s, "n": n, "w": w, "e": e}
+        self.time_zone = None
+
+    @property
+    def map_coordinates(self):
+        raise AssertionError("block path must not build the lattice")
+
+
+def _box_grid(monkeypatch, nx=40, ny=30, n_hours=6, value_fn=None):
+    """A real LambertGridIndex over an nx x ny grid + frames whose value is a
+    function of the flat cell index."""
+    pytest.importorskip("pyproj")
+    from weather_radar.lib.gridindex import LambertGridIndex
+    index = LambertGridIndex(nx=nx, ny=ny, dx=2539.703, dy=2539.703,
+                             lat1=46.0, lon1=-118.0, lad=25.0, lov=-95.0,
+                             latin1=25.0, latin2=25.0, radius=6371200.0)
+    import time as _t
+    t0 = int(_t.time()) // 3600 * 3600
+    if value_fn is None:
+        value_fn = lambda flat, h: 280.0 + (flat % 97) * 0.1 + h
+    flats = np.arange(nx * ny)
+    frames = [(t0 + h * 3600, value_fn(flats, h).astype(float))
+              for h in range(n_hours)]
+    grid = {"key": ("20261111", "12", "x"), "tree": index, "frames": frames}
+    monkeypatch.setattr(nbm, "_load_grid", lambda attr: grid)
+    monkeypatch.setattr(nbm, "grid_mtime", lambda attr: 1.0)
+    return index, grid
+
+
+def _center_box(index, half_deg=0.1):
+    lat, lon = index.latlon_of(index.ny / 2.0, index.nx / 2.0)   # grid center
+    lat, lon = float(lat), float(lon)
+    return lat - half_deg, lat + half_deg, lon - half_deg, lon + half_deg
+
+
+class TestFitAreaBox:
+    def test_points_are_the_native_cells_in_the_box(self, monkeypatch):
+        index, grid = _box_grid(monkeypatch)
+        s, n, w, e = _center_box(index)
+        fit = nbm.fit_area(_BoxArea(s, n, w, e), "temperature")
+        blk = index.box_cells(s, n, w, e)
+        assert fit is not None and "block" in fit
+        assert len(fit["points"]) == blk.flat.size
+        got = np.array([[p.lat, p.lon] for p in fit["points"]])
+        assert np.allclose(got[:, 0], blk.lats) and np.allclose(got[:, 1], blk.lons)
+        # One point per cell: no two points share a location.
+        assert len({(round(p.lat, 9), round(p.lon, 9)) for p in fit["points"]}) \
+            == len(fit["points"])
+
+    def test_values_come_from_the_selected_cells(self, monkeypatch):
+        index, grid = _box_grid(monkeypatch)
+        s, n, w, e = _center_box(index)
+        fit = nbm.fit_area(_BoxArea(s, n, w, e), "temperature")
+        blk = index.box_cells(s, n, w, e)
+        epoch0, vals0 = grid["frames"][0]
+        conv = nbm.ELEMENTS["temperature"]["convert"]
+        for i in (0, len(fit["splines"]) // 2, len(fit["splines"]) - 1):
+            want = conv(vals0[blk.flat[i]])
+            assert float(fit["splines"][i](epoch0)) == pytest.approx(want, abs=1e-6)
+
+    def test_box_outside_grid_returns_none(self, monkeypatch):
+        _box_grid(monkeypatch)
+        assert nbm.fit_area(_BoxArea(-10, -5, 10, 15), "temperature") is None
+
+    def test_dense_fit_densifies_in_grid_space(self, monkeypatch):
+        index, grid = _box_grid(monkeypatch)
+        s, n, w, e = _center_box(index)
+        k = 3
+        dense = nbm.fit_area_dense(_BoxArea(s, n, w, e), "temperature", upsample=k)
+        n_r, n_c = index.box_cells(s, n, w, e).shape
+        assert len(dense["points"]) == ((n_r - 1) * k + 1) * ((n_c - 1) * k + 1)
+        assert "block" not in dense
+
+    def test_dense_fit_skips_cells_without_data(self, monkeypatch):
+        fill = nbm._FILL
+        # Every cell with flat % 7 == 0 is fill (no data) at every hour.
+        index, grid = _box_grid(
+            monkeypatch,
+            value_fn=lambda flat, h: np.where(flat % 7 == 0, fill, 280.0 + h))
+        s, n, w, e = _center_box(index)
+        fit = nbm.fit_area(_BoxArea(s, n, w, e), "temperature")
+        blk = index.box_cells(s, n, w, e)
+        assert len(fit["points"]) == int((blk.flat % 7 != 0).sum())
+        dense = nbm.fit_area_dense(_BoxArea(s, n, w, e), "temperature", upsample=2)
+        n_r, n_c = blk.shape
+        assert 0 < len(dense["points"]) < ((n_r - 1) * 2 + 1) * ((n_c - 1) * 2 + 1)
+
+    def test_box_query_error_falls_back_to_lattice(self, monkeypatch):
+        index, grid = _box_grid(monkeypatch)
+
+        class Broken:
+            def box_cells(self, *a, **kw):
+                raise RuntimeError("boom")
+            def query(self, pts, k=1):
+                return index.query(pts, k=k)
+
+        grid["tree"] = Broken()
+        s, n, w, e = _center_box(index)
+
+        class LatticeArea(_BoxArea):
+            @property
+            def map_coordinates(self):
+                lat = (s + n) / 2; lon = (w + e) / 2
+                return [MapCoordinate(lat=lat + i * 0.02, lon=lon + j * 0.02)
+                        for i in range(3) for j in range(3)]
+
+        fit = nbm.fit_area(LatticeArea(s, n, w, e), "temperature")
+        assert fit is not None and "block" not in fit
+        assert len(fit["points"]) == 9
+
+    def test_fit_does_not_stack_whole_frames(self, monkeypatch):
+        """Only the selected cells are gathered from each frame."""
+        index, grid = _box_grid(monkeypatch)
+        stacked_shapes = []
+        real_vstack = np.vstack
+
+        def spy(arrays, *a, **kw):
+            out = real_vstack(arrays, *a, **kw)
+            stacked_shapes.append(out.shape)
+            return out
+
+        monkeypatch.setattr(np, "vstack", spy)
+        s, n, w, e = _center_box(index)
+        nbm.fit_area(_BoxArea(s, n, w, e), "temperature")
+        n_cells = index.box_cells(s, n, w, e).flat.size
+        assert stacked_shapes and all(sh[1] == n_cells for sh in stacked_shapes)
+
+
+# --- Decoding: alternating-row scanning --------------------------------------
+
+def _fake_eccodes_module(stored, keys, lats=None, lons=None, n_messages=1):
+    """A stand-in for the eccodes module serving `n_messages` identical
+    messages with the given stored (scan-ordered) values and keys."""
+    import types
+    mod = types.ModuleType("eccodes")
+    state = {"left": n_messages}
+
+    def new(f):
+        if state["left"] <= 0:
+            return None
+        state["left"] -= 1
+        return object()
+
+    mod.codes_grib_new_from_file = new
+    mod.codes_get = lambda gid, k: keys[k]
+    mod.codes_get_values = lambda gid: np.array(stored, dtype=float)
+    mod.codes_get_array = lambda gid, k: np.array(lats if k == "latitudes" else lons)
+    mod.codes_release = lambda gid: None
+    return mod
+
+
+NBM_SCAN_KEYS = {"alternativeRowScanning": 1, "Nx": 4, "Ny": 3,
+                 "jPointsAreConsecutive": 0,
+                 "validityDate": 20261121, "validityTime": 1800}
+
+
+class TestParseRecordScanOrder:
+    def test_values_put_in_uniform_layout(self, monkeypatch, tmp_path):
+        import sys
+        truth = np.arange(12, dtype=float).reshape(3, 4)
+        stored = truth.copy(); stored[1::2] = stored[1::2, ::-1]
+        monkeypatch.setitem(sys.modules, "eccodes",
+                            _fake_eccodes_module(stored.ravel(), NBM_SCAN_KEYS))
+        p = tmp_path / "rec.grib2"; p.write_bytes(b"GRIB")
+        _, epoch, vals = nbm._parse_record(str(p), want_index=False)
+        assert np.array_equal(vals, truth.ravel())
+        assert epoch == 1795284000      # 2026-11-21 18:00Z
+
+    def test_flag_off_values_unchanged(self, monkeypatch, tmp_path):
+        import sys
+        stored = np.arange(12, dtype=float)
+        keys = {**NBM_SCAN_KEYS, "alternativeRowScanning": 0}
+        monkeypatch.setitem(sys.modules, "eccodes", _fake_eccodes_module(stored, keys))
+        p = tmp_path / "rec.grib2"; p.write_bytes(b"GRIB")
+        _, _, vals = nbm._parse_record(str(p), want_index=False)
+        assert np.array_equal(vals, stored)

@@ -22,14 +22,14 @@ def model_from_type(model_type):
 # WR_WEATHER_SOURCE env var; see docs/ndfd-roadmap.md.
 
 def weather_source():
-    """The configured weather data source: "gridpoints" (default), "nbm", or
-    "ndfd"."""
-    src = os.environ.get("WR_WEATHER_SOURCE", "gridpoints").strip().lower()
+    """The configured weather data source: "nbm" (default), "ndfd", or
+    "gridpoints"."""
+    src = os.environ.get("WR_WEATHER_SOURCE", "nbm").strip().lower()
     if src == "ndfd":
         return "ndfd"
-    if src == "nbm":
-        return "nbm"
-    return "gridpoints"
+    if src == "gridpoints":
+        return "gridpoints"
+    return "nbm"
 
 
 def ensemble_kinds():

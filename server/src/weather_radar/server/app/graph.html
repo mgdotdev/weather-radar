@@ -304,7 +304,12 @@
         let y = []
         for (let feature of res.features) {
           y.push(feature["properties"][param])
-          x.push(feature["properties"]["time"])
+          // `time` is UTC epoch milliseconds. Wrap in a JS Date so Plotly
+          // renders the axis in the USER'S BROWSER-LOCAL timezone (Plotly
+          // formats Date objects in local time), instead of a server-side or
+          // fixed zone.
+          const t = feature["properties"]["time"]
+          x.push(typeof t === "number" ? new Date(t) : new Date(t))
         }
         let unit = res.features[0]["properties"]["uom"]
         let trace = {

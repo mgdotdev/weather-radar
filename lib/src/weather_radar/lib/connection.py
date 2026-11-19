@@ -33,12 +33,18 @@ _DEFAULT_APP_NAME = "weather-radar"
 _ua_warned = False
 
 
-def noaa_user_agent():
+def noaa_user_agent(warn=True):
     """Return the User-Agent string to send to api.weather.gov.
 
     Order of precedence: NOAA_USER_AGENT (verbatim) > "<WR_APP_NAME>
-    (<WR_CONTACT_EMAIL>)" > bare "<WR_APP_NAME>" (with a warning, since NWS
-    recommends a contact). See the module note above.
+    (<WR_CONTACT_EMAIL>)" > bare "<WR_APP_NAME>". See the module note above.
+
+    `warn` (default True) controls the one-time "no contact configured"
+    warning. It should be True ONLY for callers that actually hit
+    api.weather.gov (the gridpoints source), which is what NWS's contact-UA
+    policy applies to. The GRIB sources (NBM/NDFD on S3/NOMADS) reuse this
+    helper for a consistent UA string but their hosts don't require a contact,
+    so they pass warn=False to avoid a spurious api.weather.gov nag.
     """
     global _ua_warned
     override = os.environ.get("NOAA_USER_AGENT")
@@ -48,7 +54,7 @@ def noaa_user_agent():
     email = (os.environ.get("WR_CONTACT_EMAIL") or "").strip()
     if email:
         return f"{app} ({email})"
-    if not _ua_warned:
+    if warn and not _ua_warned:
         logger.warning(
             "No NOAA contact configured: set WR_CONTACT_EMAIL (or "
             "NOAA_USER_AGENT) so api.weather.gov can reach you. Sending a "
@@ -249,7 +255,11 @@ class NOAAConnection:
 
     def __init__(self, url="https://api.weather.gov"):
         self.session = requests.session()
-        self.session.headers["User-Agent"] = noaa_user_agent()
+        # Quiet here: this is the api.weather.gov client, but it may be
+        # constructed as a singleton early / even under a GRIB source that
+        # never fetches through it. The contact-UA warning is emitted lazily on
+        # the first ACTUAL external fetch in get_with_expiry() instead.
+        self.session.headers["User-Agent"] = noaa_user_agent(warn=False)
         self.url = url
         self._cache = {}
 
@@ -265,6 +275,11 @@ class NOAAConnection:
         resp = self._cache.get(path.url, None)
 
         if not resp:
+            # First real external fetch through this client -> emit the
+            # one-time NWS contact-UA warning lazily (no-op after the first
+            # call / when a contact is configured). Keeps a GRIB-source run
+            # that never hits api.weather.gov from nagging about it.
+            noaa_user_agent(warn=True)
             resp = get_from_external_source(path, self.session)
             if resp is bad_cache:
                 try:

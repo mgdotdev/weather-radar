@@ -231,13 +231,17 @@ class NDFDObservationEnsemble:
         """Global min/max over the forecast window across all lattice points,
         plus the shared window (start/end). NDFD points all share the SAME
         window (one grid), so the intersection is just that window."""
+        from datetime import timezone
         self._ensure_fit()
         if not self._fit or not self._models:
             return None
         vmin = vmax = None
         units = self._fit["units"]
-        start = datetime.fromtimestamp(self._fit["start"])
-        end = datetime.fromtimestamp(self._fit["end"])
+        # UTC-aware (not naive server-local) so the client localizes the window
+        # to the user's zone — see the "send UTC, localize in browser"
+        # convention used by the map/graph.
+        start = datetime.fromtimestamp(self._fit["start"], tz=timezone.utc)
+        end = datetime.fromtimestamp(self._fit["end"], tz=timezone.utc)
         total = (end - start).total_seconds()
         if total <= 0:
             return None

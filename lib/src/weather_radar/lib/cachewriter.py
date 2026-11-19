@@ -47,6 +47,13 @@ logger = logging.getLogger(__name__)
 # and we back off automatically. Kept in sync with area.NOAA_MAX_CONCURRENCY.
 MAX_CONCURRENCY = int(os.environ.get("NOAA_MAX_CONCURRENCY", "48"))
 
+# Max simultaneous BINARY (GRIB range) fetches in ensure_binary_many. Kept
+# LOWER than MAX_CONCURRENCY by default: a burst of dozens of parallel TLS
+# handshakes + DNS lookups to the same host (NBM/NAQFC on S3) can overwhelm a
+# constrained container's resolver (sporadic getaddrinfo failures) and gains
+# little over a modest pool for ~0.5 MB records. Tunable via env.
+BINARY_CONCURRENCY = int(os.environ.get("WR_BINARY_CONCURRENCY", "8"))
+
 # Address + auth for the manager socket. A TCP loopback address keeps this
 # working across fork/spawn and is trivial to connect to from worker procs.
 CACHE_WRITER_HOST = os.environ.get("CACHE_WRITER_HOST", "127.0.0.1")
@@ -57,15 +64,23 @@ NOAA_BASE_URL = os.environ.get("NOAA_BASE_URL", "https://api.weather.gov")
 CACHE_ROOT = os.environ.get("CACHE_DIR", "/tmp")
 
 
-def _noaa_user_agent():
+def _noaa_user_agent(warn=False):
     """NOAA User-Agent for the writer's session. Delegates to
     connection.noaa_user_agent when importable as a package submodule; when
     this module is loaded standalone (e.g. the test harness loads it by file
     path, so relative imports can't resolve), fall back to the SAME env-driven
-    logic inline so behavior is identical."""
+    logic inline so behavior is identical.
+
+    `warn` controls the one-time "no contact configured" warning. It defaults
+    to False here because the writer resolves this once at __init__ just to set
+    its session UA — nagging then would fire even under NBM/NDFD/AQI, which
+    never hit api.weather.gov. The warning is instead triggered lazily at the
+    actual gridpoints fetch (see _fetch_one), so it only appears when a NOAA
+    JSON request is really made.
+    """
     try:
         from .connection import noaa_user_agent
-        return noaa_user_agent()
+        return noaa_user_agent(warn=warn)
     except (ImportError, ValueError):
         override = os.environ.get("NOAA_USER_AGENT")
         if override and override.strip():
@@ -544,7 +559,24 @@ class _Writer:
         # writer PROCESS starts is honored. Imported lazily to keep this module
         # independent of the connection layer (which lazily imports us).
         self._session.headers["User-Agent"] = _noaa_user_agent()
+        # Size the connection pool so concurrent fetches REUSE connections
+        # instead of thrashing (default urllib3 pool is ~10). Covers both the
+        # JSON pool and the binary fan-out.
+        try:
+            from requests.adapters import HTTPAdapter
+            pool_n = max(MAX_CONCURRENCY, BINARY_CONCURRENCY) + 4
+            adapter = HTTPAdapter(pool_connections=pool_n, pool_maxsize=pool_n,
+                                  max_retries=0)
+            self._session.mount("https://", adapter)
+            self._session.mount("http://", adapter)
+        except Exception:
+            pass  # best-effort; default pool still works
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENCY)
+        # Separate, SMALLER pool for binary (GRIB range) fan-out so a cold NBM
+        # fit doesn't open dozens of simultaneous TLS/DNS connections to one
+        # host (which can trip a constrained container's resolver).
+        self._bin_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=BINARY_CONCURRENCY)
         # Per-path locks so two overlapping jobs don't fetch the same URL twice.
         self._path_locks = {}
         self._registry_lock = threading.Lock()
@@ -580,6 +612,11 @@ class _Writer:
             if _resolve_points_locally(path, cache_file, d):
                 return True
             try:
+                # About to actually hit api.weather.gov — this is the only path
+                # that needs the NWS contact UA, so emit the one-time "no
+                # contact configured" warning HERE (lazily) rather than at
+                # writer startup. No-op after the first call / when configured.
+                _noaa_user_agent(warn=True)
                 resp = _retry_get(self._session, url)
                 payload = {"headers": dict(resp.headers), "json": resp.json()}
                 os.makedirs(d, exist_ok=True)
@@ -655,70 +692,141 @@ class _Writer:
         futures = [self._pool.submit(self._fetch_one, p) for p in paths]
         concurrent.futures.wait(futures)
 
-    def ensure_binary(self, url, path, force=False):
+    def ensure_binary(self, url, path, force=False, rng=None, headers=None,
+                      stamp_expires=True):
         """Download an arbitrary BINARY resource (e.g. a NAQFC GRIB2 from
-        NOMADS) to `path`, atomically, stamping the file's mtime to the HTTP
-        `Expires` header so freshness is a cheap stat — the same model as the
-        JSON cache, but for a non-NOAA binary file.
+        NOMADS, or an NBM record via an HTTP byte range) to `path`, atomically,
+        so ALL disk writes stay inside the single writer process (no
+        cross-worker download races).
 
-        This keeps ALL disk writes inside the single writer process (so there
-        are no cross-worker download races), while staying separate from the
-        NOAA JSON path (different host, binary body, no content-hash/tombstone
-        machinery). De-duped via the per-URL lock: concurrent callers for the
-        same url collapse to one download. Returns a JSON string
-        {"ok": bool, "path": path} (value crosses the manager boundary by
-        value). Skips the download when `path` is already fresh unless `force`.
+        Freshness: by default the file's mtime is stamped to the HTTP `Expires`
+        header (cheap stat-based freshness, same model as the JSON cache). For
+        sources that send no usable Expires and instead use an age-based TTL
+        (NBM/NDFD), pass `stamp_expires=False` so the mtime stays at write time
+        (== now) and the caller's `age < TTL` check reads a just-written file as
+        fresh.
+
+        `rng` (e.g. "123-456") issues an HTTP Range request (accepting 206) so
+        only that byte range is fetched — used for NBM's per-record reads.
+        `headers` supplies extra request headers (e.g. a source User-Agent).
+
+        De-duped via the per-URL(+range) lock: concurrent callers for the same
+        resource collapse to one download. Returns a JSON string {"ok": bool,
+        "path": path}. Skips the download when `path` is already fresh unless
+        `force`.
         """
+        return json.dumps(self._ensure_binary_one(
+            url, path, force, rng, headers, stamp_expires))
+
+    def ensure_binary_many(self, specs):
+        """Download MANY binary resources CONCURRENTLY in this one writer
+        process, fanning out over the shared thread pool (MAX_CONCURRENCY).
+        Used by the NBM fit to fetch all of a cycle's per-record byte ranges in
+        parallel instead of one blocking RPC per record.
+
+        `specs` is a list of dicts, each:
+          {url, path, force?, rng?, headers?, stamp_expires?}
+        Returns a JSON string: a list of {ok, path} in the SAME ORDER as
+        `specs`. Per-resource de-dup still applies via the per-URL(+range) lock,
+        so overlapping specs for the same range collapse to one fetch.
+        """
+        results = [None] * len(specs)
+        futs = {}
+        for i, s in enumerate(specs):
+            futs[self._bin_pool.submit(
+                self._ensure_binary_one,
+                s.get("url"), s.get("path"), s.get("force", False),
+                s.get("rng"), s.get("headers"), s.get("stamp_expires", True),
+            )] = i
+        for fut in concurrent.futures.as_completed(futs):
+            i = futs[fut]
+            try:
+                results[i] = fut.result()
+            except Exception:
+                p = specs[i].get("path")
+                results[i] = {"ok": bool(p and os.path.exists(p)), "path": p}
+        return json.dumps(results)
+
+    def _ensure_binary_one(self, url, path, force=False, rng=None, headers=None,
+                           stamp_expires=True):
+        """Core single-resource binary fetch+write. Returns a dict
+        {"ok": bool, "path": path}. Shared by ensure_binary (one) and
+        ensure_binary_many (fanned out over the pool). Safe to call
+        concurrently for distinct url+range pairs."""
         def _fresh(p):
             try:
                 return os.path.getmtime(p) >= time.time()
             except OSError:
                 return False
 
-        if not force and _fresh(path):
-            return json.dumps({"ok": True, "path": path})
+        # Expires-based freshness only applies when we stamp Expires. TTL-based
+        # callers always pass force=True (their own _is_fresh gates the call),
+        # so this fast-path mainly helps the AQI (Expires) path.
+        if not force and stamp_expires and _fresh(path):
+            return {"ok": True, "path": path}
 
-        lk = self._lock_for(url)
+        lk = self._lock_for(url if rng is None else f"{url}#{rng}")
         with lk:
-            if not force and _fresh(path):   # re-check inside the lock
-                return json.dumps({"ok": True, "path": path})
+            if not force and stamp_expires and _fresh(path):   # re-check in lock
+                return {"ok": True, "path": path}
             d = os.path.dirname(path)
-            tmp = None
+            req_headers = dict(headers) if headers else {}
+            if rng is not None:
+                req_headers["Range"] = f"bytes={rng}"
             try:
                 os.makedirs(d, exist_ok=True)
-                with self._session.get(url, timeout=180, stream=True) as r:
-                    if not r.ok:
-                        logger.warning("cachewriter binary %s -> HTTP %s",
-                                       url, r.status_code)
-                        return json.dumps({"ok": os.path.exists(path), "path": path})
-                    expires = r.headers.get("Expires")
-                    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
-                    with os.fdopen(fd, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=1 << 20):
-                            f.write(chunk)
-                    os.replace(tmp, path)
-                    tmp = None
-                # mtime = Expires -> cheap freshness (same trick as _stamp_expiry).
-                if expires:
-                    try:
-                        exp = datetime.strptime(expires, "%a, %d %b %Y %H:%M:%S %Z")
-                        ts = exp.replace(tzinfo=timezone.utc).timestamp()
-                        os.utime(path, (ts, ts))
-                    except Exception:
-                        pass
-                logger.warning("cachewriter binary wrote %s (%d bytes, expires %s)",
-                               os.path.basename(path),
-                               os.path.getsize(path), expires)
-                return json.dumps({"ok": True, "path": path})
-            except Exception:
-                logger.warning("cachewriter binary failed for %s", url, exc_info=True)
-                return json.dumps({"ok": os.path.exists(path), "path": path})
-            finally:
-                if tmp and os.path.exists(tmp):
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
+            except OSError:
+                pass
+            # Retry transient connection/DNS/timeout failures a few times with
+            # backoff before giving up — a burst of concurrent fetches can
+            # momentarily trip name resolution on a constrained host. A genuine
+            # bad response (non-2xx/206) is NOT retried.
+            attempts = 3
+            last_exc = None
+            for attempt in range(attempts):
+                tmp = None
+                try:
+                    with self._session.get(url, timeout=180, stream=True,
+                                           headers=req_headers or None) as r:
+                        if not (r.ok or r.status_code == 206):
+                            logger.warning("cachewriter binary %s -> HTTP %s",
+                                           url, r.status_code)
+                            return {"ok": os.path.exists(path), "path": path}
+                        expires = r.headers.get("Expires")
+                        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+                        with os.fdopen(fd, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=1 << 20):
+                                f.write(chunk)
+                        os.replace(tmp, path)
+                        tmp = None
+                    # mtime = Expires -> cheap freshness. Skipped for TTL
+                    # sources (stamp_expires=False) so mtime stays at write time.
+                    if stamp_expires and expires:
+                        try:
+                            exp = datetime.strptime(expires, "%a, %d %b %Y %H:%M:%S %Z")
+                            ts = exp.replace(tzinfo=timezone.utc).timestamp()
+                            os.utime(path, (ts, ts))
+                        except Exception:
+                            pass
+                    logger.warning("cachewriter binary wrote %s (%d bytes, expires %s)",
+                                   os.path.basename(path),
+                                   os.path.getsize(path), expires)
+                    return {"ok": True, "path": path}
+                except Exception as e:
+                    last_exc = e
+                    if tmp and os.path.exists(tmp):
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                    if attempt < attempts - 1:
+                        time.sleep(0.5 * (attempt + 1))   # 0.5s, 1.0s backoff
+                        continue
+            # All attempts failed — transient-looking; log without a traceback
+            # spam and report not-ok so the caller can retry on the NEXT load
+            # (NBM does NOT negative-cache a failed binary fetch).
+            logger.warning("cachewriter binary failed for %s (%s)", url, last_exc)
+            return {"ok": os.path.exists(path), "path": path}
 
     # --- streaming jobs ---
     # Each streaming job keeps its progress queue ENTIRELY on the writer side
@@ -797,6 +905,7 @@ def run_writer(ready_event=None):
 
     _CacheManager.register("ensure", callable=writer.ensure)
     _CacheManager.register("ensure_binary", callable=writer.ensure_binary)
+    _CacheManager.register("ensure_binary_many", callable=writer.ensure_binary_many)
     _CacheManager.register("start_job", callable=writer.start_job)
     _CacheManager.register("poll_job", callable=writer.poll_job)
 
@@ -826,6 +935,7 @@ class _CacheClient(BaseManager):
 
 _CacheClient.register("ensure")
 _CacheClient.register("ensure_binary")
+_CacheClient.register("ensure_binary_many")
 _CacheClient.register("start_job")
 _CacheClient.register("poll_job")
 
@@ -883,19 +993,40 @@ def ensure(paths):
     client.ensure(todo)
 
 
-def ensure_binary(url, path, force=False):
+def ensure_binary(url, path, force=False, rng=None, headers=None,
+                  stamp_expires=True):
     """Have the WRITER process download a binary resource at `url` to `path`
-    (atomic, mtime stamped to HTTP Expires), so all disk writes stay in the one
-    writer. Used for NAQFC GRIB2 files. Returns True if the file is present
-    afterward. Raises WriterUnavailable if the writer can't be reached (caller
-    may then fall back to an inline download)."""
+    (atomic). Used for NAQFC GRIB2 files and NBM/NDFD GRIB records so ALL disk
+    writes stay in the one writer. `rng` issues an HTTP Range request (NBM
+    per-record reads); `headers` adds request headers (e.g. a source UA);
+    `stamp_expires=False` skips Expires-mtime stamping for age-TTL sources
+    (NBM/NDFD). Returns True if the file is present afterward. Raises
+    WriterUnavailable if the writer can't be reached (caller may then fall back
+    to an inline download)."""
     client = _get_client()
     import json as _json
-    resp = client.ensure_binary(url, path, force)
+    resp = client.ensure_binary(url, path, force, rng, headers, stamp_expires)
     try:
         return _json.loads(_value(resp)).get("ok", False)
     except Exception:
         return False
+
+
+def ensure_binary_many(specs):
+    """Have the WRITER process download MANY binary resources CONCURRENTLY (one
+    RPC, fanned out over the writer's thread pool). `specs` is a list of dicts
+    {url, path, force?, rng?, headers?, stamp_expires?}. Returns a list of
+    bools (ok per spec, in order). Used by the NBM fit to fetch all of a
+    cycle's per-record byte ranges in parallel instead of one blocking RPC per
+    record. Raises WriterUnavailable if the writer can't be reached."""
+    client = _get_client()
+    import json as _json
+    resp = client.ensure_binary_many(list(specs))
+    try:
+        arr = _json.loads(_value(resp))
+        return [bool(r and r.get("ok")) for r in arr]
+    except Exception:
+        return [False] * len(specs)
 
 
 def ensure_stream(paths):

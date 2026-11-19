@@ -156,13 +156,13 @@ class TestMissingRangeNegativeCache:
 # --- Source selection (WR_WEATHER_SOURCE) -----------------------------------
 
 class TestSourceSelection:
-    def test_default_is_gridpoints(self, monkeypatch):
+    def test_default_is_nbm(self, monkeypatch):
         monkeypatch.delenv("WR_WEATHER_SOURCE", raising=False)
         import weather_radar.lib.models as models
-        assert models.weather_source() == "gridpoints"
+        assert models.weather_source() == "nbm"
         kinds = models.ensemble_kinds()
-        assert kinds["observation"].__name__ == "ObservationEnsemble"
-        assert kinds["accumulation"].__name__ == "AccumulationEnsemble"
+        assert kinds["observation"].__name__ == "NBMObservationEnsemble"
+        assert kinds["accumulation"].__name__ == "NBMAccumulationEnsemble"
 
     def test_gridpoints_selected(self, monkeypatch):
         monkeypatch.setenv("WR_WEATHER_SOURCE", "gridpoints")
@@ -180,10 +180,11 @@ class TestSourceSelection:
         assert kinds["observation"].__name__ == "NDFDObservationEnsemble"
         assert kinds["accumulation"].__name__ == "NDFDAccumulationEnsemble"
 
-    def test_unknown_source_falls_back_to_gridpoints(self, monkeypatch):
+    def test_unknown_source_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv("WR_WEATHER_SOURCE", "bogus")
         import weather_radar.lib.models as models
-        assert models.weather_source() == "gridpoints"
+        # Default source is nbm, so an unrecognized value falls back to it.
+        assert models.weather_source() == "nbm"
 
 
 # --- Ensemble adapter (ObservationEnsemble contract) ------------------------
@@ -498,3 +499,53 @@ class TestDenseFit:
         monkeypatch.setenv("WR_NDFD_UPSAMPLE", "1")
         plain = ndfd.fit_area_dense(_StubArea(n=3), "temperature")
         assert len(plain["points"]) == 9
+
+
+# --- Decoding: alternating-row scanning --------------------------------------
+
+class TestParseFileScanOrder:
+    """NDFD sets alternativeRowScanning=1: every other row is stored reversed.
+    _parse_file must put values in the same uniform layout as the coordinates
+    its KD-tree is built on, so a cell's lat/lon finds its own value."""
+
+    def _fake(self, stored, lats, lons, n_messages=2):
+        import types
+        import numpy as np
+        mod = types.ModuleType("eccodes")
+        left = {"n": n_messages}
+        keys = {"alternativeRowScanning": 1, "Nx": 4, "Ny": 3,
+                "jPointsAreConsecutive": 0,
+                "validityDate": 20261121, "validityTime": 1800}
+
+        def new(f):
+            if left["n"] <= 0:
+                return None
+            left["n"] -= 1
+            return object()
+
+        mod.codes_grib_new_from_file = new
+        mod.codes_get = lambda gid, k: keys[k]
+        mod.codes_get_values = lambda gid: np.array(stored, dtype=float)
+        mod.codes_get_array = lambda gid, k: np.array(lats if k == "latitudes" else lons)
+        mod.codes_release = lambda gid: None
+        return mod
+
+    def test_values_align_with_tree_coordinates(self, monkeypatch, tmp_path):
+        import sys
+        import numpy as np
+        nx, ny = 4, 3
+        truth = (np.arange(ny * nx, dtype=float) + 270.0).reshape(ny, nx)
+        stored = truth.copy(); stored[1::2] = stored[1::2, ::-1]
+        # eccodes returns uniform coordinates (verified with eccodes 2.50).
+        lats = np.repeat(np.linspace(45.0, 45.2, ny), nx)
+        lons = np.tile(np.linspace(-118.0, -117.7, nx), ny)
+        monkeypatch.setitem(sys.modules, "eccodes",
+                            self._fake(stored.ravel(), lats, lons))
+        p = tmp_path / "ndfd.grib2"; p.write_bytes(b"GRIB")
+        tree, frames = ndfd._parse_file(str(p))
+        assert len(frames) == 2
+        vals = frames[0][1]
+        assert np.array_equal(vals, truth.ravel())
+        # Every cell's own coordinate looks up its own (true) value.
+        _, idx = tree.query(np.column_stack([lats, lons]), k=1)
+        assert np.array_equal(vals[idx], truth.ravel())

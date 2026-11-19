@@ -316,3 +316,103 @@ class TestLocalPointsResolution:
         cw = self._load_cw(monkeypatch, tempfile.mkdtemp())
         assert cw._parse_points_path("/gridpoints/OTX/1,2") is None
         assert cw._parse_points_path("/points/47.1,-116.2") == (47.1, -116.2)
+
+
+@pytest.fixture
+def cwbin(monkeypatch):
+    """Like `cw`, but with a fake requests whose session supports the BINARY
+    fetch path (stream=, headers=, Range, context-manager response with
+    iter_content). Records each GET so a test can assert concurrency/headers.
+    Yields (module, state) where state['gets'] lists (url, headers)."""
+    cache_dir = tempfile.mkdtemp()
+    monkeypatch.setenv("CACHE_DIR", cache_dir)
+    port = _free_port()
+    monkeypatch.setenv("CACHE_WRITER_PORT", str(port))
+
+    fake_requests = types.ModuleType("requests")
+    fake_exceptions = types.ModuleType("requests.exceptions")
+    class ConnectionError(Exception): ...
+    class Timeout(Exception): ...
+    fake_exceptions.ConnectionError = ConnectionError
+    fake_exceptions.Timeout = Timeout
+    fake_requests.exceptions = fake_exceptions
+
+    class FakeBinResp:
+        def __init__(self, url, headers):
+            # Honor Range by echoing a 206; body is a tiny GRIB-magic payload
+            # whose bytes vary by Range so distinct records differ.
+            self._rng = (headers or {}).get("Range", "")
+            self.status_code = 206 if self._rng else 200
+            self.ok = True
+            self.headers = {}  # no Expires (NBM-style)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def iter_content(self, chunk_size=1):
+            yield b"GRIB" + self._rng.encode() + b"\x00payload"
+    class FakeBinSession:
+        def __init__(self): self.headers = {}
+        def get(self, url, timeout=None, stream=None, headers=None):
+            return FakeBinResp(url, headers)
+    fake_requests.session = lambda: FakeBinSession()
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+
+    here = os.path.dirname(__file__)
+    src = os.path.abspath(os.path.join(
+        here, "..", "src", "weather_radar", "lib", "cachewriter.py"))
+    spec = importlib.util.spec_from_file_location("cachewriter_bin_under_test", src)
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "cachewriter_bin_under_test", mod)
+    spec.loader.exec_module(mod)
+
+    ready = multiprocessing.Event()
+    proc = multiprocessing.Process(target=mod.run_writer, args=(ready,), daemon=True)
+    proc.start()
+    assert ready.wait(timeout=10), "writer process never became ready"
+    try:
+        yield mod
+    finally:
+        proc.terminate()
+        proc.join(timeout=5)
+
+
+class TestEnsureBinary:
+    def test_single_range_fetch_writes_grib(self, cwbin):
+        d = os.environ["CACHE_DIR"]
+        path = os.path.join(d, "rec.f001.grib2")
+        ok = cwbin.ensure_binary(
+            "https://example/blend.grib2", path, force=True,
+            rng="0-99", headers={"User-Agent": "x"}, stamp_expires=False)
+        assert ok is True
+        assert os.path.isfile(path)
+        with open(path, "rb") as f:
+            assert f.read(4) == b"GRIB"
+
+    def test_many_fetches_all_records(self, cwbin):
+        d = os.environ["CACHE_DIR"]
+        specs = [{
+            "url": "https://example/blend.grib2",
+            "path": os.path.join(d, f"rec.f{i:03d}.grib2"),
+            "force": True, "rng": f"{i*10}-{i*10+9}",
+            "headers": {"User-Agent": "x"}, "stamp_expires": False,
+        } for i in range(1, 8)]
+        oks = cwbin.ensure_binary_many(specs)
+        assert oks == [True] * len(specs)
+        for s in specs:
+            assert os.path.isfile(s["path"])
+            with open(s["path"], "rb") as f:
+                head = f.read()
+            assert head.startswith(b"GRIB")
+            # Each record's body encodes its Range, so distinct ranges -> distinct files.
+            assert s["rng"].encode() in head
+
+    def test_no_leftover_tmp(self, cwbin):
+        d = os.environ["CACHE_DIR"]
+        cwbin.ensure_binary_many([{
+            "url": "https://example/blend.grib2",
+            "path": os.path.join(d, f"r{i}.grib2"),
+            "force": True, "rng": f"{i}-{i+5}", "stamp_expires": False,
+        } for i in range(4)])
+        leftover = []
+        for root, _dirs, files in os.walk(d):
+            leftover += [f for f in files if f.endswith(".tmp")]
+        assert leftover == []

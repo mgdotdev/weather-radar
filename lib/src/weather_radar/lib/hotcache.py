@@ -80,7 +80,28 @@ def paths_for_url(url):
     graph URL (/graph/?lat&lon). Returns a list of paths like
     "/points/..." and "/gridpoints/WFO/x,y". Resolving gridpoints may enqueue
     /points fetches via the writer (that's fine — it warms them).
+
+    SOURCE-AWARE: these /points + /gridpoints paths are the api.weather.gov
+    JSON gridpoints source ONLY. Under the GRIB-backed sources (ndfd/nbm) and
+    the NAQFC AQI path, the cache isn't keyed on these NOAA JSON paths at all —
+    warming them would just emit useless /gridpoints fetches for a source the
+    app isn't reading (the bug where WR_WEATHER_SOURCE=nbm still made
+    /gridpoints calls). For those sources we return NO paths here; warming is
+    instead handled by the bundle builder (server.bundle._build_pass ->
+    build_for_url), which is already source-aware and fits/warms each watched
+    URL's area through the correct ensemble (NDFD/NBM GRIB or NAQFC GRIB).
     """
+    try:
+        from .models import weather_source
+        if weather_source() != "gridpoints":
+            # Non-gridpoints source: nothing to warm via the NOAA JSON path.
+            # The bundle builder warms these URLs for the active source.
+            return []
+    except Exception:
+        # If the source can't be determined, fall through to the default
+        # gridpoints behavior (the historical default source).
+        pass
+
     from urllib.parse import urlparse, parse_qs
     # Import here to avoid importing scipy-adjacent modules at process start.
     from .area import CoordinateArea, MapCoordinate

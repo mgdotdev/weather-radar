@@ -88,7 +88,7 @@ Key environment variables (see `.env.example` for the full list):
 | `WR_CONTACT_EMAIL` | Contact email sent in the NOAA / Nominatim User-Agent. |
 | `WR_ADMIN_PASSWORD_HASH` | scrypt hash gating the `/admin` token-management page. |
 | `WR_ADMIN_SECRET` | Stable key signing admin sessions (survives restarts). |
-| `WR_WEATHER_SOURCE` | `gridpoints` (default), `ndfd`, or `nbm`. |
+| `WR_WEATHER_SOURCE` | `nbm` (default), `ndfd`, or `gridpoints`. |
 | `WR_WORKERS` | uvicorn worker count. |
 | `CACHE_DIR` / `WR_AUTH_DIR` / `LOG_DIR` | State locations (default `/data`). |
 

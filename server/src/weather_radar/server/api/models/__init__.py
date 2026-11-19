@@ -63,9 +63,9 @@ router = APIRouter(prefix="/models")
 # produces a precipitation heatmap.
 #
 # The CONCRETE classes depend on the configured weather source
-# (WR_WEATHER_SOURCE): gridpoints JSON (default) or NDFD GRIB. ENSEMBLE_KINDS
-# is a function (not a static dict) so a source change is picked up without a
-# reimport. Callers resolve with ENSEMBLE_KINDS().get(kind, <default>).
+# (WR_WEATHER_SOURCE): NBM GRIB (default), NDFD GRIB, or gridpoints JSON.
+# ENSEMBLE_KINDS is a function (not a static dict) so a source change is picked
+# up without a reimport. Callers resolve with ENSEMBLE_KINDS().get(kind, <default>).
 def ENSEMBLE_KINDS():
     return ensemble_kinds()
 
@@ -110,7 +110,40 @@ def models(model: str, param: str, lat: float, lon: float, time: time_t=None, dt
 
     model_class = model_from_type(model)
     m = model_class.from_map_coordinate(coord, param)
-    return m.predict(dtime, verbose=True)
+    fc = m.predict(dtime, verbose=True)
+    # Normalize feature timestamps to UTC epoch-ms so the graph renders them in
+    # the USER'S browser-local zone (matching the NDFD/NBM path above and the
+    # map). The gridpoints models emit `time` as an ISO string (aware local or
+    # naive); convert to an absolute-instant epoch-ms here.
+    return _features_time_to_epoch_ms(fc)
+
+
+def _features_time_to_epoch_ms(fc):
+    """Rewrite each feature's properties.time (an ISO-8601 string) to UTC epoch
+    milliseconds, in place. A naive string (no offset) is assumed to be in the
+    server's local zone (that's how the model built it via .astimezone()), so
+    it's made aware before converting. Leaves non-string/unparseable values
+    untouched. Returns the same `fc` for convenience."""
+    from datetime import datetime
+    try:
+        feats = fc.get("features") or []
+    except AttributeError:
+        return fc
+    for ft in feats:
+        props = ft.get("properties") if isinstance(ft, dict) else None
+        if not props or "time" not in props:
+            continue
+        tv = props["time"]
+        if not isinstance(tv, str):
+            continue  # already epoch-ms (or unexpected) — leave as is
+        try:
+            d = datetime.fromisoformat(tv)
+            if d.tzinfo is None:
+                d = d.astimezone()  # assume server-local for a naive stamp
+            props["time"] = int(d.timestamp() * 1000)
+        except Exception:
+            pass
+    return fc
 
 
 # IDW params mirrored from the client raster (map.html buildField), so the
@@ -179,9 +212,14 @@ def _ndfd_point_series(ensemble, coord, param, dt):
             den += w
         if den > 0:
             val = clamp_value(param, num / den)
+            # Emit the timestamp as UTC (epoch ms) so the client renders it in
+            # the USER'S browser-local zone. `t` is a server-local aware
+            # datetime; .timestamp() gives the absolute instant regardless of
+            # the server's zone, and *1000 -> ms for a JS Date.
+            t_ms = int(t.timestamp() * 1000)
             features.append({
                 "type": "Feature",
-                "properties": {param: val, "time": t.isoformat(), "uom": units},
+                "properties": {param: val, "time": t_ms, "uom": units},
                 "geometry": {"type": "Point",
                              "coordinates": [coord.lon, coord.lat]},
             })
@@ -442,15 +480,21 @@ def prefetch_stream(lat: float, lon: float, width: float=1, height: float=1,
             except Exception:
                 pass  # fall through to the normal resolve/fetch
 
-        # NDFD source: there are no NOAA /points or /gridpoints to resolve —
-        # the national element GRIB is fetched (writer-owned) and sampled in
-        # the fit. Warm it here so the subsequent /type/range + series stream
-        # are fast, and report a single-phase completion so the client's
-        # prefetch progress bar still advances.
+        # GRIB grid source (NDFD or NBM): there are no NOAA /points or
+        # /gridpoints to resolve — the national element GRIB is fetched
+        # (writer-owned) and sampled in the fit. Warm the CORRECT source's grid
+        # here so the subsequent /type/range + series stream are fast, and
+        # report a single-phase completion so the client's prefetch progress
+        # bar still advances. (Dispatch by weather_source(): using the wrong
+        # module warms the wrong backend — e.g. under NBM it would 404-fetch
+        # NDFD's day-4-7 ds.snow.bin, which NDFD doesn't publish.)
         if _is_ndfd() and model is not None:
             try:
-                from weather_radar.lib import ndfd
-                ndfd._load_grid(model)  # download (writer) + parse + cache
+                if weather_source() == "nbm":
+                    from weather_radar.lib import nbm as _grid_src
+                else:
+                    from weather_radar.lib import ndfd as _grid_src
+                _grid_src._load_grid(model)  # download (writer) + parse + cache
             except Exception:
                 pass
             yield json.dumps({"phase": "gridpoints", "done": 1, "total": 1}) + "\n"

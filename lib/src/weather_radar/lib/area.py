@@ -567,13 +567,19 @@ class CoordinateArea:
 
     @cached_property
     def time_zone(self):
-        """IANA timezone name (e.g. "America/Los_Angeles") for the area's
-        center, from NOAA's /points metadata. None if unavailable."""
-        try:
-            resp = NOAAConnection().get(f"/points/{self.center}")
-            return resp["properties"].get("timeZone")
-        except Exception:
-            return None
+        """Deprecated/disabled: the UI now renders all times in the USER's
+        BROWSER-LOCAL timezone (frame times are UTC epochs; the client's
+        fmtTime uses Intl.DateTimeFormat with no explicit zone when this is
+        None). Returns None so no server-side timezone is shipped — which also
+        avoids a NOAA /points round-trip (and its api.weather.gov contact-UA
+        requirement) just to look up an IANA zone, so the GRIB sources
+        (NBM/NDFD/AQI) make no api.weather.gov calls at all.
+
+        Kept as a property (rather than removed) so existing callers that put
+        `timeZone` into their range payload keep working — they just send null,
+        which the client already handles as 'use browser-local'.
+        """
+        return None
 
     @property
     def index_bounds(self):

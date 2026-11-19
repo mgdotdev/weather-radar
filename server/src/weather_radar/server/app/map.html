@@ -335,7 +335,7 @@
       const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
       for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
                        "from", "to", "t", "pins", "pinBoxes", "pinSize",
-                       "legendSize", "legendX", "legendY", "areaBox", "locked"]) {
+                       "legendSize", "legendLat", "legendLon", "areaBox", "locked"]) {
         const v = new URL(window.location.href).searchParams.get(k)
         if (v !== null) u.searchParams.set(k, v)
       }
@@ -367,7 +367,11 @@
     // the scrubber spans and the animation loops over. Defaults to the full
     // forecast window; always kept within [forecastStart, forecastEnd].
     let windowStart = null, windowEnd = null
-    // IANA timezone of the map center (from NOAA /points); null => browser-local.
+    // Timezone for displaying frame times. Frame times are UTC epochs and are
+    // rendered in the USER'S BROWSER-LOCAL zone (fmtTime uses Intl with no
+    // explicit zone when this is null). The server no longer ships a per-area
+    // IANA zone (it would require a NOAA /points round-trip), so this stays
+    // null; kept as a hook in case an explicit zone is ever reintroduced.
     let mapTimeZone = null
     let lastFeatures = []  // most recent frame's points (for instant re-render on contour-step change)
     let lastUnits = ""     // unit of the most recent frame (reused on re-render when uom omitted)
@@ -2224,7 +2228,7 @@
           const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
           for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
                            "pins", "pinBoxes", "pinSize", "legendSize",
-                           "legendX", "legendY", "areaBox", "locked"]) {
+                           "legendLat", "legendLon", "areaBox", "locked"]) {
             const v = new URL(window.location.href).searchParams.get(k)
             if (v !== null) u.searchParams.set(k, v)
           }
@@ -3653,35 +3657,77 @@
       })
     })()
 
-    // Make the legend draggable. Its position persists in the URL
-    // (?legendX=&legendY=, top-left viewport px) so a refresh/shared link keeps
-    // where you put it; restored on load (clamped into the viewport).
+    // Make the legend draggable. Its position is GEO-ANCHORED: it's pinned to
+    // a lat/lon on the map (persisted in the URL as ?legendLat=&legendLon=) and
+    // tracks that geographic point as the map pans/zooms/resizes — like a pin —
+    // so a refresh (even at a different window size) keeps it over the same
+    // place on the earth. On drag, the legend's new screen position is
+    // unprojected back to a lat/lon and saved.
     ;(function makeLegendDraggable() {
       const el = document.getElementById("legend")
       if (!el) return
+      const mapEl = document.getElementById("weatherRadar")
 
-      // Restore a persisted position (clamped so a smaller window can't park
-      // it off-screen). The legend starts hidden (display:none) and is shown
-      // on map load; measure against its scaled on-screen size.
-      function restoreLegendPos() {
-        const p = new URL(window.location.href).searchParams
-        const x = parseFloat(p.get("legendX")), y = parseFloat(p.get("legendY"))
-        if (!Number.isFinite(x) || !Number.isFinite(y)) return
-        const r = el.getBoundingClientRect()
-        const maxX = Math.max(0, window.innerWidth - r.width)
-        const maxY = Math.max(0, window.innerHeight - r.height)
-        el.style.left = Math.max(0, Math.min(x, maxX)) + "px"
-        el.style.top = Math.max(0, Math.min(y, maxY)) + "px"
+      // Keep-off-edge padding (px): the legend's clamp keeps at least this much
+      // gap from every window edge, so it never bumps flush against the border.
+      const PAD = 12
+
+      function mapRect() {
+        return (mapEl && mapEl.getBoundingClientRect()) ||
+               { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight }
       }
-      function persistLegendPos() {
+
+      // The legend's geographic anchor (its TOP-LEFT corner's lat/lon). Null
+      // until set from the URL or the first drag; while null the legend keeps
+      // its CSS default position and does NOT track the map.
+      let anchor = null   // {lat, lon}
+
+      function readAnchorFromUrl() {
+        const p = new URL(window.location.href).searchParams
+        const la = parseFloat(p.get("legendLat")), lo = parseFloat(p.get("legendLon"))
+        if (Number.isFinite(la) && Number.isFinite(lo)) return { lat: la, lon: lo }
+        return null
+      }
+
+      // Place the legend so its top-left sits at the anchor's projected screen
+      // position. Clamped on-screen. No-op if there's no anchor yet or the map
+      // isn't ready to project.
+      function positionLegend() {
+        if (!anchor || typeof map === "undefined" || typeof map.project !== "function") return
+        let pt
+        try { pt = map.project([anchor.lon, anchor.lat]) } catch (_) { return }
+        const m = mapRect()
         const r = el.getBoundingClientRect()
+        const x = m.left + pt.x
+        const y = m.top + pt.y
+        const maxX = Math.max(PAD, window.innerWidth - r.width - PAD)
+        const maxY = Math.max(PAD, window.innerHeight - r.height - PAD)
+        el.style.left = Math.max(PAD, Math.min(x, maxX)) + "px"
+        el.style.top = Math.max(PAD, Math.min(y, maxY)) + "px"
+      }
+
+      // Unproject the legend's CURRENT top-left (viewport px) to a lat/lon and
+      // persist it as the anchor. Called after a drag.
+      function persistLegendPos() {
+        if (typeof map === "undefined" || typeof map.unproject !== "function") return
+        const r = el.getBoundingClientRect()
+        const m = mapRect()
+        let ll
+        try { ll = map.unproject([r.left - m.left, r.top - m.top]) } catch (_) { return }
+        anchor = { lat: ll.lat, lon: ll.lng }
         const u = new URL(window.location.href)
-        u.searchParams.set("legendX", String(Math.round(r.left)))
-        u.searchParams.set("legendY", String(Math.round(r.top)))
+        u.searchParams.set("legendLat", anchor.lat.toFixed(5))
+        u.searchParams.set("legendLon", anchor.lon.toFixed(5))
         history.replaceState(null, "", u.toString())
       }
-      // The legend is hidden until map load; restore once it's visible so
-      // getBoundingClientRect() has real dimensions to clamp against.
+
+      // Restore the anchor on load, then position. The legend starts hidden
+      // (display:none) until map load; wait until it's visible AND the map can
+      // project before placing it.
+      function restoreLegendPos() {
+        anchor = readAnchorFromUrl()
+        if (anchor) positionLegend()
+      }
       if (el.style.display !== "none") restoreLegendPos()
       else {
         const obs = new MutationObserver(() => {
@@ -3689,6 +3735,12 @@
         })
         obs.observe(el, { attributes: true, attributeFilter: ["style"] })
       }
+      // Track the map: re-project the anchor every time the view changes
+      // (pan/zoom) and on window resize, so the legend stays over its geo point.
+      if (typeof map !== "undefined" && typeof map.on === "function") {
+        map.on("move", positionLegend)
+      }
+      window.addEventListener("resize", positionLegend)
 
       let dragging = false, offsetX = 0, offsetY = 0
       el.addEventListener("pointerdown", (e) => {
@@ -3705,15 +3757,15 @@
         // reflects any transform:scale from the legend-size control), so a
         // scaled-up legend still can't be dragged off-screen.
         const r = el.getBoundingClientRect()
-        const maxX = window.innerWidth - r.width, maxY = window.innerHeight - r.height
-        el.style.left = Math.max(0, Math.min(e.clientX - offsetX, maxX)) + "px"
-        el.style.top = Math.max(0, Math.min(e.clientY - offsetY, maxY)) + "px"
+        const maxX = window.innerWidth - r.width - PAD, maxY = window.innerHeight - r.height - PAD
+        el.style.left = Math.max(PAD, Math.min(e.clientX - offsetX, maxX)) + "px"
+        el.style.top = Math.max(PAD, Math.min(e.clientY - offsetY, maxY)) + "px"
       })
       el.addEventListener("pointerup", (e) => {
         if (!dragging) return
         dragging = false
         el.releasePointerCapture(e.pointerId)
-        persistLegendPos()   // save the new position to the URL
+        persistLegendPos()   // unproject + save the new geo anchor to the URL
       })
     })()
   </script>

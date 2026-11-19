@@ -210,7 +210,7 @@ def _download(element_file, time_range, force=False):
     tmp = path + ".tmp"
     try:
         with requests.get(url, timeout=180, stream=True,
-                          headers={"User-Agent": noaa_user_agent()}) as r:
+                          headers={"User-Agent": noaa_user_agent(warn=False)}) as r:
             if not r.ok:
                 logger.warning("NDFD download %s -> HTTP %s", url, r.status_code)
                 # 404/410 = this element isn't published for this range;
@@ -253,6 +253,7 @@ def _parse_file(path):
     import numpy as np
     import eccodes as ec
     from scipy.spatial import cKDTree
+    from .gridindex import uniform_scan_values, uniform_scan_latlon
 
     frames = []
     tree = None
@@ -262,12 +263,17 @@ def _parse_file(path):
             if gid is None:
                 break
             try:
+                get = lambda k: ec.codes_get(gid, k)
                 if tree is None:
                     lats = np.asarray(ec.codes_get_array(gid, "latitudes"))
                     lons = np.asarray(ec.codes_get_array(gid, "longitudes"))
                     lons = np.where(lons > 180, lons - 360, lons)
+                    lats, lons = uniform_scan_latlon(lats, lons, get)
                     tree = cKDTree(np.column_stack([lats, lons]))
-                vals = np.asarray(ec.codes_get_values(gid), dtype=float)
+                # NDFD uses alternating-row scanning: put the values into the
+                # same uniform layout as the coordinates the tree was built on.
+                vals = uniform_scan_values(
+                    np.asarray(ec.codes_get_values(gid), dtype=float), get)
                 vd = ec.codes_get(gid, "validityDate")   # yyyymmdd int
                 vt = ec.codes_get(gid, "validityTime")    # HHMM int
                 dt = datetime(vd // 10000, (vd // 100) % 100, vd % 100,

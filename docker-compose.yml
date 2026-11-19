@@ -50,7 +50,7 @@ services:
 
       # --- Weather data source ---------------------------------------------
       # gridpoints (default, api.weather.gov JSON) | ndfd | nbm (GRIB2).
-      WR_WEATHER_SOURCE: "${WR_WEATHER_SOURCE:-gridpoints}"
+      WR_WEATHER_SOURCE: "${WR_WEATHER_SOURCE:-nbm}"
 
       # --- NOAA contact (User-Agent) ---------------------------------------
       # api.weather.gov REQUIRES a User-Agent and asks it include a contact

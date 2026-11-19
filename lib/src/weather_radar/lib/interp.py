@@ -145,21 +145,25 @@ _cubic_warned = False
 
 def _resample_grid(lat_ax, lon_ax, grid, query):
     """Cubic-resample a complete (lat x lon) grid onto `query` [[lat,lon],...].
-    Falls back to linear if this scipy lacks N-D cubic RegularGridInterpolator."""
+    Returns (values, used_linear) where used_linear is True when this scipy
+    couldn't do cubic (e.g. the grid has < 4 points in a dimension) and fell
+    back to linear — the caller can then de-facet the (piecewise-linear) result
+    with a light smooth, since linear interpolation on a COARSE lattice shows
+    hard terraces/striations between rows."""
     global _cubic_warned
     from scipy.interpolate import RegularGridInterpolator
     try:
         rgi = RegularGridInterpolator((lat_ax, lon_ax), grid, method="cubic",
                                       bounds_error=False, fill_value=None)
-        return rgi(query)
+        return rgi(query), False
     except (ValueError, NotImplementedError):
         if not _cubic_warned:
-            logger.warning("densify: cubic RegularGridInterpolator unavailable; "
-                           "falling back to linear")
+            logger.warning("densify: cubic RegularGridInterpolator unavailable "
+                           "(small grid?); linear + smooth fallback")
             _cubic_warned = True
         rgi = RegularGridInterpolator((lat_ax, lon_ax), grid, method="linear",
                                       bounds_error=False, fill_value=None)
-        return rgi(query)
+        return rgi(query), True
 
 
 def densify_fit(lats, lons, epochs, native_splines, fit_fn, k):
@@ -220,21 +224,124 @@ def densify_fit(lats, lons, epochs, native_splines, fit_fn, k):
             continue
         native_grid[:, i, j] = vals
 
-    # Dense output lattice.
-    dense_lat = densify_axis(lat_ax, k)
-    dense_lon = densify_axis(lon_ax, k)
+    # Dense output lattice + stage 2 (spatial resample, de-faceted on the
+    # small-grid linear fallback) — shared with densify_block.
+    dense_series, dense_lat, dense_lon = _densify_series(
+        native_grid, lat_ax, lon_ax, k)
     dgy, dgx = np.meshgrid(dense_lat, dense_lon, indexing="ij")
     query = np.column_stack([dgy.ravel(), dgx.ravel()])
     n_dense = query.shape[0]
-
-    # Stage 2 per knot: complete the grid (neighbor-fill holes) and resample.
-    dense_series = np.empty((n_hours, n_dense), dtype=float)
-    for h in range(n_hours):
-        g = _fill_holes(native_grid[h])
-        dense_series[h] = _resample_grid(lat_ax, lon_ax, g, query)
 
     # Stage 1 (re-fit) on each dense point via the caller's fit_fn.
     dense_lats = query[:, 0]
     dense_lons = query[:, 1]
     dense_splines = [fit_fn(dense_series[:, c], epochs) for c in range(n_dense)]
     return dense_lats, dense_lons, dense_splines
+
+
+def _densify_series(native_grid, ax0, ax1, k):
+    """Stage 2 shared by densify_fit and densify_block: for each knot, fill
+    holes and resample the (n_hours, n0, n1) native grid onto a k-times denser
+    regular grid over the axes (ax0, ax1). Returns (dense_series of shape
+    (n_hours, n_dense) in row-major order, dense_ax0, dense_ax1)."""
+    import numpy as np
+
+    dense_ax0 = densify_axis(ax0, k)
+    dense_ax1 = densify_axis(ax1, k)
+    n_d0, n_d1 = dense_ax0.size, dense_ax1.size
+    d0, d1 = np.meshgrid(dense_ax0, dense_ax1, indexing="ij")
+    query = np.column_stack([d0.ravel(), d1.ravel()])
+
+    # When the native grid is too small for cubic resampling, scipy falls
+    # back to LINEAR, which leaves hard piecewise-linear terraces between the
+    # (few, coarse) rows/cols — visible as striations on the painted field. In
+    # that case we lightly Gaussian-smooth each dense knot grid to blend the
+    # facets. The blur radius scales with the upsample factor k (so it spans
+    # roughly one native cell's worth of dense samples) and is only applied on
+    # the linear-fallback path — the cubic path is already smooth and untouched.
+    try:
+        from scipy.ndimage import gaussian_filter
+    except Exception:
+        gaussian_filter = None
+    smooth_sigma = max(0.5, k / 3.0)
+
+    n_hours = native_grid.shape[0]
+    dense_series = np.empty((n_hours, query.shape[0]), dtype=float)
+    for h in range(n_hours):
+        g = _fill_holes(native_grid[h])
+        vals, used_linear = _resample_grid(ax0, ax1, g, query)
+        if used_linear and gaussian_filter is not None:
+            # Reshape to the dense 2-D grid, smooth, re-flatten (row-major,
+            # matching the meshgrid(indexing="ij") ravel order).
+            try:
+                vals = gaussian_filter(
+                    vals.reshape(n_d0, n_d1), sigma=smooth_sigma,
+                    mode="nearest").ravel()
+            except Exception:
+                pass
+        dense_series[h] = vals
+    return dense_series, dense_ax0, dense_ax1
+
+
+def densify_block(shape, positions, epochs, native_splines, fit_fn, k,
+                  latlon_fn):
+    """Spatially densify a fit whose points are a rows x cols BLOCK of a
+    projected GRIB grid (see gridindex.GridBlock) by factor `k`.
+
+    Unlike densify_fit, this doesn't require the points to form a regular
+    LAT/LON lattice (cells of a Lambert grid don't). It works in the grid's own
+    (row, col) index space, where the block IS a regular grid, and places the
+    dense points with `latlon_fn(rows, cols) -> (lats, lons)` for fractional
+    BLOCK-relative positions.
+
+    Args:
+      shape          : (n_rows, n_cols) of the native block.
+      positions      : (n_points,) row-major block position of each spline in
+                       `native_splines` (cells that produced no spline are
+                       simply absent — they become holes).
+      epochs, fit_fn, k : as densify_fit.
+      latlon_fn      : callable(rows, cols) -> (lats, lons).
+
+    Dense points whose nearest native cell is a hole (no data) are DROPPED
+    (their spline is None), so densifying never invents data where the source
+    has none. Returns (dense_lats, dense_lons, dense_splines) or None if the
+    block is smaller than 2x2 or empty.
+    """
+    import numpy as np
+
+    n_r, n_c = int(shape[0]), int(shape[1])
+    epochs = np.asarray(epochs, dtype=float)
+    if n_r < 2 or n_c < 2 or epochs.size == 0 or len(native_splines) == 0:
+        return None
+
+    n_hours = epochs.size
+    native_grid = np.full((n_hours, n_r, n_c), _HOLE, dtype=float)
+    has_data = np.zeros((n_r, n_c), dtype=bool)
+    for pos, sp in zip(positions, native_splines):
+        if sp is None:
+            continue
+        r, c = divmod(int(pos), n_c)
+        try:
+            vals = np.asarray(sp(epochs), dtype=float)
+        except Exception:
+            continue
+        native_grid[:, r, c] = vals
+        has_data[r, c] = True
+    if not has_data.any():
+        return None
+
+    ax_r = np.arange(n_r, dtype=float)
+    ax_c = np.arange(n_c, dtype=float)
+    dense_series, dense_r, dense_c = _densify_series(native_grid, ax_r, ax_c, k)
+    dr, dc = np.meshgrid(dense_r, dense_c, indexing="ij")
+    dr, dc = dr.ravel(), dc.ravel()
+
+    # Keep only dense points whose nearest native cell has data.
+    near_r = np.clip(np.rint(dr).astype(np.int64), 0, n_r - 1)
+    near_c = np.clip(np.rint(dc).astype(np.int64), 0, n_c - 1)
+    keep = has_data[near_r, near_c]
+
+    dense_lats, dense_lons = latlon_fn(dr, dc)
+    dense_splines = [fit_fn(dense_series[:, i], epochs) if keep[i] else None
+                     for i in range(dr.size)]
+    return np.asarray(dense_lats), np.asarray(dense_lons), dense_splines
