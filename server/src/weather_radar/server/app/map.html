@@ -2690,6 +2690,35 @@
         if (fillAbort) { try { fillAbort.abort() } catch (_) {} fillAbort = null }
       }
 
+      // Compact an ORDERED list of epochs for a URL. A run of 3+ epochs spaced by
+      // a constant gap becomes "from:to:gap" (counting up or down as `to` lies
+      // from `from`); everything else stays a plain number. Order is preserved,
+      // so "nearest the playhead first" survives. Hundreds of consecutive gap
+      // frames then cost ~30 characters instead of ~11 each — a long list can
+      // exceed a proxy's request-line limit (and silently fail the fill).
+      // The server expands these in weather_radar.lib.frametimes.
+      function encodeTimes(list) {
+        const out = []
+        let i = 0
+        while (i < list.length) {
+          let j = i + 1
+          if (j < list.length) {
+            const d = list[j] - list[i]
+            if (d !== 0) {
+              while (j + 1 < list.length && list[j + 1] - list[j] === d) j++
+              if (j - i >= 2) {
+                out.push(`${list[i]}:${list[j]}:${Math.abs(d)}`)
+                i = j + 1
+                continue
+              }
+            }
+          }
+          out.push(String(list[i]))
+          i++
+        }
+        return out.join(",")
+      }
+
       function fillCache(fromTime) {
         // Supersede any in-flight fill immediately (single-flight).
         const myToken = ++fillToken
@@ -2777,7 +2806,7 @@
             `pollutant=${encodeURIComponent(model)}`, `dt=${step}`,
             `start=${seqStart}`, `end=${seqHi}`,
           ]
-          if (batch.length) qs.push(`times=${batch.join(",")}`)
+          if (batch.length) qs.push(`times=${encodeTimes(batch)}`)
           url = `/api/models/aqi/stream?${qs.join("&")}`
           console.log(`[fill:aqi] seq=${seqStart}..${seqHi} batch=${batch.length} uncached=${uncached.length}`)
         } else {
@@ -2786,7 +2815,7 @@
             `kind=${kind}`, `dt=${step}`,
             `start=${seqStart}`, `end=${seqHi}`,
           ]
-          if (batch.length) qs.push(`times=${batch.join(",")}`)
+          if (batch.length) qs.push(`times=${encodeTimes(batch)}`)
           url = `/api/models/${model}/type/series/stream?${qs.join("&")}`
           console.log(`[fill] seq=${seqStart}..${seqHi} batch=${batch.length} uncached=${uncached.length} pivot=${pivot}`)
         }

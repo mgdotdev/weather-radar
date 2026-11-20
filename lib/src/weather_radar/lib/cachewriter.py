@@ -890,6 +890,39 @@ class _Writer:
             items.append(nxt)
         return json.dumps({"items": items, "done": ended})
 
+    def write_bundle_layer(self, dirpath, data, token, epochs):
+        """Append one layer to a bundle directory (see lib/bundlestore.py).
+        The writer owns the write so bundles obey the same single-writer rule
+        as every other cache file; slot allocation, de-duplication, the layer
+        cap and generation replacement are all decided here. The directory must
+        lie under the bundle root. Returns JSON {"status": ...}."""
+        from . import bundlestore
+        root = os.path.realpath(bundlestore.BUNDLE_ROOT)
+        real = os.path.realpath(dirpath)
+        if not real.startswith(root + os.sep):
+            return json.dumps({"status": "error", "reason": "outside bundle root"})
+        try:
+            status = bundlestore.save_layer(real, data, token, epochs)
+        except Exception:
+            logger.warning("write_bundle_layer failed for %s", dirpath, exc_info=True)
+            status = "error"
+        return json.dumps({"status": status})
+
+    def write_series_cache(self, path, blob, token, managed):
+        """Store one finished point-series cache file (see lib/seriescache.py).
+        Writer-owned like every other cache file; refuses to replace newer data
+        and to write outside the series root. Returns JSON {"status": ...}."""
+        from . import seriescache
+        root = os.path.realpath(seriescache.SERIES_ROOT)
+        real = os.path.realpath(path)
+        if not real.startswith(root + os.sep):
+            return json.dumps({"status": "error", "reason": "outside series root"})
+        try:
+            status = seriescache.save(real, blob, token, managed)
+        except Exception:
+            logger.warning("write_series_cache failed for %s", path, exc_info=True)
+            status = "error"
+        return json.dumps({"status": status})
 
 
 # --- Manager wiring ----------------------------------------------------------
@@ -908,6 +941,8 @@ def run_writer(ready_event=None):
     _CacheManager.register("ensure_binary_many", callable=writer.ensure_binary_many)
     _CacheManager.register("start_job", callable=writer.start_job)
     _CacheManager.register("poll_job", callable=writer.poll_job)
+    _CacheManager.register("write_bundle_layer", callable=writer.write_bundle_layer)
+    _CacheManager.register("write_series_cache", callable=writer.write_series_cache)
 
     mgr = _CacheManager(
         address=(CACHE_WRITER_HOST, CACHE_WRITER_PORT),
@@ -938,7 +973,8 @@ _CacheClient.register("ensure_binary")
 _CacheClient.register("ensure_binary_many")
 _CacheClient.register("start_job")
 _CacheClient.register("poll_job")
-
+_CacheClient.register("write_bundle_layer")
+_CacheClient.register("write_series_cache")
 
 class WriterUnavailable(Exception):
     """Raised when the cache-writer process can't be reached, so callers can
@@ -1027,6 +1063,32 @@ def ensure_binary_many(specs):
         return [bool(r and r.get("ok")) for r in arr]
     except Exception:
         return [False] * len(specs)
+
+
+def write_bundle_layer(dirpath, data, token, epochs):
+    """Have the WRITER process append one layer file to a bundle directory
+    (lib/bundlestore.py). Returns the status string ("ok", "dup", "stale",
+    "full", "error"). Raises WriterUnavailable if the writer can't be reached
+    (the caller may then fall back to an inline write)."""
+    client = _get_client()
+    resp = client.write_bundle_layer(dirpath, data, token, list(epochs))
+    try:
+        return json.loads(_value(resp)).get("status", "error")
+    except Exception:
+        return "error"
+
+
+def write_series_cache(path, blob, token, managed=False):
+    """Have the WRITER process store a point-series cache file (lib/seriescache).
+    Returns the status string ("ok", "dup", "stale", "error"). Raises
+    WriterUnavailable if the writer can't be reached (the caller may then fall
+    back to writing inline)."""
+    client = _get_client()
+    resp = client.write_series_cache(path, blob, token, bool(managed))
+    try:
+        return json.loads(_value(resp)).get("status", "error")
+    except Exception:
+        return "error"
 
 
 def ensure_stream(paths):

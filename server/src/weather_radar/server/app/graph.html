@@ -293,6 +293,7 @@
     let lat = {{starting_latitude}}
     let lon = {{starting_longitude}}
     let models = {{weather_models}}
+    const missing = []
 
     for (let model of Object.keys(models)) {
       let params = models[model]
@@ -300,6 +301,13 @@
         let url = `/api/models/${model}/params/${param}`
         let query = `?lat=${lat}&lon=${lon}&dt=${dt}&counts=${counts}`
         let res = await fetch(url+query).then(res => res.json())
+        // No data for this point/parameter (e.g. outside the grid): skip the
+        // curve instead of throwing and leaving a blank page.
+        if (!res || !Array.isArray(res.features) || res.features.length === 0) {
+          console.warn(`no forecast data for ${model}/${param} at ${lat},${lon}`)
+          missing.push(param)
+          continue
+        }
         let x = []
         let y = []
         for (let feature of res.features) {
@@ -322,6 +330,15 @@
       }
     }
     Plotly.redraw('graph', data, layout);
+    if (missing.length) {
+      Plotly.relayout('graph', {
+        annotations: [{
+          text: `No forecast data for ${missing.join(", ")} at this point`,
+          xref: 'paper', yref: 'paper', x: 0.5, y: data.length ? 1.04 : 0.5,
+          showarrow: false, font: { size: data.length ? 13 : 18 },
+        }],
+      })
+    }
   })
 </script>
 </html>

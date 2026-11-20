@@ -340,7 +340,7 @@ def _load_grid(attribute):
 
 def grid_mtime(attribute):
     """Newest on-disk mtime of the element files backing `attribute`, or 0.0.
-    The freshness signal for NDFD bundles (analog of aqi._aqi_grib_mtime)."""
+    The freshness signal for NDFD bundles (analog of aqi.disk_cycle_token)."""
     spec = ELEMENTS.get(attribute)
     if spec is None:
         return 0.0

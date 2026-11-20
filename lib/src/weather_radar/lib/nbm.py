@@ -802,6 +802,28 @@ _IDX_CONCURRENCY = int(os.environ.get("NBM_IDX_CONCURRENCY", "8"))
 _INCOMPLETE_RETRY_SECONDS = int(os.environ.get("NBM_INCOMPLETE_RETRY_SECONDS", "60"))
 
 
+def cycle_token(attribute):
+    """Monotonic DATA-VERSION for NBM bundles: the newest cycle's init epoch
+    plus 0.01 per published forecast hour, or 0.0 if unknown. It increases when
+    a newer cycle appears or when more hours of the current cycle land (so a
+    bundle built mid-upload is superseded), and — unlike a file mtime — does NOT
+    change when the same data is merely re-fetched or re-stamped."""
+    spec = ELEMENTS.get(attribute)
+    if spec is None:
+        return 0.0
+    cyc = latest_cycle()
+    if cyc is None:
+        return 0.0
+    day, cc = cyc
+    try:
+        init = datetime.strptime(day + cc, "%Y%m%d%H").replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return 0.0
+    n = len(_forecast_hours(spec.get("accum", False), _published_hours(day, cc)))
+    return init + 0.01 * n
+
+
 def grid_mtime(attribute):
     """Newest on-disk mtime of the records backing `attribute`, or 0.0 — the
     freshness signal for NBM bundles (analog of ndfd.grid_mtime)."""

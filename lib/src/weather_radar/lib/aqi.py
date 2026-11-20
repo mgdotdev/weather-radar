@@ -29,6 +29,7 @@ are memoized in-process per worker. Refetched when a newer cycle appears.
 """
 
 import os
+import re
 import bz2
 import math
 import time
@@ -139,6 +140,37 @@ def _aqi_from_ozone(c):
 _CONVERTER = {"pm25": _aqi_from_pm25, "ozone": _aqi_from_ozone}
 
 
+def _bands_to_aqi(c, bands, truncate, top):
+    """Vectorized twin of _aqi_from_pm25/_aqi_from_ozone: concentrations `c`
+    (any shape) -> AQI as float64, NaN where the scalar returns None (negative,
+    >= 9999, or non-finite). Same inclusive bands, truncation, top-band value
+    and round-half-even as the scalar versions."""
+    import numpy as np
+    c = np.asarray(c, dtype=float)
+    ok = np.isfinite(c) & (c >= 0) & (c < 9999)
+    t = np.where(ok, truncate(np.where(ok, c, 0.0)), 0.0)
+    res = np.full(c.shape, float(top))          # above the top band
+    done = np.zeros(c.shape, dtype=bool)
+    for Cl, Ch, Il, Ih in bands:
+        m = ok & ~done & (t >= Cl) & (t <= Ch)
+        res = np.where(m, np.round((Ih - Il) / (Ch - Cl) * (t - Cl) + Il), res)
+        done |= m
+    return np.where(ok, res, np.nan)
+
+
+def _aqi_from_pm25_array(c):
+    import numpy as np
+    return _bands_to_aqi(c, _PM25_BP, lambda x: np.floor(x * 10) / 10.0, 500)
+
+
+def _aqi_from_ozone_array(c):
+    import numpy as np
+    return _bands_to_aqi(c, _OZONE_BP_PPB, np.floor, 300)
+
+
+_CONVERTER_ARRAY = {"pm25": _aqi_from_pm25_array, "ozone": _aqi_from_ozone_array}
+
+
 # --- NowCast (EPA weighted multi-hour concentration) ------------------------
 # Consumer AQI (AirNow, Apple Weather) reports NowCast, not a single hour: a
 # weighted average over the trailing 12 hourly CONCENTRATIONS that damps
@@ -183,6 +215,51 @@ def _nowcast_concentration(recent):
     if den <= 0:
         return None
     return num / den
+
+
+def _nowcast_matrix(conc, chunk=2048):
+    """Vectorized twin of _nowcast_concentration over a whole (hours, points)
+    concentration matrix: for every hour the NowCast of the trailing
+    NOWCAST_HOURS hours (hours before the series start don't exist), NaN where
+    the scalar returns None. Same EPA rules and the same k-ascending summation
+    order as the scalar loop. Points are processed in chunks to bound memory
+    (the window cube is hours x NOWCAST_HOURS x chunk)."""
+    import numpy as np
+    conc = np.asarray(conc, dtype=float)
+    n_h, n_p = conc.shape
+    out = np.full((n_h, n_p), np.nan)
+    ks = range(NOWCAST_HOURS)
+    for lo in range(0, n_p, chunk):
+        c = conc[:, lo:lo + chunk]
+        good = np.isfinite(c) & (c >= 0) & (c < 9999)
+        v = np.where(good, c, np.nan)
+        # win[k][i] = value k hours before hour i (NaN before the series start).
+        win = []
+        for k in ks:
+            w_k = np.full(v.shape, np.nan)
+            if k < n_h:
+                w_k[k:] = v[:n_h - k]
+            win.append(w_k)
+        pres = [~np.isnan(w_k) for w_k in win]
+        n3 = sum(pres[k].astype(int) for k in range(min(3, NOWCAST_HOURS)))
+        n_all = sum(p.astype(int) for p in pres)
+        cmax = np.full(v.shape, -np.inf)
+        cmin = np.full(v.shape, np.inf)
+        for k in ks:
+            cmax = np.where(pres[k], np.maximum(cmax, win[k]), cmax)
+            cmin = np.where(pres[k], np.minimum(cmin, win[k]), cmin)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            wgt = np.maximum(1.0 - (cmax - cmin) / cmax, 0.5)
+            num = np.zeros(v.shape)
+            den = np.zeros(v.shape)
+            for k in ks:
+                wk = wgt ** k
+                num += np.where(pres[k], wk * np.where(pres[k], win[k], 0.0), 0.0)
+                den += np.where(pres[k], wk, 0.0)
+            nc = np.where(cmax <= 0, 0.0, num / den)
+        enough = (n3 >= 2) & (n_all >= 2)
+        out[:, lo:lo + chunk] = np.where(enough, nc, np.nan)
+    return out
 
 
 # --- Cycle discovery + download ---------------------------------------------
@@ -466,6 +543,48 @@ def ensure_grid(pollutant="pm25"):
 
 # --- Area sampling ----------------------------------------------------------
 
+def _cycle_epoch(day, cyc):
+    try:
+        return datetime.strptime(day + cyc, "%Y%m%d%H").replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def cycle_token_in_use(pollutant):
+    """Data-version token of the NAQFC cycle THIS process last loaded for the
+    pollutant (the cycle's init epoch), or 0.0 if none yet. Call it right after
+    a fit to label the frames it produced. Unlike the grid file's mtime — which
+    ensure_grid bumps forward without the data changing — it only changes when
+    a genuinely new cycle is loaded."""
+    base, _ = _parse_pollutant(pollutant)
+    with _CURRENT_PATH_LOCK:
+        cyc = _CURRENT_CYCLE.get(base)
+    return _cycle_epoch(*cyc) if cyc else 0.0
+
+
+def disk_cycle_token(pollutant):
+    """Token of the newest NAQFC cycle for the pollutant whose GRIB is on disk
+    (a directory listing — no parse, no network), or 0.0. Same scale as
+    cycle_token_in_use, so a reader in a worker that has loaded nothing can
+    still tell whether a stored bundle matches the data the writer has."""
+    base, _ = _parse_pollutant(pollutant)
+    pat = re.compile(r"^aqm\.(\d{8})\.t(\d{2})z\.%s\.%s\.grib2$"
+                     % (re.escape(base), re.escape(GRID_ID)))
+    best = 0.0
+    try:
+        names = os.listdir(NAQFC_DIR)
+    except OSError:
+        return 0.0
+    for n in names:
+        m = pat.match(n)
+        if m:
+            best = max(best, _cycle_epoch(m.group(1), m.group(2)))
+    return best
+
+
+# --- Area sampling ----------------------------------------------------------
+
 def _prior_frames(pollutant):
     """Parsed frames for the cycle immediately BEFORE the current one, from the
     historical archive — used to backfill NowCast's trailing hours when the
@@ -523,10 +642,68 @@ def _combined_series(area, pollutant):
 
     epochs_sorted = sorted(by_epoch)
     epochs = np.array(epochs_sorted, dtype=float)
-    stacked = np.vstack([by_epoch[e] for e in epochs_sorted])  # (n_hours, cells)
-    series = stacked[:, idx]                                   # (n_hours, pts)
+    # Gather ONLY this area's cells from each frame. (Stacking the whole frames
+    # first copied ~1.5M cells x ~144 hours — about 1.7 GB and ~1.5 s — to read
+    # a few hundred points.)
+    series = np.vstack([by_epoch[e][idx] for e in epochs_sorted])   # (n_hours, pts)
     points = [[c.lon, c.lat] for c in coords]
     return epochs, series, points, idx, grid
+
+
+# --- Fit memo ---------------------------------------------------------------
+# A fit is a pure function of (pollutant, the loaded cycle, the area's points).
+# One page load asks for it several times — /aqi/range, every /aqi/stream fill
+# request, the bundle builder — and each used to redo the whole per-point
+# conversion + CubicSpline fit (and, before cells were gathered per frame, a
+# ~1.7 GB frame stack). Memoizing it makes those one fit per (area, cycle).
+# Entries are small (splines only) and hold NO reference to the parsed grid, so
+# a superseded cycle's ~1 GB of frames can be freed as soon as _GRID_CACHE
+# drops it.
+
+_FIT_CACHE = {}           # key -> (pin, result), insertion-ordered
+_FIT_CACHE_LOCK = threading.Lock()
+_FIT_KEY_LOCKS = {}       # key -> Lock, so concurrent identical requests compute once
+_FIT_CACHE_MAX = int(os.environ.get("WR_AQI_FIT_CACHE", "32"))
+
+
+def _grid_sig(grid):
+    """Identity of a parsed grid's CONTENT: the cycle's first valid time, frame
+    count and file size (a re-download of the same cycle is the same data), plus
+    a checksum of a sparse sample of the first frame so same-shaped but
+    different data can never be mistaken for it."""
+    import numpy as np
+    first = np.asarray(grid["frames"][0][1])
+    sample = float(np.nansum(first[:: max(1, first.size // 64)]))
+    return (int(grid["frames"][0][0]), len(grid["frames"]), grid.get("size"),
+            round(sample, 6))
+
+
+def _points_sig(points):
+    return hash(tuple((round(p[0], 6), round(p[1], 6)) for p in points))
+
+
+def _memo(key, compute, pin=None):
+    """Return the cached result for `key`, computing it once under a per-key
+    lock. `pin` (optional) is an object the key refers to by id(); it is stored
+    with the entry so the id can't be reused while the entry lives."""
+    with _FIT_CACHE_LOCK:
+        hit = _FIT_CACHE.get(key)
+        if hit is not None and hit[0] is pin:
+            return hit[1]
+        lock = _FIT_KEY_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        with _FIT_CACHE_LOCK:
+            hit = _FIT_CACHE.get(key)
+            if hit is not None and hit[0] is pin:
+                return hit[1]
+        result = compute()
+        with _FIT_CACHE_LOCK:
+            _FIT_CACHE.pop(key, None)
+            while len(_FIT_CACHE) >= max(_FIT_CACHE_MAX, 1):
+                _FIT_CACHE.pop(next(iter(_FIT_CACHE)))
+            _FIT_CACHE[key] = (pin, result)
+            _FIT_KEY_LOCKS.pop(key, None)
+        return result
 
 
 def fit_area(area, pollutant="pm25"):
@@ -563,48 +740,49 @@ def fit_area(area, pollutant="pm25"):
     epochs, series, points, _idx, grid = combined
     convert = _CONVERTER[base]
 
-    # The served forecast WINDOW is always the current cycle's span — prior
-    # cycle hours exist only to feed NowCast's trailing average, not to extend
-    # the user-visible timeline.
-    win_start = int(grid["frames"][0][0])
-    win_end = int(grid["frames"][-1][0])
+    # The result depends only on the data (cycle, grid, prior-cycle backfill)
+    # and the area's points, so identical requests share ONE fit: /aqi/range,
+    # each /aqi/stream fill request and the bundle builder all ask for it.
+    key = ("fit", base, nowcast, _grid_sig(grid), len(epochs), int(epochs[0]),
+           _points_sig(points))
 
-    splines = []
-    for col in range(series.shape[1]):
-        raw = series[:, col]
-        if nowcast:
-            # Per hour: NowCast of the trailing NOWCAST_HOURS concentrations
-            # (most-recent-first), then concentration -> AQI.
-            aqi_vals = []
-            for i in range(len(raw)):
-                lo = max(0, i - NOWCAST_HOURS + 1)
-                trailing = [float(raw[j]) for j in range(i, lo - 1, -1)]
-                nc = _nowcast_concentration(trailing)
-                aqi_vals.append(convert(nc) if nc is not None else None)
-            aqi = np.array(aqi_vals, dtype=object)
-        else:
-            aqi = np.array([convert(float(x)) for x in raw], dtype=object)
+    def _build():
+
+        # The served forecast WINDOW is always the current cycle's span — prior
+        # cycle hours exist only to feed NowCast's trailing average, not to extend
+        # the user-visible timeline.
+        win_start = int(grid["frames"][0][0])
+        win_end = int(grid["frames"][-1][0])
+
+        # Concentration -> AQI for every (hour, point) at once, NaN = no value.
+        # (Per-point Python loops over ~10^4 points x ~10^2 hours were the bulk
+        # of a cold fit.) NowCast first averages the trailing hours.
+        conv = _CONVERTER_ARRAY[base]
+        aqi_mat = conv(_nowcast_matrix(series) if nowcast else series)
 
         # Only fit over hours inside the current forecast window (prior-cycle
         # hours are inputs to NowCast, not knots we want to serve/extrapolate).
         in_win = (epochs >= win_start) & (epochs <= win_end)
-        valid = np.array([a is not None for a in aqi]) & in_win
-        if valid.sum() < 2:
-            splines.append(None)
-            continue
-        xe = epochs[valid]
-        ye = np.array([a for a in aqi[valid]], dtype=float)
-        try:
-            splines.append(CubicSpline(xe, ye))
-        except Exception:
-            splines.append(None)
+        finite = np.isfinite(aqi_mat) & in_win[:, None]
+        splines = []
+        for col in range(aqi_mat.shape[1]):
+            valid = finite[:, col]
+            if valid.sum() < 2:
+                splines.append(None)
+                continue
+            try:
+                splines.append(CubicSpline(epochs[valid], aqi_mat[valid, col]))
+            except Exception:
+                splines.append(None)
 
-    return {
-        "start": win_start,
-        "end": win_end,
-        "points": points,
-        "splines": splines,
-    }
+        return {
+            "start": win_start,
+            "end": win_end,
+            "points": points,
+            "splines": splines,
+        }
+
+    return _memo(key, _build)
 
 
 # --- Dense (spatial) fitting: stage-1 temporal + stage-2 spatial ------------
@@ -623,14 +801,21 @@ def fit_area_dense(area, pollutant="pm25", upsample=None):
     AQI's per-point splines are keyed on absolute epoch and AQI is clamped >=0
     at EVALUATION (predict_area), so the dense re-fit mirrors fit_area's
     CubicSpline-over-valid-knots with no extra clamp here."""
-    import numpy as np
-    from scipy.interpolate import CubicSpline
     from . import interp
 
     k = interp.upsample_env(WR_AQI_UPSAMPLE) if upsample is None else max(int(upsample), 1)
     fit = fit_area(area, pollutant)
     if k <= 1 or fit is None:
         return fit
+    # The (costly) spatial densify is a pure function of the shared fit + k.
+    return _memo(("dense", id(fit), k), lambda: _densify(fit, k), pin=fit)
+
+
+def _densify(fit, k):
+    """Stage-2 spatial densify of a stage-1 fit by factor k (see fit_area_dense)."""
+    import numpy as np
+    from scipy.interpolate import CubicSpline
+    from . import interp
 
     pts = fit["points"]                      # [[lon,lat], ...]
     if not pts:
@@ -676,6 +861,58 @@ def _dense_epochs(fit):
     return np.linspace(fit["start"], fit["end"], num=n, dtype=float)
 
 
+def _vector_splines(fit):
+    """A callable evaluating ALL of a fit's per-point CubicSplines at one epoch
+    in a single vectorized step: returns a float array aligned to fit["points"],
+    NaN where the point has no spline.
+
+    The old per-frame loop made one scipy call per point per frame (~70 ms for a
+    ~9,000-point area); this stacks the splines' coefficients once and evaluates
+    the polynomials with the SAME arithmetic and order scipy uses (ascending
+    powers of t - x[i]; extrapolation continues the end interval), so values are
+    bit-identical. Splines are grouped by their knot vector (almost all share
+    one). Built once per fit and kept on it."""
+    cached = fit.get("_vec")
+    if cached is not None:
+        return cached
+    import numpy as np
+
+    splines = fit["splines"]
+    n = len(splines)
+    groups = []                          # (indices, x, C[(4, n_int, m)])
+    by_x = {}
+    for i, sp in enumerate(splines):
+        if sp is None:
+            continue
+        key = (len(sp.x), float(sp.x[0]), float(sp.x[-1]))
+        for gi in by_x.get(key, ()):
+            if np.array_equal(groups[gi][1], sp.x):
+                groups[gi][0].append(i)
+                groups[gi][2].append(sp.c)
+                break
+        else:
+            by_x.setdefault(key, []).append(len(groups))
+            groups.append(([i], np.asarray(sp.x), [sp.c]))
+    packed = [(np.array(ix, dtype=np.intp), x, np.stack(cs, axis=-1))
+              for ix, x, cs in groups]       # c: (4, n_int, m) per knot-vector group
+
+    def evaluate(t):
+        out = np.full(n, np.nan)
+        for ix, x, c in packed:
+            j = int(np.clip(np.searchsorted(x, t, side="right") - 1, 0, len(x) - 2))
+            s = t - x[j]
+            res = np.zeros(c.shape[2])
+            z = 1.0
+            for kp in range(c.shape[0]):     # res += c[k-kp-1] * s**kp, scipy's order
+                res = res + c[c.shape[0] - kp - 1, j] * z
+                z = z * s
+            out[ix] = res
+        return out
+
+    fit["_vec"] = evaluate
+    return evaluate
+
+
 def predict_area(fit, epochs, fixed_grid=False):
     """Evaluate a fitted area (from fit_area) at the given list of epoch
     seconds.
@@ -691,26 +928,24 @@ def predict_area(fit, epochs, fixed_grid=False):
         whose spline is None or whose value is out of the forecast window.
         Caller emits the shared coords header once (see `grid_points`).
     AQI is clamped to >= 0 and rounded to an int."""
+    import numpy as np
     pts = fit["points"]
     splines = fit["splines"]
     lo, hi = fit["start"], fit["end"]
 
     if fixed_grid:
+        vec = _vector_splines(fit)
+        none_idx = [i for i, s in enumerate(splines) if s is None]
+        has_any = len(none_idx) < len(splines)
         for t in epochs:
-            vals = []
-            any_val = False
-            in_window = (lo <= t <= hi)
-            for s in splines:
-                if s is None or not in_window:
-                    vals.append(None)
-                    continue
-                y = float(s(t))
-                if y < 0:
-                    y = 0.0
-                vals.append(round(y))
-                any_val = True
-            if any_val:
-                yield {"epoch": int(t), "vals": vals}
+            if not (lo <= t <= hi) or not has_any:
+                continue          # whole frame is None -> no frame (as before)
+            y = vec(t)            # all points at once; NaN where no spline
+            y = np.where(np.isnan(y), 0.0, np.maximum(y, 0.0))   # AQI >= 0
+            vals = np.round(y).astype(np.int64).tolist()         # half-even, like round()
+            for i in none_idx:
+                vals[i] = None
+            yield {"epoch": int(t), "vals": vals}
         return
 
     for t in epochs:

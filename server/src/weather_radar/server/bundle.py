@@ -1,82 +1,82 @@
-"""Precomputed frame bundles for watched URLs.
+"""Precomputed frame bundles.
 
-A *bundle* is the entire scrubbable animation for a watched map URL, computed
-ahead of time and written to disk, so that clicking the watched link reaches a
-playable animation with ZERO per-frame computation or progressive streaming —
-the client fetches one file and bulk-populates its in-memory frame cache.
+A *bundle* holds animation frames that were already computed for one (area,
+model), so a request for them is a disk read instead of a spline fit. It is
+layered and append-only (see weather_radar.lib.bundlestore): a bundle is a
+directory of immutable layer files, each holding only the frames that did not
+exist when it was written.
 
-What a bundle contains
-----------------------
-* ``range``  : the same payload the /type/range endpoint returns
-               (min/max/uom/start/end/timeZone) — the client uses start/end to
-               anchor its frame grid and min/max/uom for the color scale.
-* ``frames`` : one slim record per grid tick, IDENTICAL to a series-stream
-               line: ``{"time", "uom", "coords": [[c0,c1],...], "vals": [...]}``
-               so the client can cache each under its existing frame key with
-               no transformation.
-* ``meta``   : the area + model identity (lat/lon/width/height/dt/kind/model)
-               used to locate and validate the bundle.
+    request 1, dt=30 min  -> layer 1: t=0, 30, 60, ...
+    request 2, dt=10 min  -> layer 2: t=10, 20, 40, ...      (only what was missing)
+    request 3, dt=5  min  -> layer 3: t=5, 15, 25, 35, ...
+    request 4, dt=5  min  -> 0 from layer 1, 5 from layer 3, 10 from layer 2, ...
 
-Frame grid
-----------
-Frames are evaluated at the watched URL's OWN ``dt`` across the forecast window
-[start, end] (the same anchor + step the client uses), so every time the client
-asks for is present in the bundle — no subset/resample logic needed.
+Identity
+--------
+``dt`` is NOT part of a bundle's identity. The key is (model, kind, lat, lon,
+width, height) — so changing the time step never misses the bundle, it only
+means some frames might not be stored yet.
 
-Storage & freshness
--------------------
-One JSON file per (area, model, dt) under CACHE_DIR. The bundle is regenerated
-only when the underlying data changed: we stamp it with the max content-change
-marker mtime across the area's gridpoints (the same signal
-models.utils.source_mtime uses), and treat a bundle as stale when any gridpoint
-has a newer change marker. So an unchanged refresh re-stamps nothing and the
-bundle is reused.
+Who writes layers
+-----------------
+* The background builder builds the FIRST layer for each watched URL, at that
+  URL's own dt, and rebuilds it when the source data changes.
+* A request that had to compute frames live saves just those frames as a new
+  layer, so the next request for them is a read. (Only when at least
+  MIN_LAYER_FRAMES were computed, and never beyond MAX_LAYERS layers.)
+All writes go through the cache-writer process (cachewriter.write_bundle_layer);
+a worker writes inline only if the writer is unreachable.
+
+Freshness
+---------
+Every layer is stamped with a data-version token (``meta.source_mtime``): the
+forecast-cycle id for NBM and AQI, a file mtime for NDFD, the gridpoint change
+markers for the JSON source. Layers of different tokens are never mixed — the
+store replaces an older generation when a newer one is written, and the reader
+only serves one generation (see bundlestore.usable_layers).
 """
 
 import os
 import json
-import gzip
 import hashlib
 import logging
+import threading
+import time
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 
 from weather_radar.lib import framing
+from weather_radar.lib import bundlestore
 
 logger = logging.getLogger(__name__)
 
 CACHE_ROOT = os.environ.get("CACHE_DIR", "/tmp")
 BUNDLE_DIR = os.path.join(CACHE_ROOT, "weather-radar-bundles")
 
-# Cap frames per bundle (mirrors the series endpoint's 5000 guard) so a
+# Cap frames per layer (mirrors the series endpoint's 5000 guard) so a
 # pathological window/dt can't produce an unbounded file.
 MAX_FRAMES = 5000
 
 
-def _bundle_key(model, lat, lon, width, height, dt, kind):
-    """Stable filename for a bundle. Rounded coords so trivially-different
-    centers (float noise) map to one file; dt/kind included since they change
-    the frame grid / ensemble."""
-    sig = f"{model}|{kind}|{round(lat, 6)}|{round(lon, 6)}|{round(width, 1)}|{round(height, 1)}|{int(dt)}"
-    h = hashlib.sha256(sig.encode()).hexdigest()[:16]
-    return h
+def _bundle_key(model, lat, lon, width, height, kind):
+    """Stable directory name for a bundle. Rounded coords so trivially-different
+    centers (float noise) map to one bundle; kind is included since it changes
+    the ensemble. dt is deliberately NOT included (see module docstring)."""
+    sig = f"{model}|{kind}|{round(lat, 6)}|{round(lon, 6)}|{round(width, 1)}|{round(height, 1)}"
+    return hashlib.sha256(sig.encode()).hexdigest()[:16]
 
 
-def _bundle_path(model, lat, lon, width, height, dt, kind):
-    """On-disk bundle path. The bundle is GZIPPED NDJSON (.ndjson.gz): the
-    first line is a {"type":"range",...} header, each subsequent line is one
-    frame record {time,uom,coords,vals} — identical to a /series/stream line.
-    Stored gzipped (coords repeat every frame, so it compresses ~10x) and
-    streamed to the client AS-IS with Content-Encoding: gzip, so the request
-    path never parses or re-serializes the (large) payload."""
-    return os.path.join(
-        BUNDLE_DIR,
-        _bundle_key(model, lat, lon, width, height, dt, kind) + ".ndjson.gz")
+def _bundle_dir(model, lat, lon, width, height, kind):
+    """On-disk directory holding the bundle's layer files."""
+    return os.path.join(BUNDLE_DIR, _bundle_key(model, lat, lon, width, height, kind))
 
+
+# --- Data-version tokens ----------------------------------------------------
 
 def _area_source_mtime(area):
     """Newest content-change-marker mtime across the area's gridpoints — the
-    freshness signal. A bundle is stale if any gridpoint changed after it was
-    built. Returns 0.0 if nothing is resolved yet."""
+    freshness signal for the JSON gridpoints source. Returns 0.0 if nothing is
+    resolved yet."""
     from weather_radar.lib.models.utils import source_mtime
     newest = 0.0
     try:
@@ -89,46 +89,129 @@ def _area_source_mtime(area):
     return newest
 
 
-def _aqi_grib_mtime(pollutant):
-    """Freshness signal for an AQI bundle: the mtime of the NAQFC GRIB the
-    bundle was built from. A bundle is stale once a newer GRIB is downloaded
-    (new cycle). Returns 0.0 if unknown. NowCast variants ("pm25-nowcast")
-    share the base pollutant's current grid, so key on the base."""
+def _source_token(model, kind):
+    """The CURRENT data-version token for (model, kind), cheap enough for a
+    request path (no data resolution), or None if it can't be determined that
+    way (the JSON gridpoints source). Same scale as the token a layer is
+    stamped with, so equality means "built from the data we have now"."""
     try:
-        from weather_radar.lib import aqi
-        import os as _os
-        base, _nowcast = aqi._parse_pollutant(pollutant)
-        # The current grid path for this pollutant (set when ensure_grid ran).
-        with aqi._CURRENT_PATH_LOCK:
-            path = aqi._CURRENT_PATH.get(base)
-        if path and _os.path.exists(path):
-            return _os.path.getmtime(path)
+        if kind == "aqi":
+            from weather_radar.lib import aqi
+            return aqi.disk_cycle_token(model) or None
+        from weather_radar.lib.models import weather_source
+        src = weather_source()
+        if src == "nbm":
+            from weather_radar.lib import nbm
+            return nbm.cycle_token(model) or None
+        if src == "ndfd":
+            from weather_radar.lib import ndfd
+            return ndfd.grid_mtime(model) or None
     except Exception:
         pass
-    return 0.0
+    return None
 
 
-def _ndfd_grid_mtime(attribute):
-    """Freshness signal for an NDFD/NBM bundle: the newest mtime of the GRIB
-    files backing `attribute` for the active grid source. A bundle is stale
-    once a newer file is fetched. Returns 0.0 if unknown."""
+def _aqi_token_in_use(pollutant):
+    """Token of the NAQFC cycle this process just loaded — read right after a
+    fit to label the frames that fit produced."""
     try:
-        from weather_radar.lib.models import weather_source
-        if weather_source() == "nbm":
-            from weather_radar.lib import nbm
-            return nbm.grid_mtime(attribute)
-        from weather_radar.lib import ndfd
-        return ndfd.grid_mtime(attribute)
+        from weather_radar.lib import aqi
+        return aqi.cycle_token_in_use(pollutant) or None
     except Exception:
-        return 0.0
+        return None
 
 
-def _build_bundle_aqi(model, lat, lon, width, height, dt, kind):
-    """Produce (header, frame_iterator, path) for an AQI bundle — the frames
-    come from the NAQFC per-gridpoint CubicSpline fit (aqi.fit_area), evaluated
-    over the whole forecast window at `dt`, IDENTICAL to what /aqi/stream emits
-    live. `model` is the pollutant (pm25|ozone)."""
-    from datetime import datetime
+# --- Encoding + storing a layer ---------------------------------------------
+
+def _store_layer(dirpath, data, token, epochs):
+    """Append a layer through the cache-writer (the single writer of cache
+    files); fall back to writing inline only when the writer is unreachable.
+    Returns the store's status string."""
+    try:
+        from weather_radar.lib import cachewriter
+        return cachewriter.write_bundle_layer(dirpath, data, token, epochs)
+    except Exception:
+        return bundlestore.save_layer(dirpath, data, token, epochs)
+
+
+def _meta_object(header, scale, offset):
+    meta_obj = dict(header)
+    meta_obj.setdefault("type", "range")
+    meta_obj["enc"] = framing.ENC_I16
+    meta_obj["scale"] = scale
+    meta_obj["offset"] = offset
+    meta_obj["sentinel"] = framing.SENTINEL
+    return meta_obj
+
+
+def _write_bundle(dirpath, header, frame_iter):
+    """Encode `frame_iter` ({"time", "vals"} dicts aligned to header["coords"],
+    None for a missing point) into one layer and append it to the bundle at
+    `dirpath`. `header` must contain `uom`, `coords` and meta.source_mtime.
+    Returns the number of frames in the layer (0 if there were none)."""
+    uom = header.get("uom", "")
+    scale, offset = framing.choose_scale(uom)
+    items = [(int(rec["time"]),
+              framing.encode_frame(rec["time"], rec["vals"], scale, offset))
+             for rec in frame_iter]
+    if not items:
+        return 0
+    data, epochs = bundlestore.pack_layer(_meta_object(header, scale, offset), items)
+    token = (header.get("meta") or {}).get("source_mtime")
+    status = _store_layer(dirpath, data, token, epochs)
+    if status not in ("ok", "dup"):
+        logger.warning("bundle layer not stored (%s): %s", status, dirpath)
+    return len(epochs)
+
+
+def save_request_layer(model, lat, lon, width, height, kind, uom, coords,
+                       items, token, rng=None):
+    """Persist frames a request had to compute live as a new layer, in the
+    background (the response has already been streamed).
+
+    `items` is [(epoch, payload)] with payload = framing.encode_frame(...) — the
+    SAME bytes that were streamed, so a later read returns them unchanged.
+    `token` is the data-version of the data they were computed from, read right
+    after the fit. Skipped when the token is unknown (the JSON source), when too
+    few frames were computed to be worth a file, or on any error."""
+    if token is None or len(items) < bundlestore.MIN_LAYER_FRAMES:
+        return False
+    try:
+        scale, offset = framing.choose_scale(uom)
+        header = {
+            "uom": uom, "coords": coords,
+            "meta": {"model": model, "kind": kind, "lat": lat, "lon": lon,
+                     "width": width, "height": height,
+                     "source_mtime": float(token), "source": "request",
+                     "built": datetime.now().isoformat()},
+        }
+        if rng:
+            header["range"] = rng
+        data, epochs = bundlestore.pack_layer(_meta_object(header, scale, offset), items)
+        dirpath = _bundle_dir(model, lat, lon, width, height, kind)
+    except Exception:
+        logger.warning("could not pack request layer", exc_info=True)
+        return False
+
+    def _go():
+        try:
+            status = _store_layer(dirpath, data, float(token), epochs)
+            logger.info("bundle layer from request: %s (%d frames) -> %s",
+                        os.path.basename(dirpath), len(epochs), status)
+        except Exception:
+            logger.warning("bundle layer save failed", exc_info=True)
+
+    threading.Thread(target=_go, name="bundle-layer-save", daemon=True).start()
+    return True
+
+
+# --- Building (background builder) ------------------------------------------
+
+def _build_bundle_aqi(model, lat, lon, width, height, kind, dt):
+    """Produce (header, frame_iterator) for an AQI bundle — the frames come
+    from the NAQFC per-gridpoint CubicSpline fit (aqi.fit_area_dense), evaluated
+    over the whole forecast window every `dt` seconds, IDENTICAL to what
+    /aqi/stream emits live. `model` is the pollutant (pm25|ozone)."""
     from weather_radar.lib.area import MapCoordinate, CoordinateArea
     from weather_radar.lib import aqi as aqi_mod
 
@@ -152,13 +235,14 @@ def _build_bundle_aqi(model, lat, lon, width, height, dt, kind):
            "end": datetime.fromtimestamp(end).isoformat(), "timeZone": tz}
     header = {
         "type": "range", "range": rng,
-        # Grid header: fixed coords (once) + uom, so the AQI bundle header is
-        # also the stream grid header. Frames are values-only, index-aligned.
+        # Grid header: fixed coords (once) + uom, so the bundle header is also
+        # the stream grid header. Frames are values-only, index-aligned.
         "uom": "AQI",
         "coords": aqi_mod.grid_points(fit),
         "meta": {"model": model, "kind": kind, "lat": lat, "lon": lon,
-                 "width": width, "height": height, "dt": int(dt),
-                 "source_mtime": _aqi_grib_mtime(model),
+                 "width": width, "height": height, "dt": step,
+                 # Read AFTER the fit: the cycle it actually used.
+                 "source_mtime": _aqi_token_in_use(model),
                  "built": datetime.now().isoformat()},
     }
 
@@ -171,89 +255,33 @@ def _build_bundle_aqi(model, lat, lon, width, height, dt, kind):
     return header, frames()
 
 
-def _write_bundle(path, header, frame_iter):
-    """Write a gzipped BINARY-SIDECAR bundle (see weather_radar.lib.framing):
-    a gzipped stream of length-prefixed records —
-      * record 0 : JSON meta (bytes). A superset of the stream grid header —
-                   it carries `range`/`meta` (for read_bundle_range + the
-                   freshness check) AND the grid fields (uom, coords, enc,
-                   scale, offset, sentinel) so serve_bundle_epochs can
-                   reconstruct the stream's binary header from it.
-      * record k : one binary frame [epoch][N × int16], from encode_frame.
-    Atomic publish. Returns the frame count, or 0 (and no file) if none.
+def build_bundle(model, lat, lon, width, height, kind, dt=3600):
+    """Compute the animation for a watched URL at its own `dt` across the whole
+    forecast window and append it to the bundle as a layer. Returns the bundle
+    directory on success, or None.
 
-    `header` must contain `uom` and `coords`; `frame_iter` yields
-    {"time", "vals"} dicts (vals aligned to coords, None for missing)."""
-    uom = header.get("uom", "")
-    coords = header.get("coords", [])
-    scale, offset = framing.choose_scale(uom)
-    meta_obj = dict(header)
-    meta_obj.setdefault("type", "range")
-    meta_obj["enc"] = framing.ENC_I16
-    meta_obj["scale"] = scale
-    meta_obj["offset"] = offset
-    meta_obj["sentinel"] = framing.SENTINEL
-    meta_bytes = json.dumps(meta_obj, separators=(",", ":")).encode("utf-8")
-
-    tmp = path + ".tmp"
-    n = 0
-    try:
-        os.makedirs(BUNDLE_DIR, exist_ok=True)
-        with gzip.open(tmp, "wb") as f:
-            f.write(framing.record(meta_bytes))
-            for rec in frame_iter:
-                f.write(framing.record(
-                    framing.encode_frame(rec["time"], rec["vals"], scale, offset)))
-                n += 1
-        if n == 0:
-            os.unlink(tmp)
-            return 0
-        os.replace(tmp, path)
-    except OSError:
-        logger.warning("bundle write failed for %s", path, exc_info=True)
-        try:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-        except OSError:
-            pass
-        return 0
-    return n
-
-
-# Back-compat alias (callers still use the old name).
-_write_bundle_ndjson = _write_bundle
-
-
-def build_bundle(model, lat, lon, width, height, dt, kind):
-    """Compute the full animation for a watched URL and write it to disk as
-    gzipped NDJSON (header line + one {time,uom,coords,vals} frame per line).
-    Returns the bundle path on success, or None.
-
-    Dispatches on `kind`: AQI uses the NAQFC spline path (bypassing NOAA
-    gridpoints); everything else uses the NOAA ensemble path. Both write the
-    SAME NDJSON format, so serving is identical. Heavy — run in the background
-    builder, not on a request; frames stream to disk (bounded memory)."""
-    path = _bundle_path(model, lat, lon, width, height, dt, kind)
+    Dispatches on `kind`: AQI uses the NAQFC spline path; everything else uses
+    the ensemble path. Heavy — run in the background builder, not on a request."""
+    dirpath = _bundle_dir(model, lat, lon, width, height, kind)
 
     if kind == "aqi":
-        built = _build_bundle_aqi(model, lat, lon, width, height, dt, kind)
+        built = _build_bundle_aqi(model, lat, lon, width, height, kind, dt)
         if built is None:
             return None
         header, frames = built
-        n = _write_bundle_ndjson(path, header, frames)
+        n = _write_bundle(dirpath, header, frames)
         if n == 0:
             return None
-        logger.warning("bundle built (aqi): model=%s %dx%dkm dt=%d -> %d frames",
-                       model, int(width), int(height), int(dt), n)
-        return path
+        logger.warning("bundle built (aqi): model=%s %dx%dkm step=%ds -> %d frames",
+                       model, int(width), int(height), header["meta"]["dt"], n)
+        return dirpath
 
-    # --- NOAA / NDFD ensemble path ---
-    # Both sources expose the same ensemble contract (value_range + per-point
+    # --- NOAA / NDFD / NBM ensemble path ---
+    # All sources expose the same ensemble contract (value_range + per-point
     # models with a `(start,end,center,f,units,expiry)` tuple), so the bundle
     # math below is shared. They differ only in how the per-point models are
-    # enumerated: NOAA resolves WFO gridpoints (area.iter_gridpoints), NDFD
-    # samples the area's lattice points from the GRIB grid (iter_points).
-    from datetime import datetime
+    # enumerated: NOAA resolves WFO gridpoints (area.iter_gridpoints), the GRIB
+    # sources sample the area's lattice points from the grid (iter_points).
     from weather_radar.lib.area import MapCoordinate, CoordinateArea
     from weather_radar.lib.models.utils import BoundsError
     from weather_radar.server.api.models import ENSEMBLE_KINDS
@@ -261,8 +289,8 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
     from weather_radar.lib.models.accumulation import AccumulationEnsemble
 
     # True for both GRIB grid sources (NDFD, NBM): iterate the ensemble's
-    # lattice points (no /points resolution) and key freshness on grid mtime.
-    is_ndfd = weather_source() in ("ndfd", "nbm")
+    # lattice points (no /points resolution).
+    is_grib = weather_source() in ("ndfd", "nbm")
     coord = MapCoordinate(lat, lon)
     area = CoordinateArea(coord, width, height)
     ensemble_class = ENSEMBLE_KINDS().get(kind, AccumulationEnsemble)
@@ -290,9 +318,9 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
     models = []
     coords = []
     uom = ""
-    if is_ndfd:
-        # NDFD: the ensemble fit the whole area already (value_range above);
-        # iterate its wrapped lattice-point models directly — no /points.
+    if is_grib:
+        # The ensemble fit the whole area already (value_range above); iterate
+        # its wrapped lattice-point models directly — no /points.
         try:
             point_models = list(ensemble.iter_points())
         except Exception:
@@ -319,34 +347,35 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
     if not models:
         return None
 
+    # Version token read AFTER the models exist (so it describes the data they
+    # were fit from).
+    token = _source_token(model, kind) if is_grib else _area_source_mtime(area)
     header = {
         "type": "range",
         "range": rng,
-        # Grid header fields: the FIXED coords lattice (sent once) + uom, so a
-        # bundle's header line is ALSO the stream's grid header. Frames below
-        # are values-only, aligned by index to these coords.
         "uom": uom,
         "coords": coords,
         "meta": {
             "model": model, "kind": kind,
             "lat": lat, "lon": lon, "width": width, "height": height,
-            "dt": int(dt),
-            "source_mtime": (_ndfd_grid_mtime(model)
-                             if is_ndfd else _area_source_mtime(area)),
+            "dt": step,
+            "source_mtime": token,
             "built": datetime.now().isoformat(),
         },
     }
+
+    use_epoch = hasattr(models[0], "predict_epoch")
 
     def frames():
         t = start
         n = 0
         while t <= end + 1 and n < MAX_FRAMES:
-            dtime = datetime.fromtimestamp(t)
+            dtime = None if use_epoch else datetime.fromtimestamp(t)
             vals = []
             any_val = False
             for m in models:
                 try:
-                    y = m.predict(dtime, verbose=False)
+                    y = m.predict_epoch(t) if use_epoch else m.predict(dtime, verbose=False)
                 except BoundsError:
                     vals.append(None)   # fixed-length: null where out of horizon
                     continue
@@ -360,54 +389,35 @@ def build_bundle(model, lat, lon, width, height, dt, kind):
             t += step
             n += 1
 
-    n_frames = _write_bundle_ndjson(path, header, frames())
+    n_frames = _write_bundle(dirpath, header, frames())
     if n_frames == 0:
         return None
     logger.warning(
-        "bundle built: model=%s %dx%dkm dt=%d -> %d frames (%d gridpoints)",
-        model, int(width), int(height), int(dt), n_frames, len(models),
+        "bundle built: model=%s %dx%dkm step=%ds -> %d frames (%d points)",
+        model, int(width), int(height), step, n_frames, len(models),
     )
-    return path
+    return dirpath
 
 
-def _read_bundle_meta(path):
-    """Return the bundle's record-0 JSON meta dict (range/meta/uom/coords/
-    enc/scale/offset/...), or None. Reads only the first length-prefixed record
-    — cheap, no frame decode."""
-    try:
-        with gzip.open(path, "rb") as f:
-            prefix = f.read(4)
-            if len(prefix) < 4:
-                return None
-            (ln,) = framing._LEN.unpack(prefix)
-            meta_bytes = f.read(ln)
-            if len(meta_bytes) < ln:
-                return None
-            return json.loads(meta_bytes.decode("utf-8"))
-    except Exception:
-        return None
+# --- Reading ----------------------------------------------------------------
+
+def _first_layer_with_range(layer_list):
+    for _seq, _path, meta in layer_list:
+        if isinstance(meta.get("range"), dict):
+            return meta
+    return None
 
 
-def _built_source_mtime(path):
-    """Read the bundle's meta record and return its stored source_mtime (the
-    freshness stamp), or None. Used by the builder's freshness check."""
-    meta = _read_bundle_meta(path)
+def read_bundle_range(model, lat, lon, width, height, kind):
+    """Return the bundle's stored `range` (min/max/uom/start/end/timeZone/extent)
+    if any current layer carries one, else None. Reads only layer headers —
+    cheap, no gridpoint resolution. Used by the prefetch/range endpoints so a
+    watched url's color range + forecast window come WITHOUT the usual
+    resolve/fetch (the frames then stream from the same bundle)."""
+    dirpath = _bundle_dir(model, lat, lon, width, height, kind)
+    ls = bundlestore.usable_layers(dirpath, _source_token(model, kind))
+    meta = _first_layer_with_range(ls)
     if meta is None:
-        return None
-    return meta.get("meta", {}).get("source_mtime", 0.0)
-
-
-def read_bundle_range(model, lat, lon, width, height, dt, kind):
-    """Return the precomputed bundle's stored `range` (min/max/uom/start/end/
-    timeZone) if a bundle keyed by these exact params exists, else None. Reads
-    only the meta record — cheap, no gridpoint resolution. Used by the prefetch
-    endpoint so a watched url's color range + forecast window come WITHOUT the
-    usual resolve/fetch (the frames then stream from the same bundle)."""
-    path = _bundle_path(model, lat, lon, width, height, dt, kind)
-    if not os.path.exists(path):
-        return None
-    meta = _read_bundle_meta(path)
-    if meta is None or meta.get("type") != "range":
         return None
     rng = meta.get("range")
     # Derive the painted-field extent from the stored lattice coords (same 5%
@@ -456,76 +466,99 @@ def read_bundle_range(model, lat, lon, width, height, dt, kind):
     return rng
 
 
-def serve_bundle_epochs(model, lat, lon, width, height, dt, kind, epochs,
+def serve_bundle_epochs(model, lat, lon, width, height, kind, epochs,
                         covered, emit_header=False):
     """Yield the bundle's BINARY records for exactly the requested `epochs` (an
-    iterable of int epochs). Each epoch found is added to `covered`. Yields
-    nothing if no bundle exists for these params.
+    iterable of int epochs), in ascending time order. Each epoch found is added
+    to `covered`. Yields nothing if no bundle exists for these params.
+
+    The wanted epochs are looked up across ALL of the bundle's current layers
+    and merged: with layers holding t=0,30,60 / t=10,20,40 / t=5,15,25,35 a
+    dt=5 request takes 0 from layer 1, 5 from layer 3, 10 from layer 2, and so
+    on — and an epoch no layer holds is simply not covered (the caller computes
+    it live).
 
     BINARY SIDECAR (see weather_radar.lib.framing): when `emit_header=True`, the
-    FIRST yielded record is the grid header (reconstructed from the bundle's
-    meta — uom/coords/enc/scale/offset), so the client can key the stream's
-    binary frames to it. Frames are the stored binary frame records, filtered
-    to the wanted epochs; their encoding (scale/offset) is IDENTICAL to what the
-    live path would emit (choose_scale is a pure function of uom), so a mixed
-    bundle+live stream is self-consistent. The header is emitted lazily, right
-    before the first matching frame, so a totally-missed request yields nothing
-    (letting the live path emit its own header).
+    FIRST yielded record is the grid header (reconstructed from the first
+    layer's header — uom/coords/enc/scale/offset), so the client can key the
+    stream's binary frames to it. The header is emitted lazily, right before
+    the first matching frame, so a totally-missed request yields nothing
+    (letting the live path emit its own header). Frames are the stored binary
+    records, unchanged — their encoding is identical to the live path's.
 
-    CHEAP + bounded memory: de-frames record-by-record; NO gridpoint resolution.
-    """
-    path = _bundle_path(model, lat, lon, width, height, dt, kind)
-    if not os.path.exists(path):
-        return
+    CHEAP + bounded memory: de-frames record-by-record; NO gridpoint resolution."""
+    dirpath = _bundle_dir(model, lat, lon, width, height, kind)
     wanted = {int(e) for e in epochs}
     if not wanted:
         return
-    try:
-        with gzip.open(path, "rb") as f:
-            # Record 0: meta. Build the binary grid header to emit lazily.
-            prefix = f.read(4)
-            if len(prefix) < 4:
-                return
-            (ln,) = framing._LEN.unpack(prefix)
-            meta = json.loads(f.read(ln).decode("utf-8"))
-            grid_header_rec = None
-            if emit_header:
-                grid_header_rec = framing.record(framing.encode_header(
-                    meta.get("uom", ""), meta.get("coords", []),
-                    meta.get("scale", 10.0), meta.get("offset", 0.0),
-                    meta.get("sentinel", framing.SENTINEL)))
-
-            # Records 1..N: binary frames. Peek the epoch (first 8 bytes) to
-            # decide if this frame is wanted; yield the WHOLE record unchanged
-            # (same encoding the live path uses).
-            while True:
-                prefix = f.read(4)
-                if len(prefix) < 4:
-                    break
-                (ln,) = framing._LEN.unpack(prefix)
-                payload = f.read(ln)
-                if len(payload) < ln:
-                    break
-                try:
-                    t = int(framing.decode_frame_epoch(payload))
-                except Exception:
-                    continue
-                if t in wanted:
-                    covered.add(t)
-                    if grid_header_rec is not None:
-                        yield grid_header_rec
-                        grid_header_rec = None  # once
-                    yield framing.record(payload)
-    except Exception:
-        logger.warning("serve_bundle_epochs failed for %s", path, exc_info=True)
+    ls = bundlestore.usable_layers(dirpath, _source_token(model, kind))
+    if not ls:
         return
+    meta = ls[0][2]
+    grid_header_rec = None
+    if emit_header:
+        grid_header_rec = framing.record(framing.encode_header(
+            meta.get("uom", ""), meta.get("coords", []),
+            meta.get("scale", 10.0), meta.get("offset", 0.0),
+            meta.get("sentinel", framing.SENTINEL)))
+    for epoch, payload in bundlestore.merged_frames(ls, wanted):
+        covered.add(epoch)
+        if grid_header_rec is not None:
+            yield grid_header_rec
+            grid_header_rec = None  # once
+        yield framing.record(payload)
 
 
 # --- URL -> bundle params, and the single-instance background builder --------
 
-import threading
-import time
-from urllib.parse import urlparse, parse_qs
+class BundleFeed:
+    """Stored frames for one request, handed out in TIME order so a stream can
+    interleave them with frames it computes live: send the stored frame at t=0,
+    compute t=15, send the stored frame at t=30, ...
+
+    `held` is the set of requested epochs the bundle's layers can supply (known
+    from the layer headers alone, before any frame is read). `upto(limit)`
+    yields the records of stored frames with epoch < limit (all of them for
+    limit=None); call it with the next live epoch before computing that epoch."""
+
+    def __init__(self, layer_list, held):
+        self._layers = layer_list
+        self.held = held
+        self._it = bundlestore.merged_frames(layer_list, held)
+        self._head = next(self._it, None)
+
+    def header_record(self):
+        """The stream's binary grid header, from the first layer's header."""
+        meta = self._layers[0][2]
+        return framing.record(framing.encode_header(
+            meta.get("uom", ""), meta.get("coords", []),
+            meta.get("scale", 10.0), meta.get("offset", 0.0),
+            meta.get("sentinel", framing.SENTINEL)))
+
+    def upto(self, limit=None):
+        while self._head is not None and (limit is None or self._head[0] < limit):
+            _epoch, payload = self._head
+            self._head = next(self._it, None)
+            yield framing.record(payload)
+
+
+def open_bundle_feed(model, lat, lon, width, height, kind, epochs):
+    """A BundleFeed for the requested `epochs`, or None when the bundle can't
+    supply any of them (no bundle, stale generation, or no overlap)."""
+    wanted = {int(e) for e in epochs}
+    if not wanted:
+        return None
+    dirpath = _bundle_dir(model, lat, lon, width, height, kind)
+    ls = bundlestore.usable_layers(dirpath, _source_token(model, kind))
+    if not ls:
+        return None
+    held = set()
+    for eps in bundlestore.plan(ls, wanted).values():
+        held |= eps
+    return BundleFeed(ls, held) if held else None
+
+
+# --- URL -> bundle params, and the single-instance background builder --------
 
 # Gate + cadence for the background builder (runs in ONE worker only — the
 # leader that spawned the background processes — so bundles are built once and
@@ -543,7 +576,8 @@ def _params_for_url(url):
     bundleable map-model URL. Mirrors the map route: model key -> (kind,
     attribute) via the server catalog; the NOAA attribute (not the dropdown
     key) is what the ensemble reads, so bundles key on it consistently with
-    the live series endpoint."""
+    the live series endpoint. `dt` is returned for the builder (the step the
+    first layer is built at) but is not part of the bundle's identity."""
     from weather_radar.server.app import _profile, DEFAULT_PROFILE
 
     parsed = urlparse(url)
@@ -568,7 +602,7 @@ def _params_for_url(url):
     width = _num("width") or 1.0
     height = _num("height") or 1.0
     dt = _num("dt")
-    dt = int(dt) if dt else 3600
+    dt = int(dt) if dt and dt > 0 else 3600
 
     profile = _profile(model_key) or {**DEFAULT_PROFILE, "attribute": model_key}
     return {
@@ -578,48 +612,48 @@ def _params_for_url(url):
     }
 
 
-def _bundle_is_fresh(model, lat, lon, width, height, dt, kind):
-    """Builder-side freshness check: True if an on-disk bundle exists AND its
-    source hasn't changed since it was built. For NOAA kinds the source signal
-    is the area's gridpoint change-markers; for AQI it's the NAQFC GRIB mtime.
-    Resolves data, so this is for the BACKGROUND builder only — never a
-    request path."""
-    path = _bundle_path(model, lat, lon, width, height, dt, kind)
-    if not os.path.exists(path):
+def _bundle_is_fresh(model, lat, lon, width, height, kind):
+    """Builder-side freshness check: True if the bundle has a layer built from
+    the data we have NOW. Cheap (a directory listing + a token read), but may
+    resolve data for the JSON source, so this is for the BACKGROUND builder
+    only — never a request path."""
+    dirpath = _bundle_dir(model, lat, lon, width, height, kind)
+    ls = bundlestore.layers(dirpath)
+    if not ls:
         return False
-    built = _built_source_mtime(path)
-    if built is None:
-        return False  # unreadable/corrupt header -> rebuild
+    toks = [t for t in (bundlestore.token_of(m) for _, _, m in ls) if t is not None]
     try:
         if kind == "aqi":
-            # AQI source = the NAQFC GRIB; stale once a newer cycle downloaded.
-            return _aqi_grib_mtime(model) <= built + 1e-6
-        from weather_radar.lib.models import weather_source
-        if weather_source() == "ndfd":
-            # NDFD source = the element GRIB files; stale once a newer file is
-            # downloaded. No data resolution needed (just a stat).
-            return _ndfd_grid_mtime(model) <= built + 1e-6
+            # Make sure this process has noticed a newly published NAQFC cycle
+            # (a no-op on the fast path while the current file is fresh).
+            from weather_radar.lib import aqi
+            base, _nowcast = aqi._parse_pollutant(model)
+            aqi.ensure_grid(base)
+        token = _source_token(model, kind)
+        if token is not None:
+            return any(abs(t - token) < bundlestore.TOKEN_EPS for t in toks)
+        # JSON gridpoints: stale once any gridpoint changed after the build.
         from weather_radar.lib.area import MapCoordinate, CoordinateArea
         area = CoordinateArea(MapCoordinate(lat, lon), width, height)
-        return _area_source_mtime(area) <= built + 1e-6
+        return bool(toks) and _area_source_mtime(area) <= max(toks) + 1e-6
     except Exception:
         # Can't evaluate -> treat as fresh so we don't rebuild in a tight loop.
         return True
 
 
 def build_for_url(url):
-    """Build (and persist) the bundle for one watched URL. Skips the heavy
-    rebuild if the on-disk bundle is still fresh (no gridpoint changed since
-    it was built), so a steady-state builder pass is cheap. Returns True if a
-    bundle exists (fresh or freshly built) for the URL afterward."""
+    """Build (and persist) the first layer for one watched URL. Skips the heavy
+    rebuild if the bundle already has a layer from the current data, so a
+    steady-state builder pass is cheap. Returns True if a bundle exists (fresh
+    or freshly built) for the URL afterward."""
     p = _params_for_url(url)
     if p is None:
         return False
     if _bundle_is_fresh(p["model"], p["lat"], p["lon"], p["width"], p["height"],
-                        p["dt"], p["kind"]):
+                        p["kind"]):
         return True
     b = build_bundle(p["model"], p["lat"], p["lon"], p["width"], p["height"],
-                     p["dt"], p["kind"])
+                     p["kind"], p["dt"])
     return b is not None
 
 
@@ -639,6 +673,13 @@ def _build_pass():
             build_for_url(url)
         except Exception:
             logger.warning("bundle builder: failed for %s", url, exc_info=True)
+        # Same pass, same process: the grid the bundle just loaded is reused
+        # here, so keeping a map's pins / a watched graph warm adds no parse.
+        try:
+            from weather_radar.server import pointseries
+            pointseries.warm_url(url)
+        except Exception:
+            logger.warning("series pre-warm failed for %s", url, exc_info=True)
 
 
 def _run():

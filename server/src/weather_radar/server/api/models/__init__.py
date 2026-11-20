@@ -96,17 +96,18 @@ def models(model: str, param: str, lat: float, lon: float, time: time_t=None, dt
     coord = MapCoordinate(lat, lon)
     from datetime import timedelta
 
-    if weather_source() in ("ndfd", "nbm"):
+    if model == "aqi" or weather_source() in ("ndfd", "nbm"):
+        # AQI (NAQFC) is its own gridded source whatever the weather source is.
         # NDFD/NBM are area/ensemble-based. Sample the point the SAME way the map
         # does: an inverse-distance-weighted blend of the area's lattice points
         # (mirroring the client's buildField IDW), NOT just the single nearest
         # lattice point — the nearest cell may be a no-data (fill) cell that the
         # map's IDW skips, which is why a single-cell graph read 0 while the map
         # showed the blended neighbors' snow. Graph the WHOLE forecast window.
-        ensemble_class = ENSEMBLE_KINDS().get(model, AccumulationEnsemble)
-        area = CoordinateArea(coord, 1, 1)
-        ensemble = ensemble_class(area, param)
-        return _ndfd_point_series(ensemble, coord, param, dt)
+        # Answered from the point-series cache when it holds this data (a file
+        # read — no grid parse), else computed and cached for the next request.
+        from weather_radar.server.pointseries import point_series
+        return point_series(model, param, lat, lon, dt)
 
     model_class = model_from_type(model)
     m = model_class.from_map_coordinate(coord, param)
@@ -150,6 +151,64 @@ def _features_time_to_epoch_ms(fc):
 # graph's blended point value matches what the heatmap paints there.
 _IDW_K = 12
 _IDW_EPS = 0.015 * 0.015
+
+
+def _point_series(kind, param, lat, lon, dt):
+    """Compute the graph series for one point from whichever gridded source
+    backs `kind`: the NAQFC air-quality grid for "aqi", else the NBM/NDFD GRIB."""
+    if kind == "aqi":
+        return _aqi_point_series(param, lat, lon, dt)
+    return _grib_point_series(kind, param, lat, lon, dt)
+
+
+def _aqi_point_series(pollutant, lat, lon, dt):
+    """A graph FeatureCollection for one point from the NAQFC air-quality grid:
+    the whole forecast window, `dt` apart, each value an inverse-distance blend
+    of the nearest lattice points (the SAME blend the map's raster paints, so
+    graph and heatmap agree at the pin), clamped >= 0. Values keep one decimal:
+    rounding to whole AQI turned the smooth spline into a staircase (a 72 h
+    series had 43 distinct values in 569 samples), unlike the temperature
+    graph, which plots floats. Empty features when the grid or pollutant is
+    unavailable."""
+    from weather_radar.lib import aqi
+    empty = {"type": "FeatureCollection", "features": []}
+    fit = aqi.fit_area_dense(CoordinateArea(MapCoordinate(lat, lon), 1, 1), pollutant)
+    if not fit:
+        return empty
+    near = sorted(
+        ((((p[1] - lat) ** 2 + (p[0] - lon) ** 2), sp)
+         for p, sp in zip(fit["points"], fit["splines"]) if sp is not None),
+        key=lambda t: t[0])[:_IDW_K]
+    if not near:
+        return empty
+    weights = [1.0 / (d2 + _IDW_EPS) for d2, _ in near]
+    wsum = sum(weights)
+    step = int(dt) if dt and int(dt) > 0 else 3600
+    features = []
+    t = int(fit["start"])
+    while t <= int(fit["end"]):
+        num = 0.0
+        for w, (_d2, sp) in zip(weights, near):
+            y = float(sp(t))
+            num += w * (y if y > 0 else 0.0)
+        features.append({
+            "type": "Feature",
+            "properties": {pollutant: round(num / wsum, 1),
+                           "time": t * 1000, "uom": "AQI"},
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+        })
+        t += step
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _grib_point_series(kind, param, lat, lon, dt):
+    """Compute the graph series for one point from the GRIB source (NBM/NDFD):
+    the single-point FeatureCollection the graph and forecast pages plot."""
+    coord = MapCoordinate(lat, lon)
+    ensemble_class = ENSEMBLE_KINDS().get(kind, AccumulationEnsemble)
+    area = CoordinateArea(coord, 1, 1)
+    ensemble = ensemble_class(area, param)
+    return _ndfd_point_series(ensemble, coord, param, dt)
 
 
 def _ndfd_point_series(ensemble, coord, param, dt):
@@ -457,7 +516,7 @@ def prefetch_stream(lat: float, lon: float, width: float=1, height: float=1,
     show a live completed/total fraction. Phases run in order; the final line
     of each phase has done == total.
 
-    BUNDLE SHORT-CIRCUIT: if a precomputed bundle exists for (model, area, dt,
+    BUNDLE SHORT-CIRCUIT: if a precomputed bundle exists for (model, area,
     kind) — a WATCHED url — the area's NOAA data need not be resolved/fetched
     at all (every frame is already computed in the bundle). In that case we
     emit a single {"phase":"bundle","range":{...}} line carrying the bundle's
@@ -473,7 +532,7 @@ def prefetch_stream(lat: float, lon: float, width: float=1, height: float=1,
         if model is not None:
             try:
                 from weather_radar.server.bundle import read_bundle_range
-                rng = read_bundle_range(model, lat, lon, width, height, dt, kind)
+                rng = read_bundle_range(model, lat, lon, width, height, kind)
                 if rng is not None:
                     yield json.dumps({"phase": "bundle", "range": rng}) + "\n"
                     return
@@ -554,7 +613,7 @@ def aqi_range(lat: float, lon: float, width: float = 1, height: float = 1,
     # Bundle header first (watched url) — the stored range incl. start/end.
     try:
         from weather_radar.server.bundle import read_bundle_range
-        rng = read_bundle_range(pollutant, lat, lon, width, height, 3600, "aqi")
+        rng = read_bundle_range(pollutant, lat, lon, width, height, "aqi")
         if rng:
             return rng
     except Exception:
@@ -598,27 +657,29 @@ def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
     def generate():
         if not epochs:
             return
-        # Bundle first (keyed by kind="aqi", model=pollutant). The bundle emits
-        # the (binary) header record; the live path emits one only if the
-        # bundle didn't. serve_bundle_epochs yields raw binary records.
+        # Bundle first (keyed by kind="aqi", model=pollutant). Its layers say
+        # which requested epochs are stored; those are sent first, in time order
+        # (plain disk reads, instant, before the slow cold fit), then the rest
+        # are computed in the order the client asked for (nearest the playhead
+        # first). The bundle supplies the (binary) header when it holds
+        # anything; otherwise the live path emits one.
         remaining = list(epochs)
         header_sent = False
+        feed = None
         try:
-            from weather_radar.server.bundle import serve_bundle_epochs
-            covered = set()
-            for rec in serve_bundle_epochs(pollutant, lat, lon, width, height,
-                                           dt, "aqi", epochs, covered,
-                                           emit_header=True):
-                header_sent = True
-                yield rec
-            if covered:
-                remaining = [e for e in epochs if int(e) not in covered]
-                if not remaining:
-                    return  # entire request served from the bundle
+            from weather_radar.server.bundle import open_bundle_feed
+            feed = open_bundle_feed(pollutant, lat, lon, width, height, "aqi", epochs)
         except Exception:
-            remaining = list(epochs)
+            feed = None
+        if feed is not None:
+            header_sent = True
+            yield feed.header_record()
+            yield from feed.upto(None)
+            remaining = [e for e in epochs if e not in feed.held]
+            if not remaining:
+                return  # entire request served from the bundle
 
-        # Live spline path for whatever the bundle didn't cover.
+        # Live spline path for whatever the bundle didn't hold.
         fit = fit_area_dense(area, pollutant)
         if fit is None:
             return
@@ -629,9 +690,27 @@ def aqi_stream(lat: float, lon: float, width: float = 1, height: float = 1,
         if not header_sent:
             yield framing.record(
                 framing.encode_header("AQI", grid_points(fit), scale, offset))
+        # Keep the exact bytes streamed so they can be saved as a bundle layer
+        # (read next time instead of re-fit). Token = the NAQFC cycle the fit
+        # just loaded.
+        new_items = []
         for fr in predict_area(fit, remaining, fixed_grid=True):
-            yield framing.record(
-                framing.encode_frame(fr["epoch"], fr["vals"], scale, offset))
+            payload = framing.encode_frame(fr["epoch"], fr["vals"], scale, offset)
+            new_items.append((int(fr["epoch"]), payload))
+            yield framing.record(payload)
+        try:
+            from datetime import datetime as _dt
+            from weather_radar.server.bundle import (
+                save_request_layer, _aqi_token_in_use)
+            save_request_layer(
+                pollutant, lat, lon, width, height, "aqi", "AQI",
+                grid_points(fit), new_items, _aqi_token_in_use(pollutant),
+                rng={"min": AQI_MIN, "max": AQI_MAX, "uom": "AQI",
+                     "start": _dt.fromtimestamp(fit["start"]).isoformat(),
+                     "end": _dt.fromtimestamp(fit["end"]).isoformat(),
+                     "timeZone": None})
+        except Exception:
+            logger.warning("AQI bundle layer save skipped", exc_info=True)
 
     return StreamingResponse(_gzip_stream(generate()),
                              media_type=_STREAM_MEDIA_TYPE,
@@ -779,48 +858,11 @@ def ensemble_stream(
 def _frame_times(start, end, dt, times):
     """Resolve the list of frame epochs to stream, in the order to emit them.
 
-    Supports two modes, which may be COMBINED in one request:
-      * batch    - an explicit comma-separated list of epochs (`times=`),
-                   emitted first. Used to fill arbitrary gaps the client is
-                   missing (e.g. the odd 5-min slots when it already has the
-                   evens), in no particular spacing.
-      * sequence - a contiguous series start..end stepped by dt, emitted after
-                   the batch. Used to stream the continuous tail.
-
-    Duplicates are removed while preserving order (batch before sequence), so a
-    time present in both isn't computed/emitted twice.
-    """
-    out = []
-    seen = set()
-
-    def add(epoch):
-        e = int(epoch)
-        if e not in seen:
-            seen.add(e)
-            out.append(e)
-
-    # Batch first.
-    if times:
-        for tok in str(times).split(","):
-            tok = tok.strip()
-            if not tok:
-                continue
-            try:
-                add(float(tok))
-            except ValueError:
-                continue
-
-    # Then the contiguous sequence.
-    if start is not None and end is not None:
-        step = int(dt) if dt and int(dt) > 0 else 3600
-        t = float(start)
-        count = 0
-        while t <= float(end) + 1 and count < 5000:
-            add(t)
-            t += step
-            count += 1
-
-    return out
+    `times` is a comma-separated batch of epochs and/or `from:to:step` runs
+    (emitted first, in the order given); `start`/`end`/`dt` add a contiguous
+    sequence after it. See weather_radar.lib.frametimes."""
+    from weather_radar.lib.frametimes import frame_times
+    return frame_times(start, end, dt, times)
 
 
 @router.get("/{model}/type/series/stream")
@@ -882,27 +924,32 @@ def ensemble_series_stream(
         # and recomputed everything live. Serving by epoch fixes that.)
         #
         # GRID FORMAT: the stream emits exactly ONE grid header (coords sent
-        # once). The bundle path emits its header first when it serves anything;
-        # if it didn't (no bundle / nothing covered), the live path emits its
-        # own. `header_sent` tracks this so coords aren't double-sent — and the
-        # FE keys all subsequent values-only frames to that single header.
+        # once). When the bundle supplies anything it sends the header first;
+        # otherwise the live path emits its own. `header_sent` tracks this so
+        # coords aren't double-sent — and the FE keys all subsequent values-only
+        # frames to that single header.
+        #
+        # The bundle's layers say (from their headers alone) which requested
+        # epochs they hold. Those are sent FIRST, in time order — they're plain
+        # disk reads, so they arrive instantly, before the slow cold fit. The
+        # rest are then computed live in the ORDER THE CLIENT ASKED FOR (nearest
+        # the playhead first), so the frame being looked at is never queued
+        # behind far-away ones.
         remaining = list(epochs)
         header_sent = False
+        feed = None
         try:
-            from weather_radar.server.bundle import serve_bundle_epochs
-            covered = set()
-            for line in serve_bundle_epochs(model, lat, lon, width, height,
-                                            dt, kind, epochs, covered,
-                                            emit_header=True):
-                header_sent = True  # first line from the bundle is the header
-                yield line
-            if covered:
-                remaining = [e for e in epochs if int(e) not in covered]
-                if not remaining:
-                    return  # entire request served from the bundle
+            from weather_radar.server.bundle import open_bundle_feed
+            feed = open_bundle_feed(model, lat, lon, width, height, kind, epochs)
         except Exception:
-            # Bundle error: fall back to computing the full request live.
-            remaining = list(epochs)
+            feed = None   # bundle error: compute the full request live
+        if feed is not None:
+            header_sent = True
+            yield feed.header_record()
+            yield from feed.upto(None)
+            remaining = [e for e in epochs if e not in feed.held]
+            if not remaining:
+                return  # entire request served from the bundle
 
         # --- Phase timing (to locate first-frame latency: NOAA warm vs spline
         # fit vs evaluation). Logged once per request at WARNING so it surfaces
@@ -1020,6 +1067,15 @@ def ensemble_series_stream(
         # ONCE (all models in a sweep are the same kind) so the hot loop below
         # doesn't branch per (point × frame).
         use_epoch = bool(models) and hasattr(models[0], "predict_epoch")
+        # The exact bytes streamed are kept so they can be saved as a bundle
+        # layer afterwards. The version token describes the data the models were
+        # just fit from (None for the JSON source -> nothing is saved).
+        new_items = []
+        try:
+            from weather_radar.server.bundle import _source_token
+            layer_token = _source_token(model, kind)
+        except Exception:
+            layer_token = None
         for epoch in remaining:
             t = None if use_epoch else datetime.fromtimestamp(epoch)
             vals = []
@@ -1039,8 +1095,17 @@ def ensemble_series_stream(
                 if t_first_frame is None:
                     t_first_frame = time.perf_counter()
                 frames_emitted += 1
-                yield framing.record(
-                    framing.encode_frame(epoch, vals, scale, offset))
+                payload = framing.encode_frame(epoch, vals, scale, offset)
+                new_items.append((int(epoch), payload))
+                yield framing.record(payload)
+
+        if new_items and layer_token is not None:
+            try:
+                from weather_radar.server.bundle import save_request_layer
+                save_request_layer(model, lat, lon, width, height, kind,
+                                   uom, coords, new_items, layer_token)
+            except Exception:
+                logger.warning("bundle layer save skipped", exc_info=True)
 
         # --- One structured timing line per request. Durations in ms. ---
         #   resolve     : area.iter_gridpoints()
