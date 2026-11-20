@@ -130,6 +130,12 @@
           </label>
           <label style="display:flex; align-items:center; margin-top:8px;
               font-size:11px; color:#555; cursor:pointer;">
+            <span>Show cursor box</span>
+            <input type="checkbox" id="showCursorBox" checked
+              style="cursor:pointer; margin:0 0 0 auto; width:22px; height:22px;">
+          </label>
+          <label style="display:flex; align-items:center; margin-top:8px;
+              font-size:11px; color:#555; cursor:pointer;">
             <span>Lock legend &amp; pins</span>
             <input type="checkbox" id="lockLayout"
               style="cursor:pointer; margin:0 0 0 auto; width:22px; height:22px;">
@@ -139,11 +145,8 @@
     </div>
 
     <!-- Cursor readout: follows the pointer with the interpolated value. -->
-    <div id="cursorReadout" style="
-        position: fixed; z-index: 101; display: none; pointer-events: none;
-        background: rgba(0,0,0,0.75); color: #fff; font-family: sans-serif;
-        font-size: 12px; padding: 4px 7px; border-radius: 4px;
-        white-space: nowrap;"></div>
+    <div id="cursorReadout" style="position: fixed; z-index: 101; display: none;
+        pointer-events: none;"></div>
 
     <!-- Right-click context menu. -->
     <div id="contextMenu" style="
@@ -335,7 +338,7 @@
       const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
       for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
                        "from", "to", "t", "pins", "pinBoxes", "pinSize",
-                       "legendSize", "legendLat", "legendLon", "areaBox", "locked"]) {
+                       "legendSize", "legendLat", "legendLon", "areaBox", "cursorBox", "locked"]) {
         const v = new URL(window.location.href).searchParams.get(k)
         if (v !== null) u.searchParams.set(k, v)
       }
@@ -988,6 +991,44 @@
       if (src) src.setData(areaBoxGeoJSON())
     }
 
+    // The look of a pin's info box (size, type, colors, padding). ONE definition
+    // shared by every pin box and the cursor box, so the cursor box is always
+    // exactly the same size as the pins' and can't drift from them. (Position,
+    // z-index and each element's own transform are added where it's built.)
+    const PIN_INFO_CSS = "box-sizing:border-box; width:190px;" +
+      "display:flex; flex-direction:column; gap:2px;" +
+      "background:rgba(30,30,30,0.85); color:#fff; font-family:sans-serif; font-size:12px;" +
+      // Right/top padding clears the pin box's corner buttons (x top-right,
+      // graph bottom-right) so the text never sits under them.
+      "padding:3px 22px 5px 7px; border-radius:4px; white-space:nowrap;" +
+      "box-shadow:0 1px 4px rgba(0,0,0,0.4);"
+
+    // Whether the box that follows the cursor (value + coordinates) is shown.
+    // Persisted in the URL (`cursorBox=0` to hide; shown by default).
+    let showCursorBox =
+      new URL(window.location.href).searchParams.get("cursorBox") !== "0"
+    // Assigned inside map.on("load") (where the readout lives), like switchModel.
+    let refreshCursorBox = () => {}
+    function setShowCursorBox(on) {
+      showCursorBox = !!on
+      const u = new URL(window.location.href)
+      if (showCursorBox) u.searchParams.delete("cursorBox")
+      else u.searchParams.set("cursorBox", "0")
+      history.replaceState(null, "", u.toString())
+      refreshCursorBox()
+    }
+
+    // Where the cursor box goes: just below-right of the pointer, flipping to the
+    // other side when it would run off the viewport (a pinSize-scaled box is
+    // big), and never above/left of the viewport. w/h are the box's ON-SCREEN
+    // (scaled) size.
+    function readoutPosition(cx, cy, w, h, vw, vh, gap) {
+      let x = cx + gap, y = cy + gap
+      if (x + w > vw) x = cx - gap - w
+      if (y + h > vh) y = cy - gap - h
+      return { x: Math.max(0, x), y: Math.max(0, y) }
+    }
+
     // Whether the area-outline box is shown. Persisted in the URL
     // (`areaBox=0` to hide; shown by default). Applied to the layer once it
     // exists and whenever the checkbox toggles.
@@ -1068,24 +1109,43 @@
 
       const mapContainer = document.getElementById("weatherRadar")
       const readoutEl = document.getElementById("cursorReadout")
+      // Same look as a pin's info box (PIN_INFO_CSS), scaled from its top-left
+      // corner by the pin-size setting. Text lives in one block span, like a
+      // pin box's, so the two lay out identically.
+      readoutEl.style.cssText = "position:fixed; z-index:101; display:none;" +
+        "pointer-events:none; transform-origin:0 0;" + PIN_INFO_CSS
+      const readoutText = document.createElement("span")
+      readoutText.style.cssText = "display:block;"
+      readoutEl.appendChild(readoutText)
       let cursorPx = null
 
       function refreshReadout() {
+        // Nothing to show: switched off in Settings, or the pointer isn't over
+        // the map. Checked FIRST because this also runs during startup (pin
+        // restore -> applyPinSize), before later `let`s in this handler exist.
+        if (!showCursorBox || !cursorPx) { readoutEl.style.display = "none"; return }
         // Hide the hover readout while drawing an observed-area box (the draw
-        // rectangle + hint are the only overlay that should show then).
-        if (typeof drawing !== "undefined" && drawing) {
-          readoutEl.style.display = "none"; return
-        }
-        if (!cursorPx) { readoutEl.style.display = "none"; return }
+        // rectangle + hint are the only overlay that should show then). NOTE:
+        // `typeof` does NOT protect against a `let` that hasn't been initialized
+        // yet (it throws), and `drawing` is declared further down this handler,
+        // so read it inside a try — a pointer can move before setup finishes.
+        let isDrawing = false
+        try { isDrawing = !!drawing } catch (_) {}
+        if (isDrawing) { readoutEl.style.display = "none"; return }
         const rect = mapContainer.getBoundingClientRect()
         const ll = map.unproject([cursorPx.x - rect.left, cursorPx.y - rect.top])
         const v = sampleAt(ll.lng, ll.lat)
         const valueText = v === null ? "—" : `${v.toFixed(1)}${latestUnits ? " " + latestUnits : ""}`
-        readoutEl.innerHTML = `${modelLabel}: ${valueText}<br>${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`
-        readoutEl.style.left = (cursorPx.x + 12) + "px"
-        readoutEl.style.top = (cursorPx.y + 12) + "px"
-        readoutEl.style.display = "block"
+        readoutText.innerHTML = `${modelLabel}: ${valueText}<br>${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`
+        readoutEl.style.transform = `scale(${pinSize})`
+        readoutEl.style.display = "block"      // (must be laid out to be measured)
+        const pos = readoutPosition(cursorPx.x, cursorPx.y,
+          readoutEl.offsetWidth * pinSize, readoutEl.offsetHeight * pinSize,
+          window.innerWidth, window.innerHeight, 12)
+        readoutEl.style.left = pos.x + "px"
+        readoutEl.style.top = pos.y + "px"
       }
+      refreshCursorBox = refreshReadout
       mapContainer.addEventListener("mousemove", (e) => { cursorPx = { x: e.clientX, y: e.clientY }; refreshReadout() })
       mapContainer.addEventListener("mouseleave", () => { cursorPx = null; readoutEl.style.display = "none" })
       map.on("move", () => { refreshReadout(); refreshPins() })
@@ -1161,6 +1221,7 @@
         // Reposition so the info box's (pinSize-scaled) offset + transform
         // update immediately.
         if (pins.length) refreshPins()
+        refreshReadout()   // the cursor box follows the pin size too
       }
 
       // Always two decimals so the label is uniform across the 0.25 step grid
@@ -1302,18 +1363,12 @@
         // (The text is a child span, not info.innerHTML, so the per-frame
         // refresh doesn't clobber the buttons.)
         const info = document.createElement("div")
-        info.style.cssText = "position:fixed; z-index:101; box-sizing:border-box;" +
-          // Fixed width so the box NEVER resizes when the value fills in (or
-          // changes length frame-to-frame). Wide enough for a long label +
-          // value (e.g. "Snowfall Amount: 128.5 in") and the coords line.
-          "width:190px;" +
-          "transform-origin:0% 100%; transform:translate(0,-100%);" +
-          "display:flex; flex-direction:column; gap:2px;" +
-          "background:rgba(30,30,30,0.85); color:#fff; font-family:sans-serif; font-size:12px;" +
-          // Right/top padding clears the corner buttons (× top-right, 📈
-          // bottom-right, both absolute) so the text never sits under them.
-          "padding:3px 22px 5px 7px; border-radius:4px; white-space:nowrap;" +
-          "box-shadow:0 1px 4px rgba(0,0,0,0.4);"
+        // The box's size/look is PIN_INFO_CSS (shared with the cursor box). Its
+        // width is FIXED so the box NEVER resizes when the value fills in (or
+        // changes length frame-to-frame): wide enough for a long label + value
+        // (e.g. "Snowfall Amount: 128.5 in") and the coords line.
+        info.style.cssText = "position:fixed; z-index:101;" +
+          "transform-origin:0% 100%; transform:translate(0,-100%);" + PIN_INFO_CSS
         // Name (editable), on its own row. The × is pinned to the box corner
         // (absolute, below), so the name row doesn't need to reserve it.
         const nameEl = document.createElement("span")
@@ -1965,8 +2020,9 @@
         hideMenu()
         const u = new URL(window.location.href)
         u.searchParams.delete("token")
-        // Only the area/model/dt matter to the hot-cache; drop view-only params.
-        for (const k of ["zoom", "speed", "step", "from", "to", "t", "pins", "pinSize"]) {
+        // Only the area/model/dt (and the pins, whose graphs are pre-warmed)
+        // matter to the hot-cache; drop view-only params.
+        for (const k of ["zoom", "speed", "step", "from", "to", "t", "pinSize"]) {
           u.searchParams.delete(k)
         }
         const watchUrl = u.pathname + (u.search || "")
@@ -2228,7 +2284,7 @@
           const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
           for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
                            "pins", "pinBoxes", "pinSize", "legendSize",
-                           "legendLat", "legendLon", "areaBox", "locked"]) {
+                           "legendLat", "legendLon", "areaBox", "cursorBox", "locked"]) {
             const v = new URL(window.location.href).searchParams.get(k)
             if (v !== null) u.searchParams.set(k, v)
           }
@@ -3303,16 +3359,19 @@
         }
       }
 
+      // The legend's CSS transform:scale (the legend-size control). Everything
+      // measured with getBoundingClientRect()/clientX is in ON-SCREEN pixels,
+      // which include this scale; the scrubber's SVG is drawn in its own
+      // UNSCALED user units (the transform scales those on screen). Any
+      // conversion between the two must divide/multiply by this.
+      function legendScale() {
+        return (typeof legendSize === "number" && legendSize > 0) ? legendSize : 1
+      }
       function scWidth() {
-        // getBoundingClientRect() returns the ON-SCREEN width, which includes
-        // any CSS transform:scale from the legend-size control. The scrubber's
-        // handle/playhead positions are set in the SVG's OWN (unscaled) user
-        // units — the transform then scales those too. So divide the rect
-        // width back down by the legend scale to recover the unscaled width;
-        // otherwise the scale is applied twice and the playhead/handles slide
-        // past the right edge of the box.
-        const scale = (typeof legendSize === "number" && legendSize > 0) ? legendSize : 1
-        const w = (scrubberEl.getBoundingClientRect().width / scale) || 200
+        // The on-screen width includes the legend scale; divide it back out to
+        // recover the unscaled width, otherwise the scale is applied twice and
+        // the playhead/handles slide past the right edge of the box.
+        const w = (scrubberEl.getBoundingClientRect().width / legendScale()) || 200
         return Math.max(1, w - 2 * SC_PAD)
       }
       // epoch (within forecast range) -> x pixel, and inverse.
@@ -3416,7 +3475,11 @@
       let dragWhich = null
       function pointerToEpoch(evt) {
         const rect = scrubberEl.getBoundingClientRect()
-        return xToEpoch(evt.clientX - rect.left)
+        // clientX - rect.left is ON-SCREEN px; xToEpoch wants the SVG's own
+        // unscaled units (the same ones the handles are drawn in), so undo the
+        // legend scale. Without this the handle drifts away from the cursor at
+        // any legend size other than 1.00x.
+        return xToEpoch((evt.clientX - rect.left) / legendScale())
       }
       function beginDrag(which, evt) {
         if (!scrubberReady) return
@@ -3531,6 +3594,18 @@
         cb.addEventListener("change", (e) => {
           e.stopPropagation()
           setShowAreaBox(cb.checked)
+        })
+      })()
+
+      // "Show cursor box" checkbox (persisted via ?cursorBox=0).
+      ;(function setupCursorBoxToggle() {
+        const cb = document.getElementById("showCursorBox")
+        if (!cb) return
+        cb.checked = showCursorBox
+        cb.addEventListener("pointerdown", (e) => e.stopPropagation())
+        cb.addEventListener("change", (e) => {
+          e.stopPropagation()
+          setShowCursorBox(cb.checked)
         })
       })()
 

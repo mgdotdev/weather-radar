@@ -79,6 +79,22 @@ docker push ghcr.io/mgdotdev/weather-radar:latest
 Change the `image:` field in `docker-compose.yml` to your own registry/tag
 first if you're not pushing to the default.
 
+## Embedding in Home Assistant
+
+Set the map up in the web UI, then give Home Assistant the page URL (with an
+access token appended: mint one on the admin tokens page — use a separate,
+labelled token for the dashboard so you can revoke it on its own).
+
+To see how it will fit **before** touching your dashboard, open
+[`docs/ha-preview.html`](docs/ha-preview.html) in a browser: paste the URL, pick
+a card type (Home Assistant's default card height is half its width; sections
+cards are 320–500 px wide; a panel fills the page) and it shows your real app in
+an iframe of exactly that size.
+
+The legend and pin boxes are sized for a full browser window (the legend is
+360 px wide). In a small card, add `legendSize=0.5&pinSize=0.5&locked=1` to the
+URL (the preview has a checkbox for it) so they take a fraction of the card.
+
 ## Configuration
 
 Key environment variables (see `.env.example` for the full list):
