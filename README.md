@@ -86,14 +86,50 @@ access token appended: mint one on the admin tokens page — use a separate,
 labelled token for the dashboard so you can revoke it on its own).
 
 To see how it will fit **before** touching your dashboard, open
-[`docs/ha-preview.html`](docs/ha-preview.html) in a browser: paste the URL, pick
-a card type (Home Assistant's default card height is half its width; sections
-cards are 320–500 px wide; a panel fills the page) and it shows your real app in
-an iframe of exactly that size.
+`/ha-preview/` on your server (it needs the same access token as every page):
+your real app in an iframe of exactly the size you pick (Home Assistant's default
+card height is half its width; sections cards are 320–500 px wide; a panel fills
+the page), with a control for every URL parameter, a pin editor, "paste an
+existing URL", and the URL plus a ready-to-paste card snippet. With **follow**
+on, anything you change inside the preview (pins, zoom, legend position) flows
+back into the controls.
+
+`/graph-preview/` does the same for the forecast **graph** page: add or change
+curves, set the point and time step, switch the compact Home Assistant layout
+(`ha=true`) and dark mode, and set the title — click, drag or resize the title
+inside the preview and the controls follow. The two previews link to each other.
+
+Both previews render from built-in **sample data** by default ("Sample data" in
+the top bar; the frame's requests carry `fixture=1`), so the page loads in about
+a second without the forecast pipeline. Untick it to see your real data. Purely
+visual settings (pin and legend size, lock, cursor box, area box, floating scrub
+bar, credits) and the view (center and zoom) are applied inside the map in place,
+without reloading at all. The
+copied URL and card never include `fixture`. Sample data still requires an
+access token, and `WR_PREVIEW_FIXTURES=0` turns it off.
 
 The legend and pin boxes are sized for a full browser window (the legend is
 360 px wide). In a small card, add `legendSize=0.5&pinSize=0.5&locked=1` to the
 URL (the preview has a checkbox for it) so they take a fraction of the card.
+
+Add `floatScrubber=1` to move the play button, scrub bar and time label out of the
+legend into a bar floating at the bottom-center of the map (also a Settings
+checkbox, and a control on `/ha-preview/`). Place the legend away from the bottom
+edge so the two don't overlap.
+
+`mapLat` / `mapLon` set where the map is **looking** (the view center). They are
+separate from `lat` / `lon`, the center of the data area, which only changes when
+you capture or recenter the area — so panning never changes which data is
+requested. The two params follow the map as you drag (written while you move and
+once more when it settles), are removed while the view is on the area's center,
+survive a reload and a model switch, and invalid values are ignored. On
+`/ha-preview/` they have their own fields: typing a center moves the map in
+place, and panning inside the preview fills them in.
+
+The map's credit button (the basemap's required © OpenStreetMap / CARTO notice) is
+hidden by default and the distance scale sits in the top-right corner. Tick
+"Show map credits" in Settings, or add `attribution=1`, to show the button.
+Untick "Show scale bar" in Settings, or add `scaleBar=0`, to hide the distance scale.
 
 ## Configuration
 

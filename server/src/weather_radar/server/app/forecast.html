@@ -58,17 +58,23 @@
     // Forward ?token=… to same-origin API requests (credentialed/iframe
     // access; see map.html). No-op when no token is present.
     (function () {
-      const WR_TOKEN = new URL(window.location.href).searchParams.get("token");
-      if (!WR_TOKEN) return;
+      const sp = new URL(window.location.href).searchParams;
+      const WR_TOKEN = sp.get("token");
+      // ?fixture=1 (the Home Assistant preview pages): ask the API for canned SAMPLE data
+      // instead of running the real pipeline. Only /api/ calls are affected.
+      const WR_FIXTURE = sp.get("fixture") === "1";
+      if (!WR_TOKEN && !WR_FIXTURE) return;
       const _fetch = window.fetch;
       window.fetch = function (input, init) {
         try {
           let url = (typeof input === "string") ? input : (input && input.url);
           if (url) {
             const u = new URL(url, window.location.origin);
-            if (u.origin === window.location.origin && !u.searchParams.has("token")) {
-              u.searchParams.set("token", WR_TOKEN);
-              input = (typeof input === "string") ? u.toString() : new Request(u.toString(), input);
+            if (u.origin === window.location.origin) {
+              let changed = false;
+              if (WR_TOKEN && !u.searchParams.has("token")) { u.searchParams.set("token", WR_TOKEN); changed = true; }
+              if (WR_FIXTURE && u.pathname.startsWith("/api/") && !u.searchParams.has("fixture")) { u.searchParams.set("fixture", "1"); changed = true; }
+              if (changed) input = (typeof input === "string") ? u.toString() : new Request(u.toString(), input);
             }
           }
         } catch (_) {}

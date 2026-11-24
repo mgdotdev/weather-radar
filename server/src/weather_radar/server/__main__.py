@@ -113,6 +113,12 @@ def server():
 
     server = FastAPI()
 
+    # Sample data for the Home Assistant preview pages (`fixture=1`). Installed
+    # BEFORE access control: the last middleware added is the outermost, so the
+    # token check wraps it and sample data is never served without one.
+    from weather_radar.server import fixtures
+    fixtures.install(server)
+
     _install_access_control(server)
 
     # The app is always token-gated. Warn loudly if NOTHING can bootstrap it —

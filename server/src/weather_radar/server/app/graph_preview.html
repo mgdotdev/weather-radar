@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Home Assistant preview — graph</title>
+<style>
+{{ core_css }}
+  #curves .curve { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<div id="side">
+  <h1>Home Assistant preview</h1>
+  <div style="margin-bottom:8px"><a class="nav" href="/ha-preview/">Map</a><a class="nav here" href="/graph-preview/">Graph</a></div>
+  <label class="full">Paste a graph URL to start from
+    <div style="display:flex; gap:6px;">
+      <input id="importUrl" type="text" spellcheck="false" style="flex:1" placeholder="…/graph/?models=…&amp;lat=…&amp;lon=…">
+      <button id="importBtn" class="alt">Load</button>
+    </div>
+  </label>
+
+  <details open><summary>Curves</summary><div class="grp">
+    <div id="curves" class="full"></div>
+    <div class="full"><button id="addCurve" class="alt">+ Add curve</button></div>
+    <div class="hint full">One line per forecast layer, plotted together at the point below.</div>
+  </div></details>
+
+  <details open><summary>Point &amp; time</summary><div class="grp">
+    <label>Latitude <input id="lat" type="number" step="0.0001"></label>
+    <label>Longitude <input id="lon" type="number" step="0.0001"></label>
+    <label class="full">Time step between points <select id="dt"></select></label>
+  </div></details>
+
+  <details open><summary>Look</summary><div class="grp">
+    <label class="row full"><input id="ha" type="checkbox"> Compact Home Assistant layout (<code>ha=true</code>)</label>
+    <label class="row full"><input id="dark" type="checkbox"> Dark mode</label>
+    <div class="hint full">The compact layout uses a smaller font, a horizontal legend under the title and less top margin — made for a card.</div>
+  </div></details>
+
+  <details open><summary>Title</summary><div class="grp">
+    <label class="full">Title text <input id="title" type="text" placeholder="Untitled graph (click the title to edit it in the preview, too)"></label>
+    <label>X (px) <input id="titleX" type="number" placeholder="default"></label>
+    <label>Y (px) <input id="titleY" type="number" placeholder="default"></label>
+    <label class="full">Font size (px) <input id="titleSize" type="number" min="10" max="96" placeholder="20"></label>
+    <div class="hint full">Click, drag or resize the title inside the preview with "follow" on and these update.</div>
+  </div></details>
+
+  <details><summary>Advanced</summary><div class="grp">
+    <label class="full">Data points to read (<code>counts</code>) <input id="counts" type="number" step="1"></label>
+    <div class="hint full">-1 = all. Only the JSON gridpoints source uses it.</div>
+    <label class="full">Other parameters, kept as-is (read-only)<textarea id="extra" rows="2" readonly></textarea></label>
+  </div></details>
+</div>
+
+{{ main_html }}
+
+<script>
+{{ core_js }}
+</script>
+<script>
+(function () {
+  const BOOT = {{ boot_json }}
+  const $ = (id) => document.getElementById(id)
+  let api = null     // set by wire(); read the CURRENT state via api.state
+
+  // ---- state -------------------------------------------------------------
+  // The state is the graph page's URL, parsed. `extra` keeps any parameter this
+  // page has no control for, so editing never drops it.
+  const KNOWN = ["models", "lat", "lon", "dt", "counts", "ha", "dark_mode",
+                 "title", "titleX", "titleY", "titleSize", "token"]
+  const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : null }
+  const trim = (n, d) => String(+n.toFixed(d))
+  const FALSE = ["false", "0", "no", "off"]
+
+  function defaultState() {
+    const d = BOOT.defaults
+    return { curves: [{ kind: BOOT.defaultCurve.kind, attr: BOOT.defaultCurve.attribute }],
+             lat: d.lat, lon: d.lon, dt: d.dt, counts: d.counts, ha: false, dark: true,
+             title: "", titleX: null, titleY: null, titleSize: null, extra: {} }
+  }
+
+  function fromUrl(raw) {
+    let u
+    try { u = new URL(raw, window.location.origin) } catch (_) { return null }
+    if (!/\/graph\//.test(u.pathname)) return null
+    const S = defaultState(), q = u.searchParams
+    let models = {}
+    try { models = JSON.parse(q.get("models") || "{}") } catch (_) {}
+    S.curves = []
+    if (models && typeof models === "object") {
+      for (const [kind, attrs] of Object.entries(models)) {
+        for (const attr of (Array.isArray(attrs) ? attrs : [])) S.curves.push({ kind, attr: String(attr) })
+      }
+    }
+    for (const k of ["lat", "lon", "dt", "counts", "titleX", "titleY", "titleSize"]) {
+      const v = num(q.get(k)); if (v !== null) S[k] = v
+    }
+    S.ha = (q.get("ha") || "").toLowerCase() === "true" || q.get("ha") === "1"
+    S.dark = !FALSE.includes((q.get("dark_mode") || "").toLowerCase())
+    S.title = q.get("title") || ""
+    for (const [k, v] of q.entries()) if (!KNOWN.includes(k)) S.extra[k] = v
+    return S
+  }
+
+  // Build the graph URL (path + query) from state, omitting values the route
+  // defaults anyway. `models` groups curves by kind: {"observation":["temperature"],…}.
+  function toRelative(S, token) {
+    const u = new URL("/graph/", window.location.origin)
+    const q = u.searchParams
+    const models = {}
+    for (const c of S.curves) (models[c.kind] = models[c.kind] || []).push(c.attr)
+    q.set("models", JSON.stringify(models))
+    q.set("lat", trim(S.lat, 6)); q.set("lon", trim(S.lon, 6))
+    if (Math.round(S.dt) !== BOOT.defaults.dt) q.set("dt", String(Math.round(S.dt)))
+    if (Math.round(S.counts) !== BOOT.defaults.counts) q.set("counts", String(Math.round(S.counts)))
+    if (S.ha) q.set("ha", "true")
+    if (!S.dark) q.set("dark_mode", "false")
+    if (S.title) q.set("title", S.title)
+    if (S.titleX !== null) q.set("titleX", String(Math.round(S.titleX)))
+    if (S.titleY !== null) q.set("titleY", String(Math.round(S.titleY)))
+    if (S.titleSize !== null) q.set("titleSize", String(Math.round(S.titleSize)))
+    for (const [k, v] of Object.entries(S.extra)) q.set(k, v)
+    if (token) q.set("token", token)
+    return u.pathname + u.search
+  }
+
+  // ---- controls <-> state ------------------------------------------------
+  const OPTIONAL = ["titleX", "titleY", "titleSize"]
+  const key = (c) => `${c.kind}|${c.attr}`
+
+  function ensureOption(select, value, label) {
+    if ([...select.options].some((o) => o.value === value)) return
+    const o = document.createElement("option"); o.value = value; o.textContent = label; select.appendChild(o)
+  }
+
+  function renderControls(S, skipFocused) {
+    const set = (id, v) => { const el = $(id); if (skipFocused && el === document.activeElement) return
+                             el.value = v === null || v === undefined ? "" : v }
+    set("lat", S.lat); set("lon", S.lon); set("counts", S.counts); set("title", S.title)
+    for (const k of OPTIONAL) set(k, S[k])
+    ensureOption($("dt"), String(S.dt), `${S.dt} s`)
+    set("dt", String(S.dt))
+    $("ha").checked = S.ha; $("dark").checked = S.dark
+    $("extra").value = Object.entries(S.extra).map(([k, v]) => `${k}=${v}`).join("\n")
+    renderCurves(S, skipFocused)
+  }
+
+  function renderCurves(S, skipFocused) {
+    const box = $("curves")
+    if (skipFocused && box.contains(document.activeElement)) return
+    box.innerHTML = ""
+    S.curves.forEach((c, i) => {
+      const row = document.createElement("div"); row.className = "curve"
+      row.innerHTML = '<select class="sel"></select><button class="x" title="Remove curve">×</button>'
+      const sel = row.querySelector(".sel")
+      for (const e of BOOT.catalog) { const o = document.createElement("option"); o.value = e.value; o.textContent = e.label; sel.appendChild(o) }
+      ensureOption(sel, key(c), `${c.kind} / ${c.attr}`)
+      sel.value = key(c)
+      sel.addEventListener("change", () => {
+        const cur = api.state.curves[i]
+        if (!cur) return
+        const [kind, ...rest] = sel.value.split("|")
+        cur.kind = kind; cur.attr = rest.join("|")
+        api.changed(true)
+      })
+      row.querySelector(".x").addEventListener("click", () => {
+        api.state.curves.splice(i, 1)
+        api.render(false); api.changed(true)
+      })
+      box.appendChild(row)
+    })
+    if (!S.curves.length) box.innerHTML = '<div class="hint">No curves — the graph will be empty. Add one.</div>'
+  }
+
+  function readControls(S) {
+    const lat = num($("lat").value), lon = num($("lon").value), counts = num($("counts").value)
+    if (lat !== null) S.lat = lat
+    if (lon !== null) S.lon = lon
+    if (counts !== null) S.counts = counts
+    const dt = parseInt($("dt").value, 10); if (Number.isFinite(dt)) S.dt = dt
+    S.title = $("title").value
+    for (const k of OPTIONAL) S[k] = num($(k).value)
+    S.ha = $("ha").checked; S.dark = $("dark").checked
+  }
+
+  function wire(a) {
+    api = a
+    $("addCurve").addEventListener("click", () => {
+      const S = api.state
+      const have = new Set(S.curves.map(key))
+      const next = BOOT.catalog.find((e) => !have.has(e.value)) || BOOT.catalog[0]
+      const [kind, ...rest] = next.value.split("|")
+      S.curves.push({ kind, attr: rest.join("|") })
+      api.render(false); api.changed(true)
+    })
+  }
+
+  // ---- startup -------------------------------------------------------------
+  const dtSel = $("dt")
+  for (const d of BOOT.dts) { const o = document.createElement("option"); o.value = String(d.value); o.textContent = d.label; dtSel.appendChild(o) }
+
+  WRPreview.start({
+    hook: "__graphPreview",
+    pathRe: /\/graph\//,
+    controlIds: ["lat", "lon", "counts", "dt", "ha", "dark", "title", "titleX", "titleY", "titleSize"],
+    defaultState, fromUrl, toRelative, renderControls, readControls, wire,
+  })
+})()
+</script>
+</body>
+</html>

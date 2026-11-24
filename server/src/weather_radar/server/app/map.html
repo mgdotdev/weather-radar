@@ -56,8 +56,8 @@
         <span id="legendMid"></span>
         <span id="legendMax"></span>
       </div>
-      <!-- Tabbed controls: "Controls" (playback/time/contour) and "Settings"
-           (pin size, and room for future options). The color scale above is
+      <!-- Tabbed controls: "Controls" (play/scrubber and the contour interval) and
+           "Settings" (playback speed, time step, pin/legend size, and the toggles). The color scale above is
            always visible; only these panels switch. -->
       <div style="margin-top:8px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12);">
         <div style="display:flex; gap:4px; margin-bottom:6px;">
@@ -70,6 +70,7 @@
           <!-- Play/Pause sits beside a custom range scrubber: two bar handles
                set the playback window [start, end] and a circle is the current
                time (constrained between the bars). All three are draggable. -->
+          <div id="scrubberBlock">
           <div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
             <button id="playPause" title="Pause / Play" style="cursor:pointer; flex:0 0 auto; height:24px; width:28px;
               display:inline-flex; align-items:center; justify-content:center; box-sizing:border-box;
@@ -89,6 +90,18 @@
           <div id="timeSliderLabel" style="font-size:13px; color:#333; text-align:center;
             margin-bottom:6px; font-variant-numeric:tabular-nums; font-weight:600;
             white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">—</div>
+          </div><!-- /scrubberBlock -->
+          <div style="display:grid; grid-template-columns:1fr 22px 52px 22px; align-items:center;
+              column-gap:6px; row-gap:6px;">
+            <span id="contourRowLabel" style="font-size:11px; color:#555;">Contour</span>
+            <button id="stepDown" title="Finer contours" class="ctlbtn">−</button>
+            <span id="stepLabel" class="ctlval">1°</span>
+            <button id="stepUp" title="Coarser contours" class="ctlbtn">+</button>
+          </div>
+        </div>
+
+        <!-- Settings panel (hidden until its tab is selected) -->
+        <div id="panelSettings" style="display:none;">
           <div style="display:grid; grid-template-columns:1fr 22px 52px 22px; align-items:center;
               column-gap:6px; row-gap:6px;">
             <span style="font-size:11px; color:#555;">Speed</span>
@@ -101,26 +114,15 @@
             <span id="dtLabel" class="ctlval">1h</span>
             <button id="dtUp" title="Larger time step" class="ctlbtn">+</button>
 
-            <span id="contourRowLabel" style="font-size:11px; color:#555;">Contour</span>
-            <button id="stepDown" title="Finer contours" class="ctlbtn">−</button>
-            <span id="stepLabel" class="ctlval">1°</span>
-            <button id="stepUp" title="Coarser contours" class="ctlbtn">+</button>
-          </div>
-        </div>
-
-        <!-- Settings panel (hidden until its tab is selected) -->
-        <div id="panelSettings" style="display:none;">
-          <div style="display:grid; grid-template-columns:1fr 22px 52px 22px; align-items:center;
-              column-gap:6px; row-gap:6px;">
             <span style="font-size:11px; color:#555;">Pin size</span>
-            <button id="pinSizeDown" title="Smaller pins" class="ctlbtn">−</button>
+            <button id="pinSizeDown" title="Smaller pins (hold to repeat; Shift for bigger steps)" class="ctlbtn">−</button>
             <span id="pinSizeLabel" class="ctlval">1.00×</span>
-            <button id="pinSizeUp" title="Larger pins" class="ctlbtn">+</button>
+            <button id="pinSizeUp" title="Larger pins (hold to repeat; Shift for bigger steps)" class="ctlbtn">+</button>
 
             <span style="font-size:11px; color:#555;">Legend size</span>
-            <button id="legendSizeDown" title="Smaller legend" class="ctlbtn">−</button>
+            <button id="legendSizeDown" title="Smaller legend (hold to repeat; Shift for bigger steps)" class="ctlbtn">−</button>
             <span id="legendSizeLabel" class="ctlval">1.00×</span>
-            <button id="legendSizeUp" title="Larger legend" class="ctlbtn">+</button>
+            <button id="legendSizeUp" title="Larger legend (hold to repeat; Shift for bigger steps)" class="ctlbtn">+</button>
           </div>
           <label style="display:flex; align-items:center; margin-top:8px;
               font-size:11px; color:#555; cursor:pointer;">
@@ -136,6 +138,25 @@
           </label>
           <label style="display:flex; align-items:center; margin-top:8px;
               font-size:11px; color:#555; cursor:pointer;">
+            <span>Floating scrub bar</span>
+            <input type="checkbox" id="floatScrubber"
+              style="cursor:pointer; margin:0 0 0 auto; width:22px; height:22px;">
+          </label>
+          <label style="display:flex; align-items:center; margin-top:8px;
+              font-size:11px; color:#555; cursor:pointer;">
+            <span>Show scale bar</span>
+            <input type="checkbox" id="showScaleBar" checked
+              style="cursor:pointer; margin:0 0 0 auto; width:22px; height:22px;">
+          </label>
+          <label style="display:flex; align-items:center; margin-top:8px;
+              font-size:11px; color:#555; cursor:pointer;"
+              title="The basemap's required credit (OpenStreetMap contributors, CARTO)">
+            <span>Show map credits (&copy;)</span>
+            <input type="checkbox" id="showAttribution"
+              style="cursor:pointer; margin:0 0 0 auto; width:22px; height:22px;">
+          </label>
+          <label style="display:flex; align-items:center; margin-top:8px;
+              font-size:11px; color:#555; cursor:pointer;">
             <span>Lock legend &amp; pins</span>
             <input type="checkbox" id="lockLayout"
               style="cursor:pointer; margin:0 0 0 auto; width:22px; height:22px;">
@@ -143,6 +164,16 @@
         </div>
       </div>
     </div>
+
+    <!-- Floating scrub bar: the legend's play button + scrubber + time label are MOVED
+         here (and back) by the "Floating scrub bar" setting (?floatScrubber=1). It sits
+         at the bottom-center of the map, outside the legend, so it is never scaled by
+         the legend size. -->
+    <div id="scrubberFloatBar" style="position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%);
+        z-index: 100; display: none; width: min(760px, calc(100vw - 32px)); box-sizing: border-box;
+        padding: 8px 12px 6px; background: rgba(255,255,255,0.85); border-radius: 6px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-family: sans-serif; font-size: 12px;
+        color: #222; user-select: none;"></div>
 
     <!-- Cursor readout: follows the pointer with the interpolated value. -->
     <div id="cursorReadout" style="position: fixed; z-index: 101; display: none;
@@ -264,25 +295,30 @@
     // same-origin requests that don't already specify one. A no-op when no
     // token is present (open/dev deployments).
     (function () {
-      const WR_TOKEN = new URL(window.location.href).searchParams.get("token");
-      if (!WR_TOKEN) return;
+      const sp = new URL(window.location.href).searchParams;
+      const WR_TOKEN = sp.get("token");
+      // ?fixture=1 (the Home Assistant preview pages): ask the API for canned SAMPLE data
+      // instead of running the real pipeline. Only /api/ calls are affected.
+      const WR_FIXTURE = sp.get("fixture") === "1";
+      if (!WR_TOKEN && !WR_FIXTURE) return;
       const _fetch = window.fetch;
       window.fetch = function (input, init) {
         try {
           let url = (typeof input === "string") ? input : (input && input.url);
           if (url) {
             const u = new URL(url, window.location.origin);
-            if (u.origin === window.location.origin && !u.searchParams.has("token")) {
-              u.searchParams.set("token", WR_TOKEN);
-              if (typeof input === "string") input = u.toString();
-              else input = new Request(u.toString(), input);
+            if (u.origin === window.location.origin) {
+              let changed = false;
+              if (WR_TOKEN && !u.searchParams.has("token")) { u.searchParams.set("token", WR_TOKEN); changed = true; }
+              if (WR_FIXTURE && u.pathname.startsWith("/api/") && !u.searchParams.has("fixture")) { u.searchParams.set("fixture", "1"); changed = true; }
+              if (changed) input = (typeof input === "string") ? u.toString() : new Request(u.toString(), input);
             }
           }
         } catch (_) {}
         return _fetch.call(this, input, init);
       };
       // Expose for any code that builds URLs for window.open / new tabs.
-      window.WR_TOKEN = WR_TOKEN;
+      if (WR_TOKEN) window.WR_TOKEN = WR_TOKEN;
     })();
 
     // ---- Config (from the server) ------------------------------------------
@@ -337,8 +373,8 @@
     let switchModel = async (newModel) => {
       const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
       for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
-                       "from", "to", "t", "pins", "pinBoxes", "pinSize",
-                       "legendSize", "legendLat", "legendLon", "areaBox", "cursorBox", "locked"]) {
+                       "mapLat", "mapLon", "from", "to", "t", "pins", "pinBoxes", "pinSize",
+                       "legendSize", "legendLat", "legendLon", "areaBox", "cursorBox", "scaleBar", "floatScrubber", "attribution", "locked"]) {
         const v = new URL(window.location.href).searchParams.get(k)
         if (v !== null) u.searchParams.set(k, v)
       }
@@ -444,20 +480,100 @@
       return dists[dists.length >> 1]   // median nearest-neighbor distance
     }
 
-    const initialZoom = parseFloat(new URL(window.location.href).searchParams.get("zoom")) || 7.65
+    const DEFAULT_ZOOM = 7.65     // used when ?zoom is absent (there is no fit-to-area)
+    const initialZoom = parseFloat(new URL(window.location.href).searchParams.get("zoom")) || DEFAULT_ZOOM
+
+    // The VIEW center (where the map is looking) is separate from the data AREA's
+    // center (`lat`/`lon`, which decides what is fetched and is only changed by
+    // capture/recenter). `mapLat`/`mapLon` set it, default to the area center, and
+    // are kept current as the map moves (see persistViewCenter below). Values outside
+    // the valid range are ignored: MapLibre throws on an invalid LngLat.
+    const initialCenter = (() => {
+      const sp = new URL(window.location.href).searchParams
+      const la = parseFloat(sp.get("mapLat")), lo = parseFloat(sp.get("mapLon"))
+      // Both given and valid -> use them. Only one given -> it overrides just that axis.
+      const vla = Number.isFinite(la) && Math.abs(la) <= 90 ? la : lat
+      const vlo = Number.isFinite(lo) && Math.abs(lo) <= 180 ? lo : lon
+      return [vlo, vla]
+    })()
 
     const map = new maplibregl.Map({
       container: "weatherRadar",
       style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
-      center: [lon, lat],
+      center: initialCenter,
       zoom: initialZoom,
+      // The basemap credit button is OFF by default (see "Show map credits" in
+      // Settings / ?attribution=1, applyAttribution below).
+      attributionControl: false,
     })
 
-    // Distance scale bar (bottom-left; bottom-right holds the basemap
-    // attribution, top-left holds the legend). Metric units; `maxWidth` is the
+    // Distance scale bar (top-right; the legend is top-left and the bottom edge
+    // is left free for the floating scrub bar). Metric units; `maxWidth` is the
     // bar's max pixel length, which MapLibre rounds to a nice round distance
     // for the current zoom/latitude (e.g. 1 km, 500 m).
-    map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "bottom-left")
+    // Shown by default; Settings > "Show scale bar" (?scaleBar=0 hides it).
+    let showScaleBar = new URL(window.location.href).searchParams.get("scaleBar") !== "0"
+    let scaleCtrl = null
+    function applyScaleBar() {
+      if (showScaleBar && !scaleCtrl) {
+        scaleCtrl = new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" })
+        map.addControl(scaleCtrl, "top-right")
+      } else if (!showScaleBar && scaleCtrl) {
+        map.removeControl(scaleCtrl)
+        scaleCtrl = null
+      }
+    }
+    function setShowScaleBar(on) {
+      showScaleBar = !!on
+      const u = new URL(window.location.href)
+      if (showScaleBar) u.searchParams.delete("scaleBar")
+      else u.searchParams.set("scaleBar", "0")
+      history.replaceState(null, "", u.toString())
+      applyScaleBar()
+    }
+    applyScaleBar()
+
+    // Basemap credit ((i) button, bottom-right). The basemap is CARTO Positron on
+    // OpenStreetMap data, whose terms ask for visible credit — so it is hidden by
+    // default but one click away: Settings > "Show map credits" (?attribution=1).
+    let showAttribution = new URL(window.location.href).searchParams.get("attribution") === "1"
+    let attributionCtrl = null
+    function applyAttribution() {
+      if (showAttribution && !attributionCtrl) {
+        attributionCtrl = new maplibregl.AttributionControl({ compact: true })
+        map.addControl(attributionCtrl, "bottom-right")
+        // Start collapsed (just the button). The control is an empty <details>
+        // that MapLibre fills with the credit text — and OPENS itself — only once
+        // the basemap style's sources have loaded, so collapse it the first time
+        // it opens (what a click does: drop `open` + `maplibregl-compact-show`),
+        // then stop watching so the user's own expand/collapse is left alone.
+        const el = document.querySelector(".maplibregl-ctrl-attrib")
+        if (el) {
+          const collapse = () => {
+            el.removeAttribute("open"); el.classList.remove("maplibregl-compact-show")
+          }
+          if (el.hasAttribute("open")) collapse()
+          else {
+            const mo = new MutationObserver(() => {
+              if (el.hasAttribute("open")) { collapse(); mo.disconnect() }
+            })
+            mo.observe(el, { attributes: true, attributeFilter: ["open"] })
+          }
+        }
+      } else if (!showAttribution && attributionCtrl) {
+        map.removeControl(attributionCtrl)
+        attributionCtrl = null
+      }
+    }
+    function setShowAttribution(on) {
+      showAttribution = !!on
+      const u = new URL(window.location.href)
+      if (showAttribution) u.searchParams.set("attribution", "1")
+      else u.searchParams.delete("attribution")
+      history.replaceState(null, "", u.toString())
+      applyAttribution()
+    }
+    applyAttribution()
 
     // Keep the loading spinner pinned over the area center as the map moves.
     map.on("move", () => positionSpinnerOverArea())
@@ -1018,6 +1134,21 @@
       refreshCursorBox()
     }
 
+    // Whether the scrub bar floats at the bottom of the map instead of sitting in
+    // the legend. Persisted in the URL (`floatScrubber=1`; docked by default).
+    let floatScrubber =
+      new URL(window.location.href).searchParams.get("floatScrubber") === "1"
+    // Assigned inside map.on("load") (where the scrubber lives), like switchModel.
+    let refreshFloatScrubber = () => {}
+    function setFloatScrubber(on) {
+      floatScrubber = !!on
+      const u = new URL(window.location.href)
+      if (floatScrubber) u.searchParams.set("floatScrubber", "1")
+      else u.searchParams.delete("floatScrubber")
+      history.replaceState(null, "", u.toString())
+      refreshFloatScrubber()
+    }
+
     // Where the cursor box goes: just below-right of the pointer, flipping to the
     // other side when it would run off the viewport (a pinSize-scaled box is
     // big), and never above/left of the viewport. w/h are the box's ON-SCREEN
@@ -1164,6 +1295,29 @@
         history.replaceState(null, "", u.toString())
       })
 
+      // Keep the VIEW center (`mapLat`/`mapLon`) in the URL as the map moves: while
+      // you drag it is written at most every 200 ms, and exactly once more when the
+      // movement settles. When the view sits on the area's own center the params are
+      // simply removed (they would say nothing the lat/lon don't already).
+      function persistViewCenter() {
+        const c = map.getCenter()
+        const u = new URL(window.location.href)
+        if (Math.abs(c.lat - lat) < 1e-5 && Math.abs(c.lng - lon) < 1e-5) {
+          u.searchParams.delete("mapLat"); u.searchParams.delete("mapLon")
+        } else {
+          u.searchParams.set("mapLat", c.lat.toFixed(5)); u.searchParams.set("mapLon", c.lng.toFixed(5))
+        }
+        history.replaceState(null, "", u.toString())
+      }
+      let viewPersistTimer = null
+      map.on("move", () => {
+        if (!viewPersistTimer) viewPersistTimer = setTimeout(() => { viewPersistTimer = null; persistViewCenter() }, 200)
+      })
+      map.on("moveend", () => {
+        clearTimeout(viewPersistTimer); viewPersistTimer = null
+        persistViewCenter()
+      })
+
       // ---- Dropped pins -----------------------------------------------------
       // Persistent labels at fixed lat/lon showing the interpolated value,
       // updated each frame and repositioned on map move. Persisted in the URL
@@ -1197,7 +1351,8 @@
       // sizes are the elements' fixed CSS (see addPin); the transform scales
       // everything — text, padding, border, shadow — uniformly, so the info
       // box stays proportional and never crowds.
-      const PIN_SIZE_MIN = 0.5, PIN_SIZE_MAX = 3.0, PIN_SIZE_STEP = 0.25
+      // Fine step for the +/- buttons; Shift+click moves by the COARSE step.
+      const PIN_SIZE_MIN = 0.5, PIN_SIZE_MAX = 3.0, PIN_SIZE_STEP = 0.05, PIN_SIZE_COARSE = 0.25
       let pinSize = (() => {
         const v = parseFloat(new URL(window.location.href).searchParams.get("pinSize"))
         return Number.isFinite(v) ? Math.max(PIN_SIZE_MIN, Math.min(v, PIN_SIZE_MAX)) : 1.0
@@ -1233,7 +1388,7 @@
       function setPinSize(scale) {
         // Snap to the step grid so repeated +/- can't accumulate float drift
         // (e.g. 0.7500000001), and clamp to range.
-        const snapped = Math.round(scale / PIN_SIZE_STEP) * PIN_SIZE_STEP
+        const snapped = +(Math.round(scale / PIN_SIZE_STEP) * PIN_SIZE_STEP).toFixed(2)   // on the grid, no float noise
         pinSize = Math.max(PIN_SIZE_MIN, Math.min(snapped, PIN_SIZE_MAX))
         const u = new URL(window.location.href)
         if (Math.abs(pinSize - 1.0) < 1e-9) u.searchParams.delete("pinSize")
@@ -1247,7 +1402,7 @@
       // persisted in the URL (`legendSize=`). Scales from the panel's TOP-LEFT
       // corner (transform-origin 0 0) so its anchored position (style.left/top,
       // set by the drag handler) doesn't drift as it grows/shrinks.
-      const LEGEND_SIZE_MIN = 0.5, LEGEND_SIZE_MAX = 3.0, LEGEND_SIZE_STEP = 0.25
+      const LEGEND_SIZE_MIN = 0.5, LEGEND_SIZE_MAX = 3.0, LEGEND_SIZE_STEP = 0.05, LEGEND_SIZE_COARSE = 0.25
       let legendSize = (() => {
         const v = parseFloat(new URL(window.location.href).searchParams.get("legendSize"))
         return Number.isFinite(v) ? Math.max(LEGEND_SIZE_MIN, Math.min(v, LEGEND_SIZE_MAX)) : 1.0
@@ -1273,7 +1428,7 @@
       }
       function setLegendSize(scale) {
         // Snap to the step grid (avoids float drift) and clamp to range.
-        const snapped = Math.round(scale / LEGEND_SIZE_STEP) * LEGEND_SIZE_STEP
+        const snapped = +(Math.round(scale / LEGEND_SIZE_STEP) * LEGEND_SIZE_STEP).toFixed(2)
         legendSize = Math.max(LEGEND_SIZE_MIN, Math.min(snapped, LEGEND_SIZE_MAX))
         const u = new URL(window.location.href)
         if (Math.abs(legendSize - 1.0) < 1e-9) u.searchParams.delete("legendSize")
@@ -1452,8 +1607,13 @@
           input.style.cssText = "display:block; width:100%; box-sizing:border-box;" +
             "font:inherit; font-weight:600; color:#222; border:none;" +
             "border-radius:3px; padding:0 3px;"
+          // Replacing the (focused) input fires `blur` SYNCHRONOUSLY, i.e. re-enters
+          // commit mid-replace — a parentNode check can't guard that (the nested
+          // replaceChild throws), and an Escape would then be "saved" by the blur.
+          let done = false
           const commit = (save) => {
-            if (input.parentNode !== info) return
+            if (done || input.parentNode !== info) return
+            done = true
             if (save) {
               const v = input.value.trim()
               if (v) { pin.name = v; nameEl.textContent = v; serializePins() }
@@ -1987,6 +2147,7 @@
         u.searchParams.set("lat", glat.toFixed(6))
         u.searchParams.set("lon", glon.toFixed(6))
         if (window.WR_TOKEN) u.searchParams.set("token", window.WR_TOKEN)
+        if (new URL(window.location.href).searchParams.get("fixture") === "1") u.searchParams.set("fixture", "1")
         window.open(u.toString(), "_blank")
       }
       document.getElementById("ctxSeeGraph").addEventListener("click", () => {
@@ -2004,6 +2165,7 @@
         u.searchParams.set("lon", glon.toFixed(6))
         if (name) u.searchParams.set("name", name)
         if (window.WR_TOKEN) u.searchParams.set("token", window.WR_TOKEN)
+        if (new URL(window.location.href).searchParams.get("fixture") === "1") u.searchParams.set("fixture", "1")
         window.open(u.toString(), "_blank")
       }
       document.getElementById("ctxForecast").addEventListener("click", () => {
@@ -2283,8 +2445,8 @@
           console.error("model switch config fetch failed; reloading:", err)
           const u = new URL(`/map/models/${encodeURIComponent(newModel)}/`, window.location.origin)
           for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed",
-                           "pins", "pinBoxes", "pinSize", "legendSize",
-                           "legendLat", "legendLon", "areaBox", "cursorBox", "locked"]) {
+                           "mapLat", "mapLon", "pins", "pinBoxes", "pinSize", "legendSize",
+                           "legendLat", "legendLon", "areaBox", "cursorBox", "scaleBar", "floatScrubber", "attribution", "locked"]) {
             const v = new URL(window.location.href).searchParams.get(k)
             if (v !== null) u.searchParams.set(k, v)
           }
@@ -3359,19 +3521,21 @@
         }
       }
 
-      // The legend's CSS transform:scale (the legend-size control). Everything
-      // measured with getBoundingClientRect()/clientX is in ON-SCREEN pixels,
-      // which include this scale; the scrubber's SVG is drawn in its own
-      // UNSCALED user units (the transform scales those on screen). Any
-      // conversion between the two must divide/multiply by this.
-      function legendScale() {
+      // The CSS scale the scrubber is drawn under. Docked, it lives inside the
+      // legend and is scaled by the legend-size control; floating, it sits OUTSIDE
+      // the legend, so nothing scales it. Everything measured with
+      // getBoundingClientRect()/clientX is in ON-SCREEN pixels, which include
+      // this scale, while the scrubber's SVG is drawn in its own UNSCALED user
+      // units — any conversion between the two must divide/multiply by this.
+      function scrubberScale() {
+        if (floatScrubber) return 1
         return (typeof legendSize === "number" && legendSize > 0) ? legendSize : 1
       }
       function scWidth() {
         // The on-screen width includes the legend scale; divide it back out to
         // recover the unscaled width, otherwise the scale is applied twice and
         // the playhead/handles slide past the right edge of the box.
-        const w = (scrubberEl.getBoundingClientRect().width / legendScale()) || 200
+        const w = (scrubberEl.getBoundingClientRect().width / scrubberScale()) || 200
         return Math.max(1, w - 2 * SC_PAD)
       }
       // epoch (within forecast range) -> x pixel, and inverse.
@@ -3479,7 +3643,7 @@
         // unscaled units (the same ones the handles are drawn in), so undo the
         // legend scale. Without this the handle drifts away from the cursor at
         // any legend size other than 1.00x.
-        return xToEpoch((evt.clientX - rect.left) / legendScale())
+        return xToEpoch((evt.clientX - rect.left) / scrubberScale())
       }
       function beginDrag(which, evt) {
         if (!scrubberReady) return
@@ -3559,6 +3723,86 @@
       // placeholder so the bookends/playhead aren't stacked at the left edge.
       renderScrubberPlaceholder()
 
+      // Floating scrub bar: move the play button + scrubber + time label between
+      // the legend's Controls panel and the floating bar at the bottom of the map.
+      // The elements are MOVED (not copied), so every listener and the scrubber's
+      // state go with them; only the geometry changes, so redraw afterwards.
+      function applyFloatScrubber() {
+        const block = document.getElementById("scrubberBlock")
+        const bar = document.getElementById("scrubberFloatBar")
+        const panel = document.getElementById("panelControls")
+        if (!block || !bar || !panel) return
+        if (floatScrubber) {
+          if (block.parentNode !== bar) bar.appendChild(block)
+          bar.style.display = "block"
+        } else {
+          if (block.parentNode !== panel) panel.insertBefore(block, panel.firstElementChild)
+          bar.style.display = "none"
+        }
+        const cb = document.getElementById("floatScrubber")
+        if (cb) cb.checked = floatScrubber
+        if (scrubberReady) renderScrubber(); else renderScrubberPlaceholder()
+      }
+      refreshFloatScrubber = applyFloatScrubber
+      applyFloatScrubber()
+
+      // Live display settings, for the Home Assistant preview (/ha-preview/): these
+      // purely visual options can be changed IN PLACE, with no reload and no data
+      // fetch. Each is exactly what the Settings control does (it updates the
+      // URL, too), plus keeping that control's checkbox in step.
+      const checkbox = (id, on) => { const cb = document.getElementById(id); if (cb) cb.checked = !!on }
+      window.WRLive = {
+        pinSize: (v) => setPinSize(v),
+        legendSize: (v) => setLegendSize(v),
+        locked: (on) => { checkbox("lockLayout", on); setLockLayout(on) },
+        cursorBox: (on) => { checkbox("showCursorBox", on); setShowCursorBox(on) },
+        areaBox: (on) => { checkbox("showAreaBox", on); setShowAreaBox(on) },
+        floatScrubber: (on) => { checkbox("floatScrubber", on); setFloatScrubber(on) },
+        attribution: (on) => { checkbox("showAttribution", on); setShowAttribution(on) },
+        scaleBar: (on) => { checkbox("showScaleBar", on); setShowScaleBar(on) },
+        // Move the view (not the data area) — what ?mapLat/?mapLon describe. Ignores
+        // an invalid point; the move itself updates the URL (see persistViewCenter).
+        center: (la, lo) => {
+          if (Number.isFinite(la) && Number.isFinite(lo) && Math.abs(la) <= 90 && Math.abs(lo) <= 180) {
+            map.jumpTo({ center: [lo, la] })
+          }
+        },
+        // Zoom the view in place — what ?zoom describes. null/blank means "the default"
+        // (the URL parameter is removed, as if it had never been set). Out-of-range or
+        // non-numeric values are ignored. The zoom itself updates the URL (zoomend).
+        zoom: (z) => {
+          if (z === null || z === undefined || z === "") {
+            map.jumpTo({ zoom: DEFAULT_ZOOM })
+            const u = new URL(window.location.href); u.searchParams.delete("zoom")
+            history.replaceState(null, "", u.toString())
+          } else if (Number.isFinite(z) && z >= 0 && z <= 22) {
+            map.jumpTo({ zoom: z })
+          }
+        },
+        // Where the map is looking right now (for tools and tests).
+        view: () => { const c = map.getCenter(); return { lat: c.lat, lon: c.lng, zoom: map.getZoom() } },
+      }
+      ;(function setupScaleBarToggle() {
+        const cb = document.getElementById("showScaleBar")
+        if (!cb) return
+        cb.checked = showScaleBar
+        cb.addEventListener("pointerdown", (e) => e.stopPropagation())
+        cb.addEventListener("change", (e) => { e.stopPropagation(); setShowScaleBar(cb.checked) })
+      })()
+      ;(function setupAttributionToggle() {
+        const cb = document.getElementById("showAttribution")
+        if (!cb) return
+        cb.checked = showAttribution
+        cb.addEventListener("pointerdown", (e) => e.stopPropagation())
+        cb.addEventListener("change", (e) => { e.stopPropagation(); setShowAttribution(cb.checked) })
+      })()
+      ;(function setupFloatScrubberToggle() {
+        const cb = document.getElementById("floatScrubber")
+        if (!cb) return
+        cb.addEventListener("pointerdown", (e) => e.stopPropagation())
+        cb.addEventListener("change", (e) => { e.stopPropagation(); setFloatScrubber(cb.checked) })
+      })()
+
       // Wire up the control buttons (stopPropagation so clicks don't drag the
       // legend).
       ;[["speedUp", () => stepSpeed(+1)],
@@ -3567,14 +3811,36 @@
         ["dtUp", () => stepDt(+1)],
         ["dtDown", () => stepDt(-1)],
         ["stepUp", () => stepContour(+1)],
-        ["stepDown", () => stepContour(-1)],
-        ["pinSizeUp", () => setPinSize(pinSize + PIN_SIZE_STEP)],
-        ["pinSizeDown", () => setPinSize(pinSize - PIN_SIZE_STEP)],
-        ["legendSizeUp", () => setLegendSize(legendSize + LEGEND_SIZE_STEP)],
-        ["legendSizeDown", () => setLegendSize(legendSize - LEGEND_SIZE_STEP)]].forEach(([id, fn]) => {
+        ["stepDown", () => stepContour(-1)]].forEach(([id, fn]) => {
         const btn = document.getElementById(id)
         btn.addEventListener("pointerdown", (e) => e.stopPropagation())
         btn.addEventListener("click", (e) => { e.stopPropagation(); fn() })
+      })
+
+      // Pin / legend size buttons: a click moves one FINE step, Shift+click one
+      // COARSE step, and holding the button repeats (so the whole range doesn't
+      // take dozens of clicks). The click that ends a hold is swallowed so it
+      // doesn't add one more step.
+      ;[["pinSizeUp", +1, () => pinSize, setPinSize, PIN_SIZE_STEP, PIN_SIZE_COARSE],
+        ["pinSizeDown", -1, () => pinSize, setPinSize, PIN_SIZE_STEP, PIN_SIZE_COARSE],
+        ["legendSizeUp", +1, () => legendSize, setLegendSize, LEGEND_SIZE_STEP, LEGEND_SIZE_COARSE],
+        ["legendSizeDown", -1, () => legendSize, setLegendSize, LEGEND_SIZE_STEP, LEGEND_SIZE_COARSE],
+      ].forEach(([id, dir, get, set, fine, coarse]) => {
+        const btn = document.getElementById(id)
+        const bump = (shift) => set(get() + dir * (shift ? coarse : fine))
+        let delayT = null, repeatT = null, held = false
+        const stop = () => { clearTimeout(delayT); clearInterval(repeatT); delayT = repeatT = null }
+        btn.addEventListener("pointerdown", (e) => {
+          e.stopPropagation(); held = false; stop()
+          const shift = e.shiftKey
+          delayT = setTimeout(() => { held = true; repeatT = setInterval(() => bump(shift), 70) }, 450)
+        })
+        for (const ev of ["pointerup", "pointerleave", "pointercancel"]) btn.addEventListener(ev, stop)
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation()
+          if (held) { held = false; return }
+          bump(e.shiftKey)
+        })
       })
       setPlaybackSpeed(playbackSpeed) // initialize the label
       setDt(dt) // initialize the dt label
@@ -3723,10 +3989,6 @@
       scheduleNext()
     })
 
-    // Dismiss the basemap attribution popup.
-    const items = document.getElementsByClassName("maplibregl-ctrl-attrib-button")
-    for (const item of items) { item.click() }
-
     // Model selector: populate from the server's registered models and, on
     // change, navigate to that model's URL. Changing the model swaps the color
     // ramp, units, step defaults and derived kind — all computed server-side —
@@ -3845,6 +4107,11 @@
         map.on("move", positionLegend)
       }
       window.addEventListener("resize", positionLegend)
+      // The legend also changes SIZE on its own (the Controls/Settings tabs are different
+      // heights, and the floating scrub bar takes the scrubber out of it). Re-clamp it
+      // then, so opening a taller tab near the edge can't push its controls off-screen.
+      // positionLegend only moves the legend (never resizes it), so this can't loop.
+      if (typeof ResizeObserver !== "undefined") new ResizeObserver(() => positionLegend()).observe(el)
 
       let dragging = false, offsetX = 0, offsetY = 0
       el.addEventListener("pointerdown", (e) => {

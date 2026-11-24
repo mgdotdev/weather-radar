@@ -37,6 +37,12 @@ HERE = os.path.abspath(os.path.dirname(__file__))
 MAP_HTML = os.path.join(HERE, "map.html")
 GRAPH_HTML = os.path.join(HERE, "graph.html")
 FORECAST_HTML = os.path.join(HERE, "forecast.html")
+HA_PREVIEW_HTML = os.path.join(HERE, "ha_preview.html")
+GRAPH_PREVIEW_HTML = os.path.join(HERE, "graph_preview.html")
+# Shared by both preview pages (frame sizing, outputs, follow sync, paste-a-URL).
+PREVIEW_CORE_JS = os.path.join(HERE, "preview_core.js")
+PREVIEW_CORE_CSS = os.path.join(HERE, "preview_core.css")
+PREVIEW_MAIN_HTML = os.path.join(HERE, "preview_main.html")
 ADMIN_HTML = os.path.join(HERE, "admin.html")
 ADMIN_INDEX_HTML = os.path.join(HERE, "admin_index.html")
 TOKENS_HTML = os.path.join(HERE, "tokens.html")
@@ -457,6 +463,77 @@ def login_page():
     Served open (exempt from token auth)."""
     with open(LOGIN_HTML) as f:
         return f.read()
+
+
+# Time steps the map's step buttons cycle through (map.html DT_PRESETS), with labels.
+_DT_PRESETS = [(300, "5 min"), (600, "10 min"), (900, "15 min"), (1800, "30 min"),
+               (3600, "1 hour"), (7200, "2 hours"), (10800, "3 hours"),
+               (21600, "6 hours"), (43200, "12 hours"), (86400, "1 day")]
+
+
+def _render_preview(page_path, boot):
+    """Render one of the preview pages: its own template plus the shared engine,
+    stylesheet and frame/output markup (injected as text, so they are not
+    re-parsed as templates)."""
+    parts = {}
+    for name, path in (("core_js", PREVIEW_CORE_JS), ("core_css", PREVIEW_CORE_CSS),
+                       ("main_html", PREVIEW_MAIN_HTML)):
+        with open(path, encoding="utf-8") as f:
+            parts[name] = f.read()
+    with open(page_path, encoding="utf-8") as f:
+        template = Template(f.read())
+    # "</" is escaped so a label can never close the inline <script>.
+    parts["boot_json"] = json.dumps(boot).replace("</", "<\\/")
+    return template.render(parts)
+
+
+@router.get("/ha-preview/", response_class=HTMLResponse)
+def ha_preview():
+    """Interactive preview of the MAP as it would look inside a Home Assistant
+    iframe card: one control per URL parameter (layer, area, time step, pins,
+    legend/pin size, locks, …), a frame of exactly the chosen card/device size,
+    and the resulting URL + a ready-to-paste Home Assistant card. While "follow"
+    is on, changes made inside the preview (pins, zoom, legend position, …) flow
+    back into the controls. Token-gated like every other page; the preview is
+    same-origin so it can read the map's live URL."""
+    boot = {
+        "models": [{"value": key, "label": label}
+                   for key, (_kind, label, _attr) in MODEL_CATALOG.items()],
+        "defaultModel": "temperature",
+        "defaults": {"lat": _DEFAULT_LAT, "lon": _DEFAULT_LON, "width": _DEFAULT_WIDTH,
+                     "height": _DEFAULT_HEIGHT, "dt": _DEFAULT_DT},
+        "dts": [{"value": v, "label": label} for v, label in _DT_PRESETS],
+    }
+    return _render_preview(HA_PREVIEW_HTML, boot)
+
+
+# The graph route's own default time step (see graph() below) and the steps offered.
+_GRAPH_DEFAULT_DT = 450
+_GRAPH_DT_PRESETS = [(60, "1 min"), (300, "5 min"), (450, "7.5 min (default)"), (600, "10 min"),
+                     (900, "15 min"), (1800, "30 min"), (3600, "1 hour"), (10800, "3 hours")]
+
+
+@router.get("/graph-preview/", response_class=HTMLResponse)
+def graph_preview():
+    """Interactive preview of the forecast GRAPH page as it would look inside a
+    Home Assistant iframe card — the same idea as /ha-preview/, for /graph/: a
+    control per parameter (the curves, the point, the time step, the compact
+    Home Assistant layout, dark mode and the editable title), a frame of exactly
+    the chosen card size, and the resulting URL + card. With "follow" on, moving
+    or editing the title inside the preview flows back into the controls."""
+    catalog, seen = [], set()
+    for _key, (kind, label, attr) in MODEL_CATALOG.items():
+        value = f"{kind}|{attr}"
+        if value not in seen:
+            seen.add(value)
+            catalog.append({"value": value, "label": label, "kind": kind, "attribute": attr})
+    boot = {
+        "catalog": catalog,
+        "defaultCurve": {"kind": "observation", "attribute": "temperature"},
+        "defaults": {"lat": _DEFAULT_LAT, "lon": _DEFAULT_LON, "dt": _GRAPH_DEFAULT_DT, "counts": -1},
+        "dts": [{"value": v, "label": label} for v, label in _GRAPH_DT_PRESETS],
+    }
+    return _render_preview(GRAPH_PREVIEW_HTML, boot)
 
 
 @router.get("/graph/", response_class=HTMLResponse)

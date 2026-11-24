@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Home Assistant preview — map</title>
+<style>
+{{ core_css }}
+  #pins .pin { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; margin-bottom: 6px; }
+  #pins .pin input.name { grid-column: 1 / 3; }
+</style>
+</head>
+<body>
+<div id="side">
+  <h1>Home Assistant preview</h1>
+  <div style="margin-bottom:8px"><a class="nav here" href="/ha-preview/">Map</a><a class="nav" href="/graph-preview/">Graph</a></div>
+  <label class="full">Paste a map URL to start from
+    <div style="display:flex; gap:6px;">
+      <input id="importUrl" type="text" spellcheck="false" style="flex:1" placeholder="…/map/models/…/?lat=…">
+      <button id="importBtn" class="alt">Load</button>
+    </div>
+  </label>
+
+  <details open><summary>Layer &amp; area</summary><div class="grp">
+    <label class="full">Layer <select id="model"></select></label>
+    <label>Center latitude <input id="lat" type="number" step="0.0001"></label>
+    <label>Center longitude <input id="lon" type="number" step="0.0001"></label>
+    <label>Area width (km) <input id="width" type="number" step="0.1" min="1"></label>
+    <label>Area height (km) <input id="height" type="number" step="0.1" min="1"></label>
+    <label>Time step <select id="dt"></select></label>
+    <label>Playback speed <input id="speed" type="number" step="0.25" min="0.1" max="50"></label>
+    <label>Zoom <input id="zoom" type="number" step="0.1" min="0" max="22" placeholder="auto"></label>
+    <label class="hint" style="justify-content:end">blank = the default zoom (7.65)</label>
+    <label>View center latitude <input id="mapLat" type="number" step="0.0001" placeholder="area center"></label>
+    <label>View center longitude <input id="mapLon" type="number" step="0.0001" placeholder="area center"></label>
+    <div class="hint full">Where the map is looking (<code>mapLat</code>/<code>mapLon</code>) — separate from the data area's center above. It moves with the map while "follow" is on, and changing it here moves the view without a reload.</div>
+  </div></details>
+
+  <details open><summary>Pins</summary><div class="grp">
+    <div id="pins" class="full"></div>
+    <div class="full" style="display:flex; gap:6px;">
+      <button id="addPin" class="alt">+ Add pin at center</button>
+    </div>
+    <label class="full">Pin box offsets (advanced) <input id="pinBoxes" type="text" spellcheck="false" placeholder=";;-203,34;;-187,-27"></label>
+  </div></details>
+
+  <details open><summary>Legend &amp; display</summary><div class="grp">
+    <label class="full">Pin size <span class="val" id="pinSizeV"></span>
+      <input id="pinSize" type="range" min="0.5" max="3" step="0.05"></label>
+    <label class="full">Legend size <span class="val" id="legendSizeV"></span>
+      <input id="legendSize" type="range" min="0.5" max="3" step="0.05"></label>
+    <label class="row"><input id="areaBox" type="checkbox"> Show area box</label>
+    <label class="row"><input id="cursorBox" type="checkbox"> Show cursor box</label>
+    <label class="row"><input id="scaleBar" type="checkbox"> Show scale bar</label>
+    <label class="row full"><input id="floatScrubber" type="checkbox"> Floating scrub bar (bottom of the map)</label>
+    <label class="row full"><input id="attribution" type="checkbox"> Show map credits (&copy; button; the basemap asks for it)</label>
+    <label class="row full"><input id="locked" type="checkbox"> Lock legend &amp; pins (no dragging)</label>
+    <div class="full" style="display:flex; gap:6px;">
+      <button id="compact" class="alt" title="legendSize=0.5, pinSize=0.5, locked">Compact preset</button>
+      <button id="resetView" class="alt" title="Clear legend position, pin offsets and window">Reset layout</button>
+    </div>
+    <label>Legend latitude <input id="legendLat" type="number" step="0.0001" placeholder="default"></label>
+    <label>Legend longitude <input id="legendLon" type="number" step="0.0001" placeholder="default"></label>
+  </div></details>
+
+  <details><summary>Time window (advanced)</summary><div class="grp">
+    <label>From (epoch s) <input id="from" type="number" placeholder="start"></label>
+    <label>To (epoch s) <input id="to" type="number" placeholder="end"></label>
+    <label class="full">Start playhead at (epoch s) <input id="t" type="number" placeholder="window start"></label>
+    <div class="hint full">Leave blank for the whole forecast. These follow the scrubber when "follow" is on.</div>
+  </div></details>
+
+  <details><summary>Other parameters</summary><div class="grp">
+    <label class="full">Kept as-is (read-only)<textarea id="extra" rows="2" readonly></textarea></label>
+  </div></details>
+</div>
+
+{{ main_html }}
+
+<script>
+{{ core_js }}
+</script>
+<script>
+(function () {
+  const BOOT = {{ boot_json }}
+  const $ = (id) => document.getElementById(id)
+  let api = null     // set by wire(); pages must read the CURRENT state via api.state
+
+  // ---- state -------------------------------------------------------------
+  // The state is the map's URL, parsed. `extra` keeps any parameter this page
+  // has no control for, so editing never drops it.
+  const KNOWN = ["lat", "lon", "width", "height", "dt", "zoom", "speed", "mapLat", "mapLon", "pins", "pinBoxes",
+                 "pinSize", "legendSize", "legendLat", "legendLon", "areaBox", "cursorBox", "scaleBar",
+                 "floatScrubber", "attribution", "locked", "from", "to", "t", "token"]
+  const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : null }
+  const trim = (n, d) => String(+n.toFixed(d))      // 48.1000 -> "48.1"
+
+  function defaultState() {
+    const d = BOOT.defaults
+    return { model: BOOT.defaultModel, lat: d.lat, lon: d.lon, width: d.width, height: d.height,
+             dt: d.dt, zoom: null, speed: 1, mapLat: null, mapLon: null, pins: [], pinBoxes: "", pinSize: 1, legendSize: 1,
+             legendLat: null, legendLon: null, areaBox: true, cursorBox: true, scaleBar: true, floatScrubber: false,
+             attribution: false, locked: false, from: null, to: null, t: null, extra: {} }
+  }
+
+  // Parse a map URL (absolute or relative) into state. Missing values take the
+  // server's defaults, exactly as the map route does.
+  function fromUrl(raw) {
+    let u
+    try { u = new URL(raw, window.location.origin) } catch (_) { return null }
+    const m = u.pathname.match(/\/map\/models\/([^/]+)\//)
+    if (!m) return null
+    const S = defaultState(), q = u.searchParams
+    S.model = decodeURIComponent(m[1])
+    for (const k of ["lat", "lon", "width", "height", "dt", "zoom", "speed", "mapLat", "mapLon", "pinSize", "legendSize",
+                     "legendLat", "legendLon", "from", "to", "t"]) {
+      const v = num(q.get(k)); if (v !== null) S[k] = v
+    }
+    S.pinBoxes = q.get("pinBoxes") || ""
+    S.areaBox = q.get("areaBox") !== "0"
+    S.cursorBox = q.get("cursorBox") !== "0"
+    S.scaleBar = q.get("scaleBar") !== "0"
+    S.floatScrubber = q.get("floatScrubber") === "1"
+    S.attribution = q.get("attribution") === "1"
+    S.locked = q.get("locked") === "1"
+    S.pins = (q.get("pins") || "").split(";").filter(Boolean).map((item) => {
+      const f = item.split(",")
+      let name = f.slice(2).join(",")
+      try { name = decodeURIComponent(name) } catch (_) {}
+      return { lat: num(f[0]), lon: num(f[1]), name }
+    }).filter((p) => p.lat !== null && p.lon !== null)
+    for (const [k, v] of q.entries()) if (!KNOWN.includes(k)) S.extra[k] = v
+    return S
+  }
+
+  // Build the map URL (path + query) from state — omitting defaults, and
+  // writing pins exactly as the map itself does (name encoded, then the whole
+  // value encoded again by URLSearchParams), so the map restores them.
+  function toRelative(S, token) {
+    const u = new URL(`/map/models/${encodeURIComponent(S.model)}/`, window.location.origin)
+    const q = u.searchParams
+    q.set("lat", trim(S.lat, 6)); q.set("lon", trim(S.lon, 6))
+    q.set("width", S.width.toFixed(2)); q.set("height", S.height.toFixed(2))
+    q.set("dt", String(Math.round(S.dt)))
+    if (S.zoom !== null) q.set("zoom", S.zoom.toFixed(2))
+    if (Math.abs(S.speed - 1) > 1e-9) q.set("speed", S.speed.toFixed(2))
+    if (S.mapLat !== null) q.set("mapLat", trim(S.mapLat, 5))
+    if (S.mapLon !== null) q.set("mapLon", trim(S.mapLon, 5))
+    if (S.pins.length) q.set("pins", S.pins.map((p) =>
+      `${p.lat.toFixed(5)},${p.lon.toFixed(5)},${encodeURIComponent(p.name || "")}`).join(";"))
+    if (S.pinBoxes) q.set("pinBoxes", S.pinBoxes)
+    if (Math.abs(S.pinSize - 1) > 1e-9) q.set("pinSize", String(S.pinSize))
+    if (Math.abs(S.legendSize - 1) > 1e-9) q.set("legendSize", String(S.legendSize))
+    if (S.legendLat !== null) q.set("legendLat", trim(S.legendLat, 5))
+    if (S.legendLon !== null) q.set("legendLon", trim(S.legendLon, 5))
+    if (!S.areaBox) q.set("areaBox", "0")
+    if (!S.cursorBox) q.set("cursorBox", "0")
+    if (!S.scaleBar) q.set("scaleBar", "0")
+    if (S.floatScrubber) q.set("floatScrubber", "1")
+    if (S.attribution) q.set("attribution", "1")
+    if (S.locked) q.set("locked", "1")
+    for (const k of ["from", "to", "t"]) if (S[k] !== null) q.set(k, String(Math.round(S[k])))
+    for (const [k, v] of Object.entries(S.extra)) q.set(k, v)
+    if (token) q.set("token", token)
+    return u.pathname + u.search
+  }
+
+  // ---- controls <-> state ------------------------------------------------
+  const NUM_FIELDS = ["lat", "lon", "width", "height", "speed", "zoom", "mapLat", "mapLon", "legendLat", "legendLon", "from", "to", "t"]
+  const REQUIRED = ["lat", "lon", "width", "height", "speed"]
+
+  function ensureOption(select, value, label) {
+    if ([...select.options].some((o) => o.value === value)) return
+    const o = document.createElement("option"); o.value = value; o.textContent = label; select.appendChild(o)
+  }
+
+  function renderControls(S, skipFocused) {
+    const set = (id, v) => { const el = $(id); if (skipFocused && el === document.activeElement) return
+                             el.value = v === null || v === undefined ? "" : v }
+    for (const k of NUM_FIELDS) set(k, S[k])
+    // A value that isn't one of the presets (e.g. dt=450, an unknown layer) still
+    // has to show up in its select, or the select would go blank.
+    ensureOption($("model"), S.model, S.model)
+    ensureOption($("dt"), String(S.dt), `${S.dt} s`)
+    set("model", S.model); set("dt", String(S.dt)); set("pinBoxes", S.pinBoxes)
+    set("pinSize", S.pinSize); set("legendSize", S.legendSize)
+    $("pinSizeV").textContent = S.pinSize.toFixed(2) + "×"
+    $("legendSizeV").textContent = S.legendSize.toFixed(2) + "×"
+    $("areaBox").checked = S.areaBox; $("cursorBox").checked = S.cursorBox; $("scaleBar").checked = S.scaleBar; $("floatScrubber").checked = S.floatScrubber
+    $("attribution").checked = S.attribution; $("locked").checked = S.locked
+    $("extra").value = Object.entries(S.extra).map(([k, v]) => `${k}=${v}`).join("\n")
+    renderPins(S, skipFocused)
+  }
+
+  function renderPins(S, skipFocused) {
+    const box = $("pins")
+    if (skipFocused && box.contains(document.activeElement)) return
+    box.innerHTML = ""
+    S.pins.forEach((p, i) => {
+      const row = document.createElement("div"); row.className = "pin"
+      row.innerHTML = '<input class="plat" type="number" step="0.0001" title="latitude">' +
+        '<input class="plon" type="number" step="0.0001" title="longitude">' +
+        '<button class="x" title="Remove pin">×</button><input class="name" type="text" placeholder="name">'
+      row.querySelector(".plat").value = p.lat; row.querySelector(".plon").value = p.lon
+      row.querySelector(".name").value = p.name || ""
+      // Always act on the CURRENT state: "follow" may have replaced it since this
+      // row was drawn (rows are left alone while focused), and a closure over the
+      // old pin object would then edit a copy nothing reads.
+      const upd = () => {
+        const cur = api.state.pins[i]
+        if (!cur) return
+        const la = num(row.querySelector(".plat").value), lo = num(row.querySelector(".plon").value)
+        if (la !== null) cur.lat = la
+        if (lo !== null) cur.lon = lo
+        cur.name = row.querySelector(".name").value
+        api.changed(false)
+      }
+      for (const c of ["plat", "plon", "name"]) row.querySelector("." + c).addEventListener("input", upd)
+      row.querySelector(".x").addEventListener("click", () => {
+        const cur = api.state
+        cur.pins.splice(i, 1)
+        // pin box offsets are positional (one slot per pin): drop this pin's slot
+        const slots = cur.pinBoxes ? cur.pinBoxes.split(";") : []
+        if (slots.length > i) { slots.splice(i, 1); cur.pinBoxes = slots.join(";").replace(/^;+$/, "") }
+        api.render(false); api.changed(true)
+      })
+      box.appendChild(row)
+    })
+    if (!S.pins.length) box.innerHTML = '<div class="hint">No pins. Add one, or drop pins in the preview (right-click the map) with "follow" on.</div>'
+  }
+
+  function readControls(S) {
+    for (const k of NUM_FIELDS) {
+      const v = num($(k).value)
+      if (REQUIRED.includes(k)) { if (v !== null) S[k] = v } else S[k] = v
+    }
+    S.model = $("model").value; S.dt = parseInt($("dt").value, 10)
+    S.pinBoxes = $("pinBoxes").value.trim()
+    S.pinSize = parseFloat($("pinSize").value); S.legendSize = parseFloat($("legendSize").value)
+    S.areaBox = $("areaBox").checked; S.cursorBox = $("cursorBox").checked; S.scaleBar = $("scaleBar").checked; S.floatScrubber = $("floatScrubber").checked
+    S.attribution = $("attribution").checked; S.locked = $("locked").checked
+    $("pinSizeV").textContent = S.pinSize.toFixed(2) + "×"
+    $("legendSizeV").textContent = S.legendSize.toFixed(2) + "×"
+  }
+
+  // ---- page-specific buttons ---------------------------------------------
+  function wire(a) {
+    api = a
+    $("addPin").addEventListener("click", () => {
+      const S = api.state
+      S.pins.push({ lat: S.lat, lon: S.lon, name: `Pin ${S.pins.length + 1}` })
+      const slots = S.pinBoxes ? S.pinBoxes.split(";") : []
+      while (slots.length < S.pins.length) slots.push("")   // keep offsets positional
+      S.pinBoxes = slots.join(";").replace(/^;+$/, "")
+      api.render(false); api.changed(true)
+    })
+    $("compact").addEventListener("click", () => {
+      const S = api.state
+      S.legendSize = 0.5; S.pinSize = 0.5; S.locked = true
+      api.render(false); api.changed(true)
+    })
+    $("resetView").addEventListener("click", () => {
+      const S = api.state
+      S.legendLat = S.legendLon = null; S.pinBoxes = ""; S.from = S.to = S.t = null; S.zoom = null
+      S.mapLat = S.mapLon = null
+      api.render(false); api.changed(true)
+    })
+  }
+
+  // ---- startup -------------------------------------------------------------
+  function fill(select, items) { for (const [v, l] of items) { const o = document.createElement("option"); o.value = v; o.textContent = l; select.appendChild(o) } }
+  fill($("model"), BOOT.models.map((m) => [m.value, m.label]))
+  fill($("dt"), BOOT.dts.map((d) => [String(d.value), d.label]))
+
+  WRPreview.start({
+    hook: "__haPreview",
+    pathRe: /\/map\/models\//,
+    controlIds: [...NUM_FIELDS, "model", "dt", "pinBoxes", "pinSize", "legendSize", "areaBox", "cursorBox", "scaleBar",
+                 "floatScrubber", "attribution", "locked"],
+    defaultState, fromUrl, toRelative, renderControls, readControls, wire,
+    // Purely visual settings: applied inside the loaded map in place (no reload, no
+    // data fetch). The names are both the URL parameters and the state fields.
+    // The view (center and zoom) is live too: the map is moved / zoomed in place.
+    live: {
+      keys: ["pinSize", "legendSize", "locked", "cursorBox", "scaleBar", "areaBox", "floatScrubber", "attribution",
+             "mapLat", "mapLon", "zoom"],
+      apply(win, S, keys) {
+        const L = win.WRLive
+        const visual = keys.filter((k) => k !== "mapLat" && k !== "mapLon")
+        const moves = visual.length !== keys.length
+        if (!visual.every((k) => typeof L[k] === "function") || (moves && typeof L.center !== "function")) return false
+        for (const k of visual) L[k](S[k])
+        // An unset axis means "the area's own center" (what the page does without the param).
+        if (moves) L.center(S.mapLat !== null ? S.mapLat : S.lat, S.mapLon !== null ? S.mapLon : S.lon)
+        return true
+      },
+    },
+  })
+})()
+</script>
+</body>
+</html>

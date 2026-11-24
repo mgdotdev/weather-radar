@@ -1,0 +1,62 @@
+<div id="main">
+  <div id="bar">
+    <label>Card type
+      <select id="mode">
+        <option value="card">Card (height from aspect ratio)</option>
+        <option value="sections">Sections-view card (set size)</option>
+        <option value="panel">Panel view (fills the page)</option>
+        <option value="device">Phone / tablet (full screen)</option>
+      </select>
+    </label>
+    <label id="wLbl">Width (px) <input id="fw" type="number" min="100" max="4000">
+      <select id="wPreset" title="A Home Assistant card on a phone is narrower than this page's default, so the map is cropped more (the legend and pins shift). Pick a width to see what that looks like.">
+        <option value="">common widths…</option>
+        <option value="377">iPhone 15 / 16 / Pro card — 377</option>
+        <option value="374">iPhone 12 – 14 card — 374</option>
+        <option value="359">iPhone SE / mini card — 359</option>
+        <option value="414">iPhone Pro Max card — 414</option>
+        <option value="344">Android 360 dp card — 344</option>
+      </select></label>
+    <label id="arLbl">Aspect ratio
+      <select id="ar">
+        <option value="">default (50%)</option><option value="75%">75%</option><option value="100%">100%</option>
+        <option value="16:9">16:9</option><option value="4:3">4:3</option><option value="1:1">1:1</option>
+      </select>
+    </label>
+    <label id="hLbl">Height (px) <input id="fh" type="number" min="100" max="4000"></label>
+    <label id="devLbl">Device
+      <select id="dev">
+        <option value="390x844">Phone portrait 390x844</option>
+        <option value="844x390">Phone landscape 844x390</option>
+        <option value="768x1024">Tablet portrait 768x1024</option>
+        <option value="1024x768">Tablet landscape 1024x768</option>
+        <option value="1280x800">Wall tablet 1280x800</option>
+      </select>
+    </label>
+    <label class="row"><input id="fit" type="checkbox"> Scale to fit</label>
+    <label class="row"><input id="follow" type="checkbox"> Follow the preview <span id="status"></span></label>
+    <label class="row" title="Canned sample data: instant and offline. Untick to use your real forecast data."><input id="fixture" type="checkbox"> Sample data (fast)</label>
+    <button id="reload" class="alt">Reload</button>
+  </div>
+  <div id="stage">
+    <div id="info"></div>
+    <div id="frameWrap"><iframe id="frame" title="preview" allow="fullscreen"></iframe></div>
+  </div>
+  <div id="out">
+    <div>
+      <div class="hint" style="margin-bottom:3px">URL for Home Assistant
+        &nbsp;·&nbsp; base <input id="base" type="text" spellcheck="false" style="width:230px">
+        &nbsp;<label class="row" style="display:inline-flex"><input id="useToken" type="checkbox"> token</label>
+        <input id="token" type="password" placeholder="access token" style="width:120px"></div>
+      <pre id="urlOut"></pre>
+      <div style="margin-top:5px; display:flex; gap:6px">
+        <button id="copyUrl">Copy URL</button><button id="openTab" class="alt">Open in new tab</button>
+      </div>
+    </div>
+    <div>
+      <div class="hint" style="margin-bottom:3px">Home Assistant card (YAML)</div>
+      <pre id="yamlOut"></pre>
+      <div style="margin-top:5px"><button id="copyYaml">Copy YAML</button></div>
+    </div>
+  </div>
+</div>

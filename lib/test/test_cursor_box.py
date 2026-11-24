@@ -58,7 +58,11 @@ class TestSetting:
 
     def test_persists_and_survives_a_model_switch(self):
         assert 'u.searchParams.set("cursorBox", "0")' in HTML
-        assert HTML.count('"areaBox", "cursorBox", "locked"') == 2     # both carry-over lists
+        # both model-switch carry-over lists keep the cursor-box and floating-bar settings
+        lists = re.findall(r'for \(const k of \[("lat", "lon".*?)\]\) \{', HTML, re.S)
+        assert len(lists) == 2
+        for lst in lists:
+            assert all(f'"{k}"' in lst for k in ("cursorBox", "floatScrubber", "attribution"))
 
     def test_readout_is_hidden_when_off(self):
         assert 'if (!showCursorBox || !cursorPx)' in HTML
