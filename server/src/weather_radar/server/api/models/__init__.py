@@ -1067,6 +1067,13 @@ def ensemble_series_stream(
         # ONCE (all models in a sweep are the same kind) so the hot loop below
         # doesn't branch per (point × frame).
         use_epoch = bool(models) and hasattr(models[0], "predict_epoch")
+        # ALL points of a frame in one numpy pass (None when the models can't be
+        # evaluated that way, e.g. the JSON source — they use the loop below).
+        evaluate = None
+        if use_epoch:
+            import numpy as np
+            from weather_radar.lib.models.ndfd_model import frame_evaluator
+            evaluate = frame_evaluator(models)
         # The exact bytes streamed are kept so they can be saved as a bundle
         # layer afterwards. The version token describes the data the models were
         # just fit from (None for the JSON source -> nothing is saved).
@@ -1078,19 +1085,23 @@ def ensemble_series_stream(
             layer_token = None
         for epoch in remaining:
             t = None if use_epoch else datetime.fromtimestamp(epoch)
-            vals = []
-            any_val = False
-            for m in models:
-                try:
-                    y = m.predict_epoch(epoch) if use_epoch else m.predict(t, verbose=False)
-                except BoundsError:
-                    vals.append(None)   # out of horizon this frame -> sentinel
-                    continue
-                except Exception:
-                    vals.append(None)
-                    continue
-                vals.append(y)
-                any_val = True
+            if evaluate is not None:
+                vals = evaluate(epoch)
+                any_val = not bool(np.isnan(vals).all())
+            else:
+                vals = []
+                any_val = False
+                for m in models:
+                    try:
+                        y = m.predict_epoch(epoch) if use_epoch else m.predict(t, verbose=False)
+                    except BoundsError:
+                        vals.append(None)   # out of horizon this frame -> sentinel
+                        continue
+                    except Exception:
+                        vals.append(None)
+                        continue
+                    vals.append(y)
+                    any_val = True
             if any_val:
                 if t_first_frame is None:
                     t_first_frame = time.perf_counter()

@@ -78,29 +78,23 @@ def encode_header(uom, coords, scale, offset, sentinel=SENTINEL):
 
 def encode_frame(epoch, vals, scale, offset, sentinel=SENTINEL):
     """Serialize one frame record payload (bytes, no length prefix):
-    [8-byte epoch][N × int16 LE]. `vals` is a list aligned to the header coords;
-    None entries become the sentinel. Values are scaled/offset and clamped to
-    the int16 range."""
-    n = len(vals)
-    buf = bytearray(8 + n * 2)
-    _EPOCH.pack_into(buf, 0, int(epoch))
-    off = 8
-    for v in vals:
-        if v is None:
-            iv = sentinel
-        else:
-            iv = round((v - offset) * scale)
-            if iv < _I16_MIN:
-                iv = _I16_MIN
-            elif iv > _I16_MAX:
-                iv = _I16_MAX
-            # Never let a real value collide with the sentinel; nudge by 1.
-            if iv == sentinel:
-                iv = sentinel + 1
-        # little-endian int16
-        struct.pack_into("<h", buf, off, iv)
-        off += 2
-    return bytes(buf)
+    [8-byte epoch][N x int16 LE]. `vals` is a list OR a float array aligned to the
+    header coords; None (or NaN) entries become the sentinel. Values are
+    scaled/offset, rounded half-to-even, and clamped to the int16 range.
+
+    Vectorized: a ~44,000-point frame used to cost a Python loop iteration per
+    value (tens of ms); this is a few array operations. The bytes are identical to
+    the old per-value loop."""
+    import numpy as np
+    a = np.asarray(vals, dtype=float)               # None -> NaN
+    missing = np.isnan(a)
+    iv = np.rint((a - offset) * scale)              # half-to-even, like round()
+    iv = np.clip(np.nan_to_num(iv, nan=0.0, posinf=_I16_MAX, neginf=_I16_MIN),
+                 _I16_MIN, _I16_MAX).astype(np.int64)
+    # Never let a real value collide with the sentinel; nudge by 1.
+    iv[iv == sentinel] = sentinel + 1
+    iv[missing] = sentinel
+    return _EPOCH.pack(int(epoch)) + iv.astype("<i2").tobytes()
 
 
 def frame_payload_len(n_points):

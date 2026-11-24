@@ -365,11 +365,25 @@ def build_bundle(model, lat, lon, width, height, kind, dt=3600):
     }
 
     use_epoch = hasattr(models[0], "predict_epoch")
+    # All points of a frame in one numpy pass (None for the JSON source, whose
+    # models are evaluated one at a time below).
+    evaluate = None
+    if use_epoch:
+        from weather_radar.lib.models.ndfd_model import frame_evaluator
+        evaluate = frame_evaluator(models)
 
     def frames():
+        import numpy as np
         t = start
         n = 0
         while t <= end + 1 and n < MAX_FRAMES:
+            if evaluate is not None:
+                y = evaluate(t)
+                if not np.isnan(y).all():
+                    yield {"time": t, "vals": y}
+                t += step
+                n += 1
+                continue
             dtime = None if use_epoch else datetime.fromtimestamp(t)
             vals = []
             any_val = False

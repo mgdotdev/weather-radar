@@ -867,48 +867,14 @@ def _vector_splines(fit):
     NaN where the point has no spline.
 
     The old per-frame loop made one scipy call per point per frame (~70 ms for a
-    ~9,000-point area); this stacks the splines' coefficients once and evaluates
-    the polynomials with the SAME arithmetic and order scipy uses (ascending
-    powers of t - x[i]; extrapolation continues the end interval), so values are
-    bit-identical. Splines are grouped by their knot vector (almost all share
-    one). Built once per fit and kept on it."""
+    ~9,000-point area). `SplineBank` (lib.splinevec) stacks the coefficients once
+    and evaluates with scipy's own arithmetic, so values are bit-identical. Built
+    once per fit and kept on it."""
     cached = fit.get("_vec")
     if cached is not None:
         return cached
-    import numpy as np
-
-    splines = fit["splines"]
-    n = len(splines)
-    groups = []                          # (indices, x, C[(4, n_int, m)])
-    by_x = {}
-    for i, sp in enumerate(splines):
-        if sp is None:
-            continue
-        key = (len(sp.x), float(sp.x[0]), float(sp.x[-1]))
-        for gi in by_x.get(key, ()):
-            if np.array_equal(groups[gi][1], sp.x):
-                groups[gi][0].append(i)
-                groups[gi][2].append(sp.c)
-                break
-        else:
-            by_x.setdefault(key, []).append(len(groups))
-            groups.append(([i], np.asarray(sp.x), [sp.c]))
-    packed = [(np.array(ix, dtype=np.intp), x, np.stack(cs, axis=-1))
-              for ix, x, cs in groups]       # c: (4, n_int, m) per knot-vector group
-
-    def evaluate(t):
-        out = np.full(n, np.nan)
-        for ix, x, c in packed:
-            j = int(np.clip(np.searchsorted(x, t, side="right") - 1, 0, len(x) - 2))
-            s = t - x[j]
-            res = np.zeros(c.shape[2])
-            z = 1.0
-            for kp in range(c.shape[0]):     # res += c[k-kp-1] * s**kp, scipy's order
-                res = res + c[c.shape[0] - kp - 1, j] * z
-                z = z * s
-            out[ix] = res
-        return out
-
+    from .splinevec import SplineBank
+    evaluate = SplineBank(fit["splines"]).evaluate
     fit["_vec"] = evaluate
     return evaluate
 

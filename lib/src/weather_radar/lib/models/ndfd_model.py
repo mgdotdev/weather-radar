@@ -154,6 +154,58 @@ class _Scalar(float):
         return float(self)
 
 
+def frame_evaluator(models):
+    """A function `evaluate(epoch) -> float array` giving EVERY point's value for
+    one frame at once (NaN = no value there), or None if these models can't be
+    evaluated that way (callers then loop `predict_epoch` per point).
+
+    Equivalent to calling each model's `predict_epoch(epoch)` — NaN where it would
+    raise BoundsError (or has no spline), the non-negative clamp applied — but a
+    single numpy pass instead of one Python call per point, which is the
+    difference between ~300 ms and a millisecond or two for a large area.
+
+    The stacked coefficients are built once and kept on the models' first spline,
+    so every later request for the same fit reuses them."""
+    from ..splinevec import SplineBank, UnsupportedSpline
+    import numpy as np
+    if not models or not all(type(m) is _NDFDPointModel for m in models):
+        return None
+    splines = [m._spline for m in models]
+    anchor = next((sp for sp in splines if sp is not None), None)
+    if anchor is not None:
+        cached = getattr(anchor, "_wr_frame_eval", None)
+        if cached is not None and cached[0] == len(models) and cached[1] is splines[-1] \
+                and cached[2] is splines[0]:
+            return cached[3]
+    try:
+        bank = SplineBank(splines, compact=True)
+    except UnsupportedSpline:
+        return None
+    n = len(models)
+    starts = np.array([m._start_epoch for m in models], dtype=float)
+    ends = np.array([m._end_epoch for m in models], dtype=float)
+    nonneg = np.array([bool(m._nonneg) for m in models])
+    any_nonneg = bool(nonneg.any())
+    uniform = bool((starts == starts[0]).all() and (ends == ends[0]).all())
+    s0, e0 = float(starts[0]), float(ends[0])
+
+    def evaluate(epoch):
+        if uniform:
+            if epoch < s0 or epoch > e0:
+                return np.full(n, np.nan)          # the whole frame is out of horizon
+            y = bank.evaluate(epoch)
+        else:
+            y = bank.evaluate(epoch)
+            y[(epoch < starts) | (epoch > ends)] = np.nan
+        if any_nonneg:
+            y = np.where(nonneg & (y < 0), 0.0, y)  # NaN < 0 is False: NaN stays NaN
+        return y
+
+    if anchor is not None:
+        anchor._wr_frame_eval = (n, splines[-1], splines[0], evaluate)
+    return evaluate
+
+
 class NDFDObservationEnsemble:
     """Area ensemble backed by NDFD GRIB instead of NOAA /gridpoints JSON.
 
